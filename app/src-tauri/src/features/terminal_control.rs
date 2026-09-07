@@ -960,6 +960,33 @@ pub(crate) fn release_pty_control(
     }
 }
 
+/// Apply the standard terminal-control error classification: clear the lease
+/// on ownership/handoff failures, mark recovery-required states, and record
+/// the last error for observers.
+fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallError) {
+    if matches!(
+        error.code.as_str(),
+        "PERMISSION_DENIED"
+            | "HANDOFF_PENDING"
+            | "TARGET_GONE"
+            | "RECOVERY_REQUIRED"
+            | "OPERATION_IN_DOUBT"
+            | "UNAVAILABLE"
+            | "INTERNAL"
+    ) {
+        control.lease = None;
+        control.applied_size = None;
+    }
+    if matches!(
+        error.code.as_str(),
+        "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
+    ) {
+        control.last_state = "RECOVERY_REQUIRED".to_string();
+        control.last_owner_kind = None;
+    }
+    control.last_error = Some(error.to_string());
+}
+
 pub(crate) fn write_pty_control(
     app: &tauri::AppHandle,
     state: &TerminalControlState,
@@ -982,27 +1009,7 @@ pub(crate) fn write_pty_control(
         }),
     );
     if let Err(error) = &result {
-        if matches!(
-            error.code.as_str(),
-            "PERMISSION_DENIED"
-                | "HANDOFF_PENDING"
-                | "TARGET_GONE"
-                | "RECOVERY_REQUIRED"
-                | "OPERATION_IN_DOUBT"
-                | "UNAVAILABLE"
-                | "INTERNAL"
-        ) {
-            control.lease = None;
-            control.applied_size = None;
-        }
-        if matches!(
-            error.code.as_str(),
-            "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
-        ) {
-            control.last_state = "RECOVERY_REQUIRED".to_string();
-            control.last_owner_kind = None;
-        }
-        control.last_error = Some(error.to_string());
+        classify_control_error(control, error);
     }
     result.map(|_| ())
 }
@@ -1037,27 +1044,7 @@ pub(crate) fn scroll_pty_control(
         }),
     );
     if let Err(error) = &result {
-        if matches!(
-            error.code.as_str(),
-            "PERMISSION_DENIED"
-                | "HANDOFF_PENDING"
-                | "TARGET_GONE"
-                | "RECOVERY_REQUIRED"
-                | "OPERATION_IN_DOUBT"
-                | "UNAVAILABLE"
-                | "INTERNAL"
-        ) {
-            control.lease = None;
-            control.applied_size = None;
-        }
-        if matches!(
-            error.code.as_str(),
-            "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
-        ) {
-            control.last_state = "RECOVERY_REQUIRED".to_string();
-            control.last_owner_kind = None;
-        }
-        control.last_error = Some(error.to_string());
+        classify_control_error(control, error);
     }
     result.map(|_| ())
 }

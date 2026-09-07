@@ -1,7 +1,7 @@
 use super::tmux_session_is_missing_error;
 use crate::config::find_host;
 use crate::features::control_plane::parse_session_key;
-use crate::features::{kill_managed_session_with_control, PtyState, TerminalControlState};
+use crate::features::{kill_with_managed_fallback, PtyState, TerminalControlState};
 use crate::remote::{run_remote_tmux_check, run_remote_tmux_output};
 use crate::support::{run_check, run_quiet, tmux_bin};
 
@@ -53,24 +53,16 @@ pub(crate) async fn kill_session(
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
-    let pty_state = std::sync::Arc::clone(pty_state.inner());
-    let control_state = std::sync::Arc::clone(control_state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        let (host_id, raw_name) = parse_session_key(&name);
-        if managed.unwrap_or(false) {
-            kill_managed_session_with_control(
-                &app,
-                pty_state.as_ref(),
-                control_state.as_ref(),
-                raw_name,
-                host_id,
-            )
-        } else {
-            kill_legacy_session(&name)
-        }
-    })
+    kill_with_managed_fallback(
+        app,
+        pty_state.inner(),
+        control_state.inner(),
+        name,
+        managed,
+        "session",
+        kill_legacy_session,
+    )
     .await
-    .map_err(|error| format!("session kill task failed: {error}"))?
 }
 
 #[tauri::command]

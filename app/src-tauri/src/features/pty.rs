@@ -5,6 +5,7 @@ use super::{
     PtyControlStatus, TerminalControlState,
 };
 use crate::config::{find_host, load_hosts};
+use crate::features::control_plane::parse_session_key;
 use crate::ipc::{OpenArgs, PtyChunk, PtyExit};
 use crate::remote::HostConfig;
 use crate::support::{app_home_dir, remote_path_expr, resolve_cmd, shell_quote};
@@ -262,6 +263,41 @@ pub(crate) fn kill_managed_session_with_control(
             Err(error.to_string())
         }
     }
+}
+
+/// Shared body of the `kill_session` and `kill_plain_terminal` commands:
+/// run on the blocking pool, dispatching to the managed control path when
+/// requested and to the caller's legacy fallback otherwise.
+pub(crate) async fn kill_with_managed_fallback<F>(
+    app: tauri::AppHandle,
+    pty_state: &std::sync::Arc<PtyState>,
+    control_state: &std::sync::Arc<TerminalControlState>,
+    name: String,
+    managed: Option<bool>,
+    kind: &str,
+    legacy: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+{
+    let pty_state = std::sync::Arc::clone(pty_state);
+    let control_state = std::sync::Arc::clone(control_state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (host_id, raw_name) = parse_session_key(&name);
+        if managed.unwrap_or(false) {
+            kill_managed_session_with_control(
+                &app,
+                pty_state.as_ref(),
+                control_state.as_ref(),
+                raw_name,
+                host_id,
+            )
+        } else {
+            legacy(&name)
+        }
+    })
+    .await
+    .map_err(|error| format!("{kind} kill task failed: {error}"))?
 }
 
 #[tauri::command]
