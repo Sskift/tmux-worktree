@@ -4823,6 +4823,84 @@ test("exact claims survive ping and foreign status while same-target status stil
   }
 });
 
+test("exact target external-state entries are TTL-bounded without resurrecting stale claims", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  let clock = Date.parse("2026-07-22T00:00:00.000Z");
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+    relayV2ExactTargetTtlMs: 1_000,
+    now: () => new Date(clock),
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-ttl-bound",
+    scopeId: "scope-ttl-bound",
+    sessionId: "session-ttl-bound",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-ttl-bound",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:ttl-bound" },
+  };
+  try {
+    const target = await resolved(authority);
+    const foreignTarget = await resolved(authority, "foreign-terminal");
+    // Prepared before any status touches this target: stamped at epoch 0.
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    // A same-target status creates the external-state entry and fences the claim.
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "ttl-bound-same-status",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(authority.relayV2TargetExternalStates.has(target.controlTargetId), true);
+    assert.throws(
+      () => authority.fenceRelayV2ExactTarget(preparation.claim, exactInput),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    // Advance past the claim TTL: the lease expires and the entry becomes evictable.
+    clock += 2_000;
+    // A foreign-target status triggers the sweep; the stale entry is evicted.
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "ttl-bound-foreign-status",
+      type: "ownership.status",
+      controlTargetId: foreignTarget.controlTargetId,
+    });
+    assert.equal(authority.relayV2TargetExternalStates.has(target.controlTargetId), false,
+      "the untouched external-state entry is evicted after the TTL sweep");
+    assert.equal(authority.relayV2TargetExternalStates.size, 1,
+      "only the freshly-touched foreign entry remains");
+    // The epoch-0 claim must not resurrect: its lease has expired, so the
+    // missing entry (read as epoch 0) still fails the current check.
+    assert.throws(
+      () => authority.fenceRelayV2ExactTarget(preparation.claim, exactInput),
+      (error) => error.code === "PERMISSION_DENIED",
+      "a stale epoch-0 claim must not resurrect after TTL eviction",
+    );
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
 test("exact read observation consumes the admitted claim into a freshly seeded generation", async () => {
   const temp = tempState();
   const backend = new FakeBackend();

@@ -176,6 +176,7 @@ interface RelayV2ExactClaimRecord {
 interface RelayV2TargetExternalState {
   epoch: number;
   operations: number;
+  lastTouchedMs: number;
 }
 
 interface RelayV2ExactObservationRecord {
@@ -825,12 +826,15 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     controlTargetId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
+    this.sweepRelayV2TargetExternalStates();
     const state = this.relayV2TargetExternalStates.get(controlTargetId) ?? {
       epoch: 0,
       operations: 0,
+      lastTouchedMs: 0,
     };
     state.operations += 1;
     state.epoch += 1;
+    state.lastTouchedMs = this.now().getTime();
     this.relayV2TargetExternalStates.set(controlTargetId, state);
     try {
       await this.relayV2WithdrawExactClaimsForTarget(controlTargetId);
@@ -838,6 +842,25 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     } finally {
       state.operations -= 1;
       state.epoch += 1;
+    }
+  }
+
+  /**
+   * Bounds relayV2TargetExternalStates by evicting entries untouched for longer
+   * than the exact-target claim TTL. The TTL floor is load-bearing: a claim
+   * stamped against a missing entry reads epoch 0, so deleting an entry whose
+   * epoch is non-zero would resurrect a stale epoch-0 claim. Every claim's
+   * lease expires after relayV2ExactTargetTtlMs, and an entry can only be
+   * evicted once it has been untouched for at least that long, so by eviction
+   * time every claim that could be resurrected has already expired. Entries
+   * with in-flight operations are never evicted.
+   */
+  private sweepRelayV2TargetExternalStates(): void {
+    const cutoff = this.now().getTime() - this.relayV2ExactTargetTtlMs;
+    for (const [targetId, state] of this.relayV2TargetExternalStates) {
+      if (state.operations === 0 && state.lastTouchedMs < cutoff) {
+        this.relayV2TargetExternalStates.delete(targetId);
+      }
     }
   }
 
