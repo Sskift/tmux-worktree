@@ -61,6 +61,7 @@ import {
   type RelayV2BrokerTransportCloseLease,
   type RelayV2BrokerTransportSocketRegistration,
 } from "./brokerTransportCloseCoordinator.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 type RelayV2BrokerCoreOptions = NonNullable<
   ConstructorParameters<typeof RelayV2BrokerCore>[0]
@@ -429,14 +430,6 @@ function captureNativeTerminalSocket(socket: unknown): NativeTerminalSocket {
     on: captureMethod("on"),
     removeListener: captureMethod("removeListener"),
   });
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function invalidAuthorizationSnapshot(): RelayV2BrokerConnectionAuthorization {

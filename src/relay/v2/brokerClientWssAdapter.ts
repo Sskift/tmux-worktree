@@ -15,6 +15,7 @@ import type {
   RelayV2BrokerClientSocketTransport,
   RelayV2BrokerClientSocketWriteCompletion,
 } from "./brokerClientSocketTransport.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 const CLIENT_PROTOCOL = "tw-relay.v2";
 const OPEN = 1;
@@ -177,14 +178,6 @@ function isRejectedProxy(value: unknown): boolean {
   } catch {
     return true;
   }
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function exactDataRecord(value: unknown, keys: readonly string[]): DataRecord {

@@ -4,6 +4,7 @@ import type {
   RelayV2LiveAuthorizationCloseReason,
   RelayV2LiveAuthorizationCloseSignal,
 } from "./brokerCore.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 const CREDENTIAL_FENCE_CLOSE_DEADLINE_MS = 5_000;
 
@@ -92,14 +93,6 @@ const defaultDeadlineScheduler: RelayV2BrokerTransportCloseDeadlineScheduler = O
     clearTimeout(handle as ReturnType<typeof setTimeout>);
   },
 });
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
-}
 
 function ownDataValue(source: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(source, key);

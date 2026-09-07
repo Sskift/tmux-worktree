@@ -4,6 +4,7 @@ import {
   type RelayV2BrokerAction,
   type RelayV2BrokerResult,
 } from "./brokerCore.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 export const RELAY_V2_BROKER_PRODUCER_MAX_ACTIONS =
   RELAY_V2_BROKER_LIMITS.maxBackpressureSweepActionsPerCarrier;
@@ -354,14 +355,6 @@ function isOpaqueSynchronousBrokerResult(value: unknown): boolean {
 function hasExactKeys(record: OwnDataRecord, expected: readonly string[]): boolean {
   return record.keys.length === expected.length
     && record.keys.every((key) => expected.includes(key));
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function isGeneration(value: unknown): value is string {

@@ -27,6 +27,7 @@ import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
 } from "./codec.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 const DEFAULT_DELIVERY_TIMEOUT_MS = 20_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
@@ -224,14 +225,6 @@ function isRejectedProxy(value: unknown): boolean {
   } catch {
     return true;
   }
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function positiveBounded(
