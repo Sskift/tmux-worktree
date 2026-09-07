@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
 const credentialAuthority = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const credentialVault = await import("../dist/relay/v2/hostCredentialVault.js");
@@ -118,32 +119,14 @@ function openAuthority(vault) {
   });
 }
 
-function tokenIssuer() {
-  let keyring = issuer.createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "host-vault-test-key",
-    secretBase64url: Buffer.alloc(32, 0x72).toString("base64url"),
-    nowSeconds: NOW_SECONDS,
-  });
-  let issued = 0;
-  return () => {
-    issued += 1;
-    const prepared = issuer.prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId: HOST_ID,
-      principalId: "host-principal-uuid",
-      grantId: "host-grant-uuid",
-      nowSeconds: NOW_SECONDS + issued,
-      jti: `host-access-jti-${issued}`,
-    });
-    keyring = prepared.nextKeyring;
-    return {
-      token: prepared.token,
-      jti: prepared.claims.jti,
-      expiresAtMs: prepared.claims.exp * 1_000,
-    };
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "host-vault-test-key",
+  secretByte: 0x72,
+  baseTime: NOW_SECONDS,
+  hostId: HOST_ID,
+  principalId: "host-principal-uuid",
+  grantId: "host-grant-uuid",
+});
 
 function bootstrapPreparation(overrides = {}) {
   return {

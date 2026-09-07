@@ -4,6 +4,8 @@ import { createServer } from "node:http";
 import { Duplex } from "node:stream";
 import test from "node:test";
 import { WebSocket } from "ws";
+import { InMemoryReentrantCredentialStorage as InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
 const hostAdapterModule = await import(
   "../dist/relay/v2/brokerHostWssNodeNoServerAdapter.js"
@@ -110,68 +112,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class InMemoryCredentialStorage {
-  slots = new Map();
-  exclusiveDepth = 0;
-
-  runExclusive(reference, operation) {
-    if (this.exclusiveDepth !== 0) {
-      throw new Error("injected non-reentrant credential storage");
-    }
-    const slot = this.slot(reference);
-    this.exclusiveDepth += 1;
-    try {
-      return operation({
-        read: () => ({
-          state: slot.state === null ? null : structuredClone(slot.state),
-          revision: Object.freeze({ revision: slot.revision }),
-        }),
-        compareAndSwap(_expected, replacement) {
-          slot.state = replacement === null ? null : structuredClone(replacement);
-          slot.revision += 1;
-          return { status: "swapped" };
-        },
-      });
-    } finally {
-      this.exclusiveDepth -= 1;
-    }
-  }
-
-  slot(reference) {
-    let slot = this.slots.get(reference);
-    if (!slot) {
-      slot = { state: null, revision: 0 };
-      this.slots.set(reference, slot);
-    }
-    return slot;
-  }
-}
-
-function tokenIssuer() {
-  let keyring = issuer.createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "host-heartbeat-test-key",
-    secretBase64url: Buffer.alloc(32, 0x61).toString("base64url"),
-    nowSeconds: 1_783_700_000,
-  });
-  let sequence = 0;
-  return () => {
-    sequence += 1;
-    const prepared = issuer.prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId: HOST_ID,
-      principalId: "host-principal-one",
-      grantId: "host-grant-one",
-      nowSeconds: 1_783_700_000 + sequence,
-      jti: `host-access-${sequence}`,
-    });
-    keyring = prepared.nextKeyring;
-    return {
-      token: prepared.token,
-      expiresAtMs: prepared.claims.exp * 1_000,
-    };
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "host-heartbeat-test-key",
+  secretByte: 0x61,
+  baseTime: 1_783_700_000,
+  hostId: HOST_ID,
+  principalId: "host-principal-one",
+  grantId: "host-grant-one",
+  jtiPrefix: "host-access-",
+  includeJti: false,
+});
 
 function credentialHarness() {
   const storage = new InMemoryCredentialStorage();

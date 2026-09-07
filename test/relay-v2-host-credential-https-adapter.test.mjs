@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { deferred, nextTurn } from "./support/async.mjs";
+import { InMemoryReentrantCredentialStorage as InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
 
 const require = createRequire(import.meta.url);
 const mutableNodeHttps = require("node:https");
@@ -370,38 +371,8 @@ const WSS_HOST_EPOCH = "host-epoch-one";
 const WSS_HOST_INSTANCE_ID = "host-instance-one";
 const WSS_CREDENTIAL_REFERENCE = "relay-v2-host-credential-ref:primary";
 
-class InMemoryCredentialStorage {
-  slots = new Map();
-  exclusiveDepth = 0;
-
-  runExclusive(reference, operation) {
-    if (this.exclusiveDepth !== 0) throw new Error("non-reentrant storage");
-    let slot = this.slots.get(reference);
-    if (slot === undefined) {
-      slot = { state: null, revision: 0 };
-      this.slots.set(reference, slot);
-    }
-    this.exclusiveDepth += 1;
-    try {
-      return operation({
-        read: () => ({
-          state: slot.state === null ? null : structuredClone(slot.state),
-          revision: TEST_OBJECT_FREEZE({ revision: slot.revision }),
-        }),
-        compareAndSwap: (_expected, replacement) => {
-          slot.state = replacement === null ? null : structuredClone(replacement);
-          slot.revision += 1;
-          return { status: "swapped" };
-        },
-      });
-    } finally {
-      this.exclusiveDepth -= 1;
-    }
-  }
-}
-
 function wssCredentialHarness() {
-  const storage = new InMemoryCredentialStorage();
+  const storage = new InMemoryCredentialStorage({ reentryMessage: "non-reentrant storage" });
   const authority = new credentialModule.RelayV2HostCredentialAuthority({
     storage,
     secretResolver: {
