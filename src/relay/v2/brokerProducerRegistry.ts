@@ -5,6 +5,7 @@ import {
   type RelayV2BrokerResult,
 } from "./brokerCore.js";
 import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 export const RELAY_V2_BROKER_PRODUCER_MAX_ACTIONS =
   RELAY_V2_BROKER_LIMITS.maxBackpressureSweepActionsPerCarrier;
@@ -267,17 +268,6 @@ type ImmutableJsonValue =
   | string
   | readonly ImmutableJsonValue[]
   | Readonly<Record<string, ImmutableJsonValue>>;
-
-function isRejectedProxy(value: unknown): boolean {
-  if (
-    !((typeof value === "object" && value !== null) || typeof value === "function")
-  ) return false;
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 const NATIVE_PROMISE_OBSERVER = () => undefined;
 

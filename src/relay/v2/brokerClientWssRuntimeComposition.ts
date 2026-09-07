@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { types as nodeUtilTypes } from "node:util";
 
 import {
   RelayV2BrokerAuthorizationExpiryDeadlineOwner,
@@ -62,6 +61,7 @@ import {
   type RelayV2BrokerTransportSocketRegistration,
 } from "./brokerTransportCloseCoordinator.js";
 import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 type RelayV2BrokerCoreOptions = NonNullable<
   ConstructorParameters<typeof RelayV2BrokerCore>[0]
@@ -269,15 +269,6 @@ function deferred(): Deferred {
   });
   void promise.catch(() => {});
   return Object.freeze({ promise, resolve, reject });
-}
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
 }
 
 function captureMethod(value: object, name: string): Function | null {

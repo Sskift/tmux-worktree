@@ -1,5 +1,3 @@
-import { types as nodeUtilTypes } from "node:util";
-
 import {
   RELAY_V2_BROKER_LIMITS,
   type RelayV2BrokerConnectionAuthorization,
@@ -16,6 +14,7 @@ import type {
   RelayV2BrokerClientSocketWriteCompletion,
 } from "./brokerClientSocketTransport.js";
 import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 const CLIENT_PROTOCOL = "tw-relay.v2";
 const OPEN = 1;
@@ -167,17 +166,6 @@ type PendingWrite = {
 
 function failure(): RelayV2BrokerClientWssAdapterError {
   return new RelayV2BrokerClientWssAdapterError();
-}
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
 }
 
 function exactDataRecord(value: unknown, keys: readonly string[]): DataRecord {

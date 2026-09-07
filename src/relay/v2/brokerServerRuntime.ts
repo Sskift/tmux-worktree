@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { types as nodeUtilTypes } from "node:util";
 
 import {
   activateRelayV2BrokerCombinedWssNodeListenerFreeComposition,
@@ -44,6 +43,7 @@ import {
 import {
   RELAY_LARK_BINDINGS_CAPABILITY,
 } from "../extensions/larkBindings/v2/codec.js";
+import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
 
 export interface RelayV2BrokerServerCredentialAuthority
   extends RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort,
@@ -309,17 +309,6 @@ type AgentCapabilityReadinessCapture = Readonly<
   | { outcome: "invalid" }
   | { outcome: "ready"; readiness: CapturedAgentCapabilityReadiness }
 >;
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 const OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS: ReadonlyArray<Readonly<{
   capability: string;

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { types as nodeUtilTypes } from "node:util";
 
 import {
   RELAY_V2_BROKER_LIMITS,
@@ -28,6 +27,7 @@ import {
   encodeRelayV2WebSocketFrame,
 } from "./codec.js";
 import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 const DEFAULT_DELIVERY_TIMEOUT_MS = 20_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
@@ -215,17 +215,6 @@ const defaultScheduler: RelayV2BrokerClientSocketScheduler = Object.freeze({
     return () => clearTimeout(timer);
   },
 });
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function positiveBounded(
   value: number | undefined,

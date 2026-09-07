@@ -22,6 +22,10 @@ import type {
 import {
   RELAY_V2_BROKER_LIMITS,
 } from "./brokerCore.js";
+import {
+  isRejectedProxy as rejectedProxy,
+  captureExactDataRecord,
+} from "./untrustedSnapshot.js";
 
 const CLIENT_SUBPROTOCOL = "tw-relay.v2";
 const REJECT_END_DEADLINE_MS = 1_000;
@@ -141,41 +145,6 @@ function deferred(): Deferred {
   });
   void promise.catch(() => undefined);
   return Object.freeze({ promise, resolve, reject });
-}
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
-
-function captureExactDataRecord(
-  value: unknown,
-  exactKeys: readonly string[],
-): Readonly<Record<string, unknown>> | null {
-  if (value === null || typeof value !== "object" || rejectedProxy(value)) return null;
-  try {
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(descriptors);
-    if (
-      keys.length !== exactKeys.length
-      || keys.some((key) => typeof key !== "string" || !exactKeys.includes(key))
-    ) return null;
-    const captured = Object.create(null) as Record<string, unknown>;
-    for (const key of exactKeys) {
-      const descriptor = descriptors[key];
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
-      captured[key] = descriptor.value;
-    }
-    return Object.freeze(captured);
-  } catch {
-    return null;
-  }
 }
 
 function captureMethod(receiver: object, name: string): Function | null {

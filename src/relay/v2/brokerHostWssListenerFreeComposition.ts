@@ -45,6 +45,10 @@ import {
   type RelayV2BrokerSharedProducerRuntimeActivationOptions,
   type RelayV2BrokerSharedProducerRuntimeCompositionOptions,
 } from "./carrierPump.js";
+import {
+  isRejectedProxy as rejectedProxy,
+  captureExactDataRecord,
+} from "./untrustedSnapshot.js";
 
 const RAW_FACTORY_KEYS = Object.freeze([
   "verifyV2AccessToken",
@@ -145,47 +149,12 @@ export interface RelayV2BrokerCombinedWssNodeListenerFreeComposition {
   closeAndDrain(): Promise<void>;
 }
 
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
-
 function failure(): Error {
   return new Error("Relay v2 Broker Host WSS listener-free composition failed");
 }
 
 function combinedFailure(): Error {
   return new Error(COMBINED_FAILURE_MESSAGE);
-}
-
-function captureExactDataRecord(
-  value: unknown,
-  exactKeys: readonly string[],
-): Readonly<Record<string, unknown>> | null {
-  if (value === null || typeof value !== "object" || rejectedProxy(value)) return null;
-  try {
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(descriptors);
-    if (
-      keys.length !== exactKeys.length
-      || keys.some((key) => typeof key !== "string" || !exactKeys.includes(key))
-    ) return null;
-    const captured = Object.create(null) as Record<string, unknown>;
-    for (const key of exactKeys) {
-      const descriptor = descriptors[key];
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
-      captured[key] = descriptor.value;
-    }
-    return Object.freeze(captured);
-  } catch {
-    return null;
-  }
 }
 
 function captureSharedRuntimeOptions(

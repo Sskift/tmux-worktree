@@ -1,4 +1,4 @@
-import { types as nodeUtilTypes } from "node:util";
+import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
 
 export const RELAY_V2_BROKER_HOST_WSS_MAX_FRAME_BYTES = 1_500_000;
 
@@ -139,17 +139,6 @@ const METHOD_NAMES = Object.freeze([
   "close",
   "terminate",
 ] as const);
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function captureTrustedDescriptor(
   trustedPrototype: object,
