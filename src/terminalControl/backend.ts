@@ -91,6 +91,16 @@ const AGENT_RESUME_INITIAL_SOURCE_WAIT_MS = 2_000;
 const AGENT_RESUME_SUBMIT_RETRY_MS = 500;
 const RENDERED_SNAPSHOT_HISTORY_LINES = 1024;
 
+type AgentSourceBoundary = {
+  paneId: string;
+  provider: TerminalControlAgentSource["provider"];
+  cwd: string;
+  sessionId?: string;
+  startedAtNotBefore: string;
+  expectedUserMessage: string;
+  capturedSource?: TerminalControlAgentSource;
+};
+
 export interface TerminalControlRenderedSnapshot {
   dataBase64: string;
   truncated: boolean;
