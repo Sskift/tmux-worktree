@@ -1,3 +1,4 @@
+use crate::config::trimmed_non_empty_string;
 use crate::features::sessions::tmux_session_exists;
 use crate::ipc::CreateArgs;
 use crate::support::{app_home_dir_or_tmp, shell_quote};
@@ -92,21 +93,12 @@ fn automation_runs_path() -> std::path::PathBuf {
     app_home_dir_or_tmp().join(".tw-dashboard-automation-runs.json")
 }
 
-pub(crate) fn trimmed_non_empty(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 fn optional_string_patch(
     existing: Option<String>,
     patch: Option<Option<String>>,
 ) -> Option<String> {
     match patch {
-        Some(Some(value)) => trimmed_non_empty(value),
+        Some(Some(value)) => trimmed_non_empty_string(value),
         Some(None) => None,
         None => existing,
     }
@@ -212,8 +204,8 @@ where
 
     let ai_cmd = automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
     let start_result = create(CreateArgs {
-        project: automation.project.clone().and_then(trimmed_non_empty),
-        path: automation.path.clone().and_then(trimmed_non_empty),
+        project: automation.project.clone().and_then(trimmed_non_empty_string),
+        path: automation.path.clone().and_then(trimmed_non_empty_string),
         ai_cmd,
         name: Some(automation.name.clone()),
         branch: None,
@@ -262,7 +254,7 @@ pub(crate) fn upsert_automation_from_input(
     input: SaveAutomationInput,
     now: &str,
 ) -> Result<UpsertAutomationResult, String> {
-    let input_id = input.id.and_then(trimmed_non_empty);
+    let input_id = input.id.and_then(trimmed_non_empty_string);
     let existing_index = input_id.as_deref().and_then(|id| {
         automations
             .iter()
@@ -277,7 +269,7 @@ pub(crate) fn upsert_automation_from_input(
         .unwrap_or_else(|| new_prefixed_id("auto"));
     let name = input
         .name
-        .and_then(trimmed_non_empty)
+        .and_then(trimmed_non_empty_string)
         .or_else(|| existing.as_ref().map(|automation| automation.name.clone()))
         .unwrap_or_else(|| "Untitled automation".to_string());
     let enabled = input
@@ -314,7 +306,7 @@ pub(crate) fn upsert_automation_from_input(
     );
     let ai_cmd = input
         .ai_cmd
-        .and_then(trimmed_non_empty)
+        .and_then(trimmed_non_empty_string)
         .or_else(|| {
             existing
                 .as_ref()
@@ -453,7 +445,7 @@ pub(crate) fn list_automation_runs(
     automation_id: Option<String>,
 ) -> Result<Vec<AutomationRun>, String> {
     let mut runs = load_automation_runs_from_disk()?;
-    if let Some(id) = automation_id.and_then(trimmed_non_empty) {
+    if let Some(id) = automation_id.and_then(trimmed_non_empty_string) {
         runs.retain(|run| run.automation_id == id);
     }
     runs.truncate(AUTOMATION_RUN_LIMIT);
