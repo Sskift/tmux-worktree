@@ -39,6 +39,40 @@ for (const [name, relativePath] of Object.entries(manifest.bin ?? {})) {
   requiredFiles.add(relativePath);
 }
 
+// Release-facing manifests must all advertise the same version. A drift here
+// (e.g. Android versionName left behind) silently breaks the upgrade chain,
+// so this is a prepack gate, not just a test. Mirrors the assertion in
+// test/update-cli.test.mjs.
+const readVersionManifest = (relativePath) =>
+  JSON.parse(readFileSync(resolve(repositoryRoot, relativePath), "utf8")).version;
+const appVersion = readVersionManifest("app/package.json");
+const tauriVersion = readVersionManifest("app/src-tauri/tauri.conf.json");
+const cargoToml = readFileSync(resolve(repositoryRoot, "app/src-tauri/Cargo.toml"), "utf8");
+const cargoPackageSection = cargoToml.split(/^\[/m).find((section) =>
+  section.startsWith("package]"),
+) ?? "";
+const cargoVersion = cargoPackageSection.match(/^version = "([^"]+)"/m)?.[1];
+const androidBuildGradle = readFileSync(
+  resolve(repositoryRoot, "mobile/android/app/build.gradle.kts"),
+  "utf8",
+);
+const androidVersion = androidBuildGradle.match(/^\s+versionName = "([^"]+)"/m)?.[1];
+const androidVersionCode = Number(androidBuildGradle.match(/^\s+versionCode = (\d+)/m)?.[1]);
+
+for (const [label, value] of [
+  ["app/package.json", appVersion],
+  ["app/src-tauri/tauri.conf.json", tauriVersion],
+  ["app/src-tauri/Cargo.toml", cargoVersion],
+  ["mobile/android/app/build.gradle.kts versionName", androidVersion],
+]) {
+  if (value !== manifest.version) {
+    fail(`${label} version ${JSON.stringify(value)} != package.json version ${JSON.stringify(manifest.version)}`);
+  }
+}
+if (!Number.isInteger(androidVersionCode) || androidVersionCode <= 0) {
+  fail(`mobile/android/app/build.gradle.kts versionCode must be a positive integer`);
+}
+
 const cli = readFileSync(resolve(repositoryRoot, "dist/cli.cjs"), "utf8");
 if (!cli.startsWith("#!/usr/bin/env node\n") || cli.length < 1_000) {
   fail("dist/cli.cjs is missing, truncated, or lacks its Node shebang");
