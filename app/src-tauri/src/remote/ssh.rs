@@ -793,6 +793,9 @@ mod tests {
 
     #[test]
     fn terminal_control_path_avoids_legacy_directory_and_fits_real_home() {
+        // Other tests mutate HOME for the duration of their assertions; take
+        // the shared env lock so dirs::home_dir() observes the restored value.
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
         let temp = tempfile::Builder::new()
             .prefix("twc")
             .tempdir_in("/tmp")
