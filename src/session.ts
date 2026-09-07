@@ -433,6 +433,125 @@ function lifecycleRecordWasCommittedAfterTmuxMutation(
 }
 
 /**
+ * Shared commit-and-rollback skeleton for create-terminal and
+ * restore-worktree: start the tmux session, capture the lifecycle v2
+ * identity, persist the managed-state record, and confirm the commit.
+ * Returns the captured lifecycle (if any) so the caller can build its own
+ * result shape. The base record and rollback labels are per-flow.
+ */
+function commitAndRollbackOperation(options: {
+  operation: "create-terminal" | "restore-worktree";
+  session: string;
+  startCwd: string;
+  aiCmd: string;
+  baseRecord: ManagedSession;
+  rollbackStopLabel: string;
+  rollbackDoneLabel: string;
+  tmux: string;
+  exec: (bin: string, args: string[], timeout?: number) => void;
+  setupBindings: () => void;
+  preparedLifecycle: PreparedLifecycleV2Create | undefined;
+  listLifecycle: () => TmuxSessionLifecycleEntry[];
+  loadMutationState: () => ManagedState;
+  deps: CreateManagedWorktreeSessionDeps;
+}): ReturnType<typeof captureLifecycleV2> | undefined {
+  const {
+    operation, session, startCwd, aiCmd, baseRecord,
+    rollbackStopLabel, rollbackDoneLabel,
+    tmux, exec, setupBindings, preparedLifecycle,
+    listLifecycle, loadMutationState, deps,
+  } = options;
+  let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
+  try {
+    startManagedSession(
+      tmux,
+      session,
+      startCwd,
+      aiCmd,
+      exec,
+      setupBindings,
+      preparedLifecycle,
+    );
+  } catch (error) {
+    if (!preparedLifecycle) throw error;
+    try {
+      capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+        operation,
+        "tmux start confirmation",
+        session,
+        preparedLifecycle,
+        listLifecycle,
+      );
+    } catch {
+      throw new ManagedSessionLifecycleV2InDoubtError(
+        `RPC v2 ${operation} could not confirm whether tmux session ${session} was created: ${errorDetail(error)}`,
+      );
+    }
+  }
+  if (preparedLifecycle && !capturedLifecycle) {
+    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+      operation,
+      "initial tmux identity capture",
+      session,
+      preparedLifecycle,
+      listLifecycle,
+    );
+  }
+  const record = capturedLifecycle
+    ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
+    : baseRecord;
+  try {
+    persistManagedSession(record, deps);
+  } catch (error) {
+    if (capturedLifecycle) {
+      if (!lifecycleRecordWasCommittedAfterTmuxMutation(
+        operation,
+        "state commit re-read",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
+        throw new ManagedSessionLifecycleV2InDoubtError(
+          `RPC v2 ${operation} state commit is uncertain for ${session}: ${errorDetail(error)}`,
+        );
+      }
+    } else {
+      try {
+        rollbackManagedSession(session, tmux, exec, deps.killSession);
+      } catch (rollbackError) {
+        throw appendRollbackFailures(
+          new CliError(`写入 TW state 失败: ${errorDetail(error)}`),
+          [`停止 ${rollbackStopLabel} ${session} 失败: ${errorDetail(rollbackError)}`],
+        );
+      }
+      throw new CliError(`写入 TW state 失败，已回滚 ${rollbackDoneLabel}: ${errorDetail(error)}`);
+    }
+  }
+  if (capturedLifecycle) {
+    const confirmed = captureLifecycleV2AfterTmuxMutation(
+      operation,
+      "final tmux identity confirmation",
+      session,
+      preparedLifecycle!,
+      listLifecycle,
+    );
+    if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
+      || !lifecycleRecordWasCommittedAfterTmuxMutation(
+        operation,
+        "final state commit confirmation",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
+      throw new ManagedSessionLifecycleV2InDoubtError(
+        `RPC v2 ${operation} commit could not be confirmed for ${session}`,
+      );
+    }
+  }
+  return capturedLifecycle;
+}
+
+/**
  * Every new TW-managed worktree uses the same single-pane tmux contract.
  * `profile` remains managed-state provenance for compatibility with existing
  * CLI and Dashboard records; it must never select a different pane layout.
@@ -801,42 +920,6 @@ export function createManagedTerminalSession(
   } while (sessionExists(session));
   const createdAt = managedSessionCreatedAt(now);
 
-  let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
-  try {
-    startManagedSession(
-      tmux,
-      session,
-      cwd,
-      params.aiCmd ?? "",
-      exec,
-      setupBindings,
-      preparedLifecycle,
-    );
-  } catch (error) {
-    if (!preparedLifecycle) throw error;
-    try {
-      capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
-        "create-terminal",
-        "tmux start confirmation",
-        session,
-        preparedLifecycle,
-        listLifecycle,
-      );
-    } catch {
-      throw new ManagedSessionLifecycleV2InDoubtError(
-        `RPC v2 create-terminal could not confirm whether tmux session ${session} was created: ${errorDetail(error)}`,
-      );
-    }
-  }
-  if (preparedLifecycle && !capturedLifecycle) {
-    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
-      "create-terminal",
-      "initial tmux identity capture",
-      session,
-      preparedLifecycle,
-      listLifecycle,
-    );
-  }
   const baseRecord: ManagedSession = {
     name: session,
     kind: "terminal",
@@ -844,57 +927,22 @@ export function createManagedTerminalSession(
     cwd,
     createdAt,
   };
-  const record = capturedLifecycle
-    ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
-    : baseRecord;
-  try {
-    persistManagedSession(record, deps);
-  } catch (error) {
-    if (capturedLifecycle) {
-      if (!lifecycleRecordWasCommittedAfterTmuxMutation(
-        "create-terminal",
-        "state commit re-read",
-        session,
-        capturedLifecycle.extension,
-        loadMutationState,
-      )) {
-        throw new ManagedSessionLifecycleV2InDoubtError(
-          `RPC v2 create-terminal state commit is uncertain for ${session}: ${errorDetail(error)}`,
-        );
-      }
-    } else {
-      try {
-        rollbackManagedSession(session, tmux, exec, deps.killSession);
-      } catch (rollbackError) {
-        throw appendRollbackFailures(
-          new CliError(`写入 TW state 失败: ${errorDetail(error)}`),
-          [`停止 tmux session ${session} 失败: ${errorDetail(rollbackError)}`],
-        );
-      }
-      throw new CliError(`写入 TW state 失败，已回滚 terminal session: ${errorDetail(error)}`);
-    }
-  }
-  if (capturedLifecycle) {
-    const confirmed = captureLifecycleV2AfterTmuxMutation(
-      "create-terminal",
-      "final tmux identity confirmation",
-      session,
-      preparedLifecycle!,
-      listLifecycle,
-    );
-    if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
-      || !lifecycleRecordWasCommittedAfterTmuxMutation(
-        "create-terminal",
-        "final state commit confirmation",
-        session,
-        capturedLifecycle.extension,
-        loadMutationState,
-      )) {
-      throw new ManagedSessionLifecycleV2InDoubtError(
-        `RPC v2 create-terminal commit could not be confirmed for ${session}`,
-      );
-    }
-  }
+  const capturedLifecycle = commitAndRollbackOperation({
+    operation: "create-terminal",
+    session,
+    startCwd: cwd,
+    aiCmd: params.aiCmd ?? "",
+    baseRecord,
+    rollbackStopLabel: "tmux session",
+    rollbackDoneLabel: "terminal session",
+    tmux,
+    exec,
+    setupBindings,
+    preparedLifecycle,
+    listLifecycle,
+    loadMutationState,
+    deps,
+  });
   return {
     session,
     cwd,
@@ -1124,43 +1172,6 @@ export function restoreManagedWorktreeSession(
 
   const session = resolveSessionName(params.sessionName.trim(), sessionExists);
   if (!session) throw new CliError("session name required");
-  let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
-  try {
-    startManagedSession(
-      tmux,
-      session,
-      worktreePath,
-      params.aiCmd ?? "",
-      exec,
-      setupBindings,
-      preparedLifecycle,
-    );
-  } catch (error) {
-    if (!preparedLifecycle) throw error;
-    try {
-      capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
-        "restore-worktree",
-        "tmux start confirmation",
-        session,
-        preparedLifecycle,
-        listLifecycle,
-      );
-    } catch {
-      throw new ManagedSessionLifecycleV2InDoubtError(
-        `RPC v2 restore-worktree could not confirm whether tmux session ${session} was created: ${errorDetail(error)}`,
-      );
-    }
-  }
-  if (preparedLifecycle && !capturedLifecycle) {
-    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
-      "restore-worktree",
-      "initial tmux identity capture",
-      session,
-      preparedLifecycle,
-      listLifecycle,
-    );
-  }
-
   const baseRecord: ManagedSession = {
     name: session,
     kind: "worktree",
@@ -1173,57 +1184,22 @@ export function restoreManagedWorktreeSession(
     cwd: worktreePath,
     createdAt: now().toISOString(),
   };
-  const record = capturedLifecycle
-    ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
-    : baseRecord;
-  try {
-    persistManagedSession(record, deps);
-  } catch (error) {
-    if (capturedLifecycle) {
-      if (!lifecycleRecordWasCommittedAfterTmuxMutation(
-        "restore-worktree",
-        "state commit re-read",
-        session,
-        capturedLifecycle.extension,
-        loadMutationState,
-      )) {
-        throw new ManagedSessionLifecycleV2InDoubtError(
-          `RPC v2 restore-worktree state commit is uncertain for ${session}: ${errorDetail(error)}`,
-        );
-      }
-    } else {
-      try {
-        rollbackManagedSession(session, tmux, exec, deps.killSession);
-      } catch (rollbackError) {
-        throw appendRollbackFailures(
-          new CliError(`写入 TW state 失败: ${errorDetail(error)}`),
-          [`停止 restored tmux session ${session} 失败: ${errorDetail(rollbackError)}`],
-        );
-      }
-      throw new CliError(`写入 TW state 失败，已回滚 restored session: ${errorDetail(error)}`);
-    }
-  }
-  if (capturedLifecycle) {
-    const confirmed = captureLifecycleV2AfterTmuxMutation(
-      "restore-worktree",
-      "final tmux identity confirmation",
-      session,
-      preparedLifecycle!,
-      listLifecycle,
-    );
-    if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
-      || !lifecycleRecordWasCommittedAfterTmuxMutation(
-        "restore-worktree",
-        "final state commit confirmation",
-        session,
-        capturedLifecycle.extension,
-        loadMutationState,
-      )) {
-      throw new ManagedSessionLifecycleV2InDoubtError(
-        `RPC v2 restore-worktree commit could not be confirmed for ${session}`,
-      );
-    }
-  }
+  const capturedLifecycle = commitAndRollbackOperation({
+    operation: "restore-worktree",
+    session,
+    startCwd: worktreePath,
+    aiCmd: params.aiCmd ?? "",
+    baseRecord,
+    rollbackStopLabel: "restored tmux session",
+    rollbackDoneLabel: "restored session",
+    tmux,
+    exec,
+    setupBindings,
+    preparedLifecycle,
+    listLifecycle,
+    loadMutationState,
+    deps,
+  });
   return {
     session,
     workDir: worktreePath,
