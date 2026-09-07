@@ -1,4 +1,5 @@
 import type { RelayV2JsonValue } from "./strictJson.js";
+import { createCodecSchemaHelpers } from "./codecSchemaHelpers.js";
 
 const BUFFER_CONSTRUCTOR = Buffer;
 const BUFFER_BYTE_LENGTH = BUFFER_CONSTRUCTOR.byteLength;
@@ -135,166 +136,30 @@ const COMMAND_DISPOSITIONS = [
   "not_applicable",
 ] as const;
 
-const COUNTER_MAX = 18_446_744_073_709_551_615n;
-
 function reject(failureClass: RelayV2CodecFailureClass): never {
   throw new RelayV2SchemaError(failureClass);
 }
 
-function object(value: RelayV2JsonValue): RelayV2JsonObject {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "object"
-    || REFLECT_APPLY(ARRAY_IS_ARRAY, ARRAY_CONSTRUCTOR, [value])) {
-    reject("type-coercion");
-  }
-  return value;
-}
-
-function exact(
-  value: RelayV2JsonObject,
-  required: readonly string[],
-  optional: readonly string[] = [],
-): void {
-  const allowed = new Set([...required, ...optional]);
-  for (const key of required) {
-    if (!OBJECT_HAS_OWN(value, key)) reject("missing-field");
-  }
-  for (const key of OBJECT_KEYS(value)) {
-    if (!allowed.has(key)) reject("unknown-field");
-  }
-}
-
-function field(value: RelayV2JsonObject, name: string): RelayV2JsonValue {
-  if (!OBJECT_HAS_OWN(value, name)) reject("missing-field");
-  return value[name]!;
-}
-
-function stringValue(
-  value: RelayV2JsonValue,
-  options: {
-    allowEmpty?: boolean;
-    allowOuterWhitespace?: boolean;
-    maxBytes?: number;
-    maxCharacters?: number;
-    allowNul?: boolean;
-  } = {},
-): string {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!options.allowEmpty && value.length === 0) reject("invalid-argument");
-  if (!options.allowNul
-    && REFLECT_APPLY(STRING_INCLUDES, value, ["\0"])) reject("invalid-argument");
-  if (!options.allowOuterWhitespace
-    && REFLECT_APPLY(STRING_TRIM, value, []) !== value) reject("invalid-argument");
-  if (
-    options.maxBytes !== undefined
-    && BUFFER_BYTE_LENGTH(value, "utf8") > options.maxBytes
-  ) {
-    reject("id-byte-limit");
-  }
-  if (
-    options.maxCharacters !== undefined
-    && (
-      REFLECT_APPLY(ARRAY_FROM, ARRAY_CONSTRUCTOR, [value]) as unknown[]
-    ).length > options.maxCharacters
-  ) {
-    reject("invalid-argument");
-  }
-  return value;
-}
-
-function id(value: RelayV2JsonValue): string {
-  return stringValue(value, { maxBytes: 128 });
-}
-
-function cursor(value: RelayV2JsonValue): string {
-  return stringValue(value, { maxBytes: 1_024 });
-}
-
-function nullable<T>(
-  value: RelayV2JsonValue,
-  validator: (item: RelayV2JsonValue) => T,
-): T | null {
-  return value === null ? null : validator(value);
-}
-
-function booleanValue(value: RelayV2JsonValue): boolean {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "boolean") reject("type-coercion");
-  return value;
-}
-
-function nullValue(value: RelayV2JsonValue): null {
-  if (value !== null) reject("schema-mismatch");
-  return null;
-}
-
-function integer(
-  value: RelayV2JsonValue,
-  minimum = 0,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (value === null) reject("forbidden-null");
-  if (
-    typeof value !== "number"
-    || !Number.isSafeInteger(value)
-    || Object.is(value, -0)
-  ) {
-    reject("type-coercion");
-  }
-  if (value < minimum || value > maximum) reject("invalid-argument");
-  return value;
-}
-
-function literal<T extends string | number | boolean>(
-  value: RelayV2JsonValue,
-  expected: T,
-): T {
-  if (value !== expected) {
-    if (value === null) reject("forbidden-null");
-    reject("schema-mismatch");
-  }
-  return expected;
-}
-
-function oneOf<const T extends readonly string[]>(
-  value: RelayV2JsonValue,
-  allowed: T,
-): T[number] {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!(allowed as readonly string[]).includes(value)) reject("schema-mismatch");
-  return value as T[number];
-}
-
-function array(
-  value: RelayV2JsonValue,
-  validator: (item: RelayV2JsonValue) => void,
-  maximum: number,
-  minimum = 0,
-): RelayV2JsonValue[] {
-  if (value === null) reject("forbidden-null");
-  if (!REFLECT_APPLY(ARRAY_IS_ARRAY, ARRAY_CONSTRUCTOR, [value])) {
-    reject("type-coercion");
-  }
-  if (value.length < minimum || value.length > maximum) reject("invalid-argument");
-  for (const item of value) validator(item);
-  return value;
-}
-
-function counter(value: RelayV2JsonValue): string {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) reject("non-canonical-counter");
-  if (BigInt(value) > COUNTER_MAX) reject("counter-overflow");
-  return value;
-}
-
-function positiveCounter(value: RelayV2JsonValue): string {
-  const parsed = counter(value);
-  if (parsed === "0") reject("invalid-argument");
-  return parsed;
-}
+const {
+  array,
+  booleanValue,
+  counter,
+  cursor,
+  exact,
+  field,
+  id,
+  integer,
+  literal,
+  nullable,
+  nullValue,
+  object,
+  oneOf,
+  positiveCounter,
+  stringValue,
+} = createCodecSchemaHelpers(
+  (failureClass) => reject(failureClass as RelayV2CodecFailureClass),
+  { wellFormedStrings: false },
+);
 
 const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
