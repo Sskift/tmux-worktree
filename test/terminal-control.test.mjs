@@ -3330,6 +3330,26 @@ test("cold-resumed Agent input excludes hydration and binds a delayed transcript
     );
     assert.equal(status.agentRunning, true);
     assert.equal(status.source?.turnId, "019f8888-8888-7888-8888-888888888888");
+    const settled = await backend.agentStatus(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      output.generation,
+      "0",
+    );
+    assert.equal(
+      settled.agentRunning,
+      false,
+      "the correlated boundary is consumed instead of replaying a completed source forever",
+    );
+    const result = await backend.agentResult(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      output.generation,
+      "0",
+      status.source,
+      terminalControl.TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
+    );
+    assert.equal(result.text, "DELAYED-ACK");
   } finally {
     if (previousShell === undefined) delete process.env.SHELL;
     else process.env.SHELL = previousShell;

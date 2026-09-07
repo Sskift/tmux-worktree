@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.feature
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -179,7 +180,7 @@ class CreationScreensInstrumentedTest {
     }
 
     @Test
-    fun worktreeCreationDisablesEveryVisibleBackAction() {
+    fun worktreeCreationAllowsLeavingButDisablesDuplicateSubmit() {
         val host = RelayHost("host")
         val scope = RelayScope("host", "local")
         composeRule.setContent {
@@ -216,8 +217,8 @@ class CreationScreensInstrumentedTest {
             }
         }
 
-        composeRule.onNodeWithTag("topbar_back").assertIsNotEnabled()
-        composeRule.onNodeWithTag("create_back").assertIsNotEnabled()
+        composeRule.onNodeWithTag("topbar_back").assertIsEnabled()
+        composeRule.onNodeWithTag("create_back").assertIsEnabled()
         composeRule.onNodeWithTag("create_submit").assertIsNotEnabled()
     }
 

@@ -1692,6 +1692,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             permission = AgentNotificationPermission.GRANTED,
             profileActive = true,
             policy = AgentNotificationPolicy.ALLOW,
+            completed = true,
         ),
     )
 

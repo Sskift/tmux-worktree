@@ -2645,7 +2645,13 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           && error.code === "RESOURCE_EXHAUSTED"
           && error.retryable)) throw error;
       }
-      delete boundary.capturedSource;
+      // The boundary exists only to correlate the first status observation
+      // after an exact submitted input. Once that source has been handed to
+      // the caller, retaining the boundary would rediscover the same completed
+      // transcript on every later poll and falsely report the Agent as running
+      // forever. The caller keeps the immutable source for the eventual
+      // activity.agent-result request, so consume the whole boundary here.
+      this.agentSourceBoundaries.delete(boundaryKey);
       return { agentSupported: true, agentRunning: true, provider, source, progress };
     }
     if (!observed.agentRunning) {
