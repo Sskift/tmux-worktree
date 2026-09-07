@@ -624,9 +624,7 @@ fn valid_csi_reply(sequence: &[u8]) -> bool {
             body == "0"
                 || body.strip_prefix('?').is_some_and(|value| {
                     matches!(value, "0" | "10" | "11" | "13" | "20" | "21" | "53")
-                        || value
-                            .strip_prefix("27;")
-                            .is_some_and(|suffix| numeric(suffix))
+                        || value.strip_prefix("27;").is_some_and(&numeric)
                 })
         }
         b't' => {

@@ -406,7 +406,7 @@ impl ExactChildAuthority {
             Some(status) => {
                 let exit = child_exit(status);
                 let stderr_log = self.stderr_log.clone();
-                state.exit = Some(exit.clone());
+                state.exit = Some(exit);
                 drop(state);
                 if let Some(path) = stderr_log {
                     append_management_child_exit_line(&path, &status);
@@ -458,7 +458,7 @@ impl ChildLifecycle for ExactChildAuthority {
             }
         };
         let stderr_log = self.stderr_log.clone();
-        state.exit = Some(exit.clone());
+        state.exit = Some(exit);
         drop(state);
         if let Some(path) = stderr_log {
             append_management_child_exit_line(&path, &status);
@@ -1944,10 +1944,10 @@ fn supervise_child(manager: std::sync::Weak<ManagerInner>) {
         }
         if !manager.in_flight.load(Ordering::Acquire) {
             if let Ok(_observation) = manager.observation.try_lock() {
-                if !manager.in_flight.load(Ordering::Acquire) {
-                    if manager.observe_idle_child().is_some() {
-                        return;
-                    }
+                if !manager.in_flight.load(Ordering::Acquire)
+                    && manager.observe_idle_child().is_some()
+                {
+                    return;
                 }
             }
         }

@@ -366,9 +366,10 @@ pub(crate) fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> 
             );
         }
         serde_json::Value::Array(projects) => {
-            if let Some(existing) = projects.iter_mut().find(|item| {
-                string_field(item, &["name", "key", "id", "label"]).as_deref() == Some(name)
-            }) {
+            if let Some(existing) = projects
+                .iter_mut()
+                .find(|item| string_field(item, &["name", "key", "id", "label"]) == Some(name))
+            {
                 *existing = serde_json::json!({ "name": name, "path": path });
             } else {
                 projects.push(serde_json::json!({ "name": name, "path": path }));

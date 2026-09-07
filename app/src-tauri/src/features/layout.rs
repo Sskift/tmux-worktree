@@ -123,7 +123,7 @@ fn canonical_json_number_text(text: &str) -> Option<CanonicalJsonNumber> {
         Some(unsigned) => (true, unsigned),
         None => (false, text),
     };
-    let exponent_index = unsigned.find(|character| character == 'e' || character == 'E');
+    let exponent_index = unsigned.find(['e', 'E']);
     let (mantissa, explicit_exponent) = match exponent_index {
         Some(index) => {
             let exponent = unsigned.get(index + 1..)?.parse::<i64>().ok()?;

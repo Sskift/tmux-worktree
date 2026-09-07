@@ -204,7 +204,10 @@ where
 
     let ai_cmd = automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
     let start_result = create(CreateArgs {
-        project: automation.project.clone().and_then(trimmed_non_empty_string),
+        project: automation
+            .project
+            .clone()
+            .and_then(trimmed_non_empty_string),
         path: automation.path.clone().and_then(trimmed_non_empty_string),
         ai_cmd,
         name: Some(automation.name.clone()),

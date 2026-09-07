@@ -182,7 +182,7 @@ struct FeishuBridgeInstanceLock {
 fn socket_path() -> Result<PathBuf, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let preferred = home.join(".tmux-worktree").join("feishu-bridge-v1.sock");
-    if preferred.to_string_lossy().as_bytes().len() <= 100 {
+    if preferred.to_string_lossy().len() <= 100 {
         return Ok(preferred);
     }
     let digest = Sha256::digest(home.to_string_lossy().as_bytes());

@@ -137,7 +137,7 @@ fn terminal_control_ssh_bind_path_len(control_path: &str) -> usize {
     // OpenSSH expands %C to its 40-character connection hash (including %j).
     // A new master first binds the expanded path plus "." and 16 random
     // characters before atomically moving the socket into place.
-    control_path.as_bytes().len() - "%C".len() + 40 + 17
+    control_path.len() - "%C".len() + 40 + 17
 }
 
 fn terminal_control_ssh_digest(host: &HostConfig, domain: &[u8]) -> Vec<u8> {

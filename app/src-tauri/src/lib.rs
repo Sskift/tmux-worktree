@@ -49,7 +49,7 @@ pub fn run() {
             let (relay_v2_management, restore_self_hosted_connector) =
                 match prepare_relay_v2_self_hosted_management_prerequisites() {
                     Ok(None) => (
-                        MobileRelayV2ManagementCommandState::start(&app.handle()),
+                        MobileRelayV2ManagementCommandState::start(app.handle()),
                         None,
                     ),
                     Ok(Some(prepared)) => {
@@ -57,7 +57,7 @@ pub fn run() {
                         match prepared.management_binding() {
                             Ok(binding) => (
                                 MobileRelayV2ManagementCommandState::start_self_hosted(
-                                    &app.handle(),
+                                    app.handle(),
                                     selection,
                                     move || prepared.commit_ready(),
                                 ),
@@ -96,7 +96,7 @@ pub fn run() {
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
             setup_clipboard_bindings();
-            restore_window_layout(&app.handle());
+            restore_window_layout(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

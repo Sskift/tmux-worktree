@@ -341,7 +341,7 @@ fn socket_path() -> PathBuf {
     }
     let home = app_home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let preferred = home.join(".tmux-worktree").join("terminal-control-v1.sock");
-    if preferred.to_string_lossy().as_bytes().len() <= 100 {
+    if preferred.to_string_lossy().len() <= 100 {
         return preferred;
     }
     let digest = Sha256::digest(home.to_string_lossy().as_bytes());
@@ -485,7 +485,7 @@ fn remote_terminal_control_command(host: &HostConfig, mode: &str) -> String {
         .is_some_and(|path| !path.trim().is_empty())
     {
         command.push_str("TW_TMUX=");
-        command.push_str(&remote_tmux_cmd(&host));
+        command.push_str(&remote_tmux_cmd(host));
         command.push(' ');
     }
     command.push_str(&remote_tw_cmd(host));
@@ -1455,7 +1455,7 @@ mod tests {
             .join(format!("tw-terminal-control-{suffix}"))
             .join("v1.sock");
         assert_eq!(socket_path(), expected_hashed_socket);
-        assert!(socket_path().to_string_lossy().as_bytes().len() <= 100);
+        assert!(socket_path().to_string_lossy().len() <= 100);
         unsafe {
             std::env::set_var("TW_DASHBOARD_HOME", &dashboard_home);
         }

@@ -203,23 +203,17 @@ fn ssh_hosts_from_config_text(text: &str, include_alias: fn(&str) -> bool) -> Ve
                 }
                 current = SshHostBlock::default();
             }
-            "user" => {
-                if !value.is_empty() {
-                    current.user = Some(value.to_string());
-                }
+            "user" if !value.is_empty() => {
+                current.user = Some(value.to_string());
             }
             "port" => {
                 current.port = value.parse::<u16>().ok();
             }
-            "hostname" => {
-                if !value.is_empty() {
-                    current.host_name = Some(value.to_string());
-                }
+            "hostname" if !value.is_empty() => {
+                current.host_name = Some(value.to_string());
             }
-            "proxyjump" => {
-                if !value.is_empty() {
-                    current.proxy_jump = Some(value.to_string());
-                }
+            "proxyjump" if !value.is_empty() => {
+                current.proxy_jump = Some(value.to_string());
             }
             _ => {}
         }
