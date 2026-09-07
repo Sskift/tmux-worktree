@@ -711,11 +711,11 @@ export function canonicalTerminalControlSocketPath(home?: string): string {
 
 export class CanonicalTerminalControlSocketClient implements CanonicalTerminalControlClient {
   private readonly socketPath: string;
-  private readonly timeoutMs: number;
+  private readonly timeoutMs: number | undefined;
 
   constructor(options: { socketPath?: string; timeoutMs?: number } = {}) {
     this.socketPath = options.socketPath ?? canonicalTerminalControlSocketPath();
-    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.timeoutMs = options.timeoutMs;
   }
 
   async capabilities(): Promise<CanonicalTerminalControlCapabilities> {
@@ -971,7 +971,7 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
     } as TerminalControlRequestInput;
     return requestTerminalControl(input, {
       socketPath: this.socketPath,
-      timeoutMs: this.timeoutMs,
+      ...(this.timeoutMs === undefined ? {} : { timeoutMs: this.timeoutMs }),
     });
   }
 }

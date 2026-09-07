@@ -11,6 +11,7 @@ import {
   TerminalControlProtocolError,
 } from "./protocol";
 import { terminalControlSocketPath } from "./store";
+import { TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS } from "./timeouts";
 
 type DistributiveRequestInput<T> = T extends TerminalControlRequest
   ? Omit<T, "protocolVersion" | "requestId">
@@ -208,7 +209,9 @@ export async function requestTerminalControl<T = unknown>(
   } = {},
 ): Promise<T> {
   const socketPath = options.socketPath ?? terminalControlSocketPath();
-  const timeoutMs = options.timeoutMs ?? 10_000;
+  const timeoutMs = options.timeoutMs ?? (input.type === "input.agent-message"
+    ? TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS
+    : 10_000);
   const request = {
     ...input,
     protocolVersion: TERMINAL_CONTROL_PROTOCOL_VERSION,

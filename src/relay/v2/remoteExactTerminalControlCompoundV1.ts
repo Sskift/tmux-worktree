@@ -31,6 +31,8 @@ import {
   terminalControlStoreLockOwnerProcessId,
   type TerminalControlStoreLock,
 } from "../../terminalControl/store.js";
+import { TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS } from
+  "../../terminalControl/timeouts.js";
 import type {
   RelayV2ExactTerminalControlTargetEvidenceV1,
   RelayV2ExactTerminalControlTargetInputV1,
@@ -47,7 +49,8 @@ import {
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION = 1 as const;
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT = "rpc-v2-remote-exact-v1" as const;
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES = 384 * 1024;
-export const RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS = 30_000;
+export const RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS =
+  TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS;
 
 const MAX_ACTIVE_CHANNELS = 256;
 const DAEMON_UPGRADE_TIMEOUT_MS = 5_000;

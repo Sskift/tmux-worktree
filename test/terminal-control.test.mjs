@@ -40,6 +40,28 @@ const isolatedTmuxWrapper = join(isolatedTmuxWrapperRoot, "isolated-tmux");
 
 after(() => rmSync(isolatedTmuxWrapperRoot, { recursive: true, force: true }));
 
+test("Agent cold-resume timeout layers preserve backend and transport ordering", () => {
+  assert.equal(
+    terminalControl.TERMINAL_CONTROL_AGENT_MESSAGE_BACKEND_MAX_MS,
+    terminalControl.TERMINAL_CONTROL_CODEX_ENVIRONMENT_HYDRATION_TIMEOUT_MS
+      + terminalControl.TERMINAL_CONTROL_AGENT_RESUME_INPUT_TIMEOUT_MS,
+  );
+  assert.ok(
+    exactCompound.RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS
+      > terminalControl.TERMINAL_CONTROL_AGENT_MESSAGE_BACKEND_MAX_MS,
+    "the compound transport must leave margin after the longest backend operation",
+  );
+  assert.equal(
+    exactCompound.RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS,
+    terminalControl.TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS,
+  );
+  assert.ok(
+    terminalControl.TERMINAL_CONTROL_SERVER_SOCKET_IDLE_TIMEOUT_MS
+      > terminalControl.TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS,
+    "the daemon socket must outlive the caller's complete request window",
+  );
+});
+
 function tempState(prefix = "tw-terminal-control-") {
   const root = mkdtempSync(join(tmpdir(), prefix));
   return {
@@ -3165,6 +3187,152 @@ test("cold-resumed Agent input accepts a turn that completes before transcript p
       message,
     );
   } finally {
+    await harness.cleanup();
+  }
+});
+
+test("cold-resumed Agent input excludes hydration and binds a delayed transcript", async (t) => {
+  const harness = isolatedManagedTmux(t, "agent-delayed-transcript");
+  if (!harness) return;
+  const agentBin = join(harness.home, ".local", "bin");
+  const transcriptRoot = join(harness.home, ".codex", "sessions", "2026", "07", "14");
+  const sessionId = "019f7777-7777-7777-8777-777777777777";
+  const transcriptPath = join(
+    transcriptRoot,
+    `rollout-2026-07-14T00-00-00-${sessionId}.jsonl`,
+  );
+  const appPath = join(harness.temp.root, "fake-delayed-codex.cjs");
+  const slowShell = join(harness.temp.root, "slow-login-shell");
+  const paneCwd = realpathSync(harness.temp.root);
+  const message = "confirm delayed cold resume";
+  const paneTarget = `=${harness.sessionName}:`;
+  const previousShell = process.env.SHELL;
+  try {
+    mkdirSync(agentBin, { recursive: true, mode: 0o700 });
+    mkdirSync(transcriptRoot, { recursive: true, mode: 0o700 });
+    symlinkSync(process.execPath, join(agentBin, "codex-agent-marker"));
+    writeFileSync(transcriptPath, `${JSON.stringify({
+      timestamp: "2026-07-14T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: sessionId, cwd: paneCwd },
+    })}\n`, { mode: 0o600 });
+    writeFileSync(appPath, [
+      'const { appendFileSync } = require("node:fs")',
+      `const transcript = ${JSON.stringify(transcriptPath)}`,
+      `const expected = ${JSON.stringify(message)}`,
+      "let body = ''",
+      "let scheduled = false",
+      "process.stdin.setRawMode(true)",
+      "process.stdin.resume()",
+      'process.stdout.write("\\x1b]2;Codex\\x07FAKE_DELAYED_CODEX_READY\\n")',
+      "process.stdin.on('data', (chunk) => {",
+      "  for (const byte of chunk) {",
+      "    if (byte !== 13) { body += Buffer.from([byte]).toString('utf8'); continue }",
+      "    if (scheduled || body !== expected) continue",
+      "    scheduled = true",
+      "    setTimeout(() => {",
+      "      const timestamp = new Date().toISOString()",
+      "      const turnId = '019f8888-8888-7888-8888-888888888888'",
+      "      const rows = [",
+      "        { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },",
+      "        { timestamp, type: 'event_msg', payload: { type: 'item_completed', turn_id: turnId, item: { type: 'UserMessage', content: [{ type: 'text', text: expected }] } } },",
+      "        { timestamp, type: 'event_msg', payload: { type: 'item_completed', turn_id: turnId, item: { type: 'AgentMessage', content: [{ type: 'text', text: 'DELAYED-ACK' }] } } },",
+      "        { timestamp, type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'DELAYED-ACK' } },",
+      "      ]",
+      "      appendFileSync(transcript, rows.map(JSON.stringify).join('\\n') + '\\n')",
+      "    }, 1200)",
+      "  }",
+      "})",
+      "setInterval(() => {}, 1000)",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(join(agentBin, "codex"), [
+      "#!/bin/sh",
+      `marker=${shellSingleQuote(join(agentBin, "codex-agent-marker"))}`,
+      `app=${shellSingleQuote(appPath)}`,
+      '"$marker" -e "setInterval(() => {}, 1000)" &',
+      "marker_pid=$!",
+      'trap \'kill "$marker_pid" >/dev/null 2>&1 || true\' EXIT INT TERM',
+      '"$marker" "$app"',
+    ].join("\n") + "\n", { mode: 0o700 });
+    writeFileSync(slowShell, [
+      "#!/bin/sh",
+      "sleep 1.2",
+      "printf '\\0'",
+      "env -0",
+    ].join("\n") + "\n", { mode: 0o700 });
+
+    const started = spawnSync(harness.wrapper, [
+      "respawn-pane",
+      "-k",
+      "-t", paneTarget,
+      "-c", harness.temp.root,
+      `PATH=${shellSingleQuote(agentBin)}:$PATH codex`,
+    ], { encoding: "utf8" });
+    assert.equal(started.status, 0, started.stderr);
+    let ready = "";
+    const readyDeadline = Date.now() + 2_000;
+    while (!ready.includes("FAKE_DELAYED_CODEX_READY") && Date.now() < readyDeadline) {
+      const captured = spawnSync(
+        harness.wrapper,
+        ["capture-pane", "-p", "-t", paneTarget],
+        { encoding: "utf8" },
+      );
+      assert.equal(captured.status, 0, captured.stderr);
+      ready = captured.stdout;
+      if (!ready.includes("FAKE_DELAYED_CODEX_READY")) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    assert.match(ready, /FAKE_DELAYED_CODEX_READY/);
+
+    process.env.SHELL = slowShell;
+    void terminalControl.inheritCodexResumeEnvironmentFromLoginShellAsync();
+    const backend = new terminalControl.TmuxTerminalControlBackend({
+      agentResumeInputTimeoutMs: 800,
+    });
+    const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
+    const output = await backend.prepareOutput(
+      randomUUID(),
+      harness.sessionName,
+      "0",
+      randomUUID(),
+      true,
+    );
+    const submittedAt = Date.now();
+    await backend.sendAgentMessageFenced(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      output.generation,
+      "0",
+      message,
+      true,
+    );
+    assert.ok(
+      Date.now() - submittedAt >= 1_100,
+      "the backend waits for hydration before starting the input budget",
+    );
+    assert.equal(
+      readFileSync(transcriptPath, "utf8").includes("DELAYED-ACK"),
+      false,
+      "the exact tmux submission is accepted before delayed transcript publication",
+    );
+
+    const publicationDeadline = Date.now() + 2_000;
+    while (!readFileSync(transcriptPath, "utf8").includes("DELAYED-ACK")
+      && Date.now() < publicationDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const status = await backend.agentStatus(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      output.generation,
+      "0",
+    );
+    assert.equal(status.agentRunning, true);
+    assert.equal(status.source?.turnId, "019f8888-8888-7888-8888-888888888888");
+  } finally {
+    if (previousShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = previousShell;
     await harness.cleanup();
   }
 });

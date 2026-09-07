@@ -160,7 +160,9 @@ test("local exact compound shares one connect, write, and response deadline", as
   await Promise.resolve();
   assert.equal(writes, 1, "the injected write remains permanently backpressured");
 
-  t.mock.timers.tick(9_999);
+  const remainingAfterConnect =
+    compound.RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS - 20_000;
+  t.mock.timers.tick(remainingAfterConnect - 1);
   await Promise.resolve();
   assert.equal(settled, false);
   t.mock.timers.tick(1);
@@ -171,7 +173,7 @@ test("local exact compound shares one connect, write, and response deadline", as
   assert.equal(
     socket.destroyed,
     true,
-    "write receives only the 10s left after connect consumed 20s of the shared deadline",
+    "write receives only the time left after connect consumed 20s of the shared deadline",
   );
 });
 

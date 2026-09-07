@@ -15,6 +15,7 @@ import {
   terminalControlOwnsSocketDirectory,
   terminalControlSocketPath,
 } from "./store";
+import { TERMINAL_CONTROL_SERVER_SOCKET_IDLE_TIMEOUT_MS } from "./timeouts";
 
 function requestIdFrom(value: unknown): string {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "invalid";
@@ -37,7 +38,7 @@ function handleSocket(
 ): void {
   onActivity();
   socket.setEncoding("utf8");
-  socket.setTimeout(15_000, () => socket.destroy());
+  socket.setTimeout(TERMINAL_CONTROL_SERVER_SOCKET_IDLE_TIMEOUT_MS, () => socket.destroy());
   let buffer = "";
   let handled = false;
   socket.on("data", (chunk: string) => {

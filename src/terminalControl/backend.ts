@@ -45,6 +45,10 @@ import {
   readCompletedAgentResult,
   resumedAgentSessionIdFromStartCommand,
 } from "./agentTranscript";
+import {
+  TERMINAL_CONTROL_AGENT_RESUME_INPUT_TIMEOUT_MS,
+  TERMINAL_CONTROL_CODEX_ENVIRONMENT_HYDRATION_TIMEOUT_MS,
+} from "./timeouts";
 
 const TMUX_INSTANCE_OPTION = "@tw_terminal_control_instance_v1";
 const OUTPUT_GENERATION_OPTION = "@tw_terminal_control_output_generation_v1";
@@ -61,8 +65,7 @@ const AGENT_RESUME_SETTLE_MS = 500;
 // several more seconds to persist the correlated UserMessage record (update
 // notices and provider startup both occur in this window). Keep the retry
 // cadence short, but allow enough total time to prove the exact submitted
-// turn before declaring the already-written input uncertain.
-const AGENT_RESUME_INPUT_TIMEOUT_MS = 20_000;
+// turn before handing any remaining source correlation to status polling.
 const AGENT_RESUME_INITIAL_SOURCE_WAIT_MS = 2_000;
 const AGENT_RESUME_SUBMIT_RETRY_MS = 500;
 const MAX_RENDERED_SNAPSHOT_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -1057,7 +1060,11 @@ export function inheritCodexResumeEnvironmentFromLoginShell(): void {
     const snapshot = execFileSync(
       shell,
       ["-l", "-i", "-c", "printf '\\0'; env -0"],
-      { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 10_000 },
+      {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+        timeout: TERMINAL_CONTROL_CODEX_ENVIRONMENT_HYDRATION_TIMEOUT_MS,
+      },
     );
     applyCodexResumeEnvironmentSnapshot(snapshot);
   } catch {
@@ -1085,7 +1092,7 @@ export function inheritCodexResumeEnvironmentFromLoginShellAsync(
       {
         encoding: "utf8",
         maxBuffer: 1024 * 1024,
-        timeout: 10_000,
+        timeout: TERMINAL_CONTROL_CODEX_ENVIRONMENT_HYDRATION_TIMEOUT_MS,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
       (error, snapshot) => {
@@ -1749,6 +1756,18 @@ async function exactTargetInspection(
 
 export class TmuxTerminalControlBackend implements TerminalControlBackend {
   private readonly agentSourceBoundaries = new Map<string, AgentSourceBoundary>();
+  private readonly agentResumeInputTimeoutMs: number;
+
+  constructor(options: Readonly<{ agentResumeInputTimeoutMs?: number }> = {}) {
+    const timeout = options.agentResumeInputTimeoutMs
+      ?? TERMINAL_CONTROL_AGENT_RESUME_INPUT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeout)
+      || timeout < AGENT_MESSAGE_SUBMIT_PACE_MS
+      || timeout > TERMINAL_CONTROL_AGENT_RESUME_INPUT_TIMEOUT_MS) {
+      throw new TypeError("Agent resume input timeout is invalid");
+    }
+    this.agentResumeInputTimeoutMs = timeout;
+  }
 
   async resolveManagedSession(sessionName: string): Promise<ResolvedManagedTerminalBackend> {
     const managedSession = exactManagedSession(sessionName);
@@ -2088,12 +2107,15 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       if (boundary !== undefined) {
         const freshSource = await waitForAgentSource(
           boundary,
-          Date.parse(boundary.startedAtNotBefore) + AGENT_RESUME_INPUT_TIMEOUT_MS,
+          Date.parse(boundary.startedAtNotBefore) + this.agentResumeInputTimeoutMs,
         );
-        if (freshSource === undefined) {
-          throw new Error("managed Agent did not start a fresh transcript source before the input deadline");
-        }
-        boundary.capturedSource = freshSource;
+        // tmux has already confirmed delivery into the exact fenced pane. A
+        // cold Codex process may publish its correlated UserMessage only after
+        // this bounded synchronous confirmation window. Preserve the boundary
+        // so Agent status polling can bind that source later; returning an
+        // error here would incorrectly journal a delivered operation in-doubt
+        // and allow the same user-visible turn to arrive after the failure.
+        if (freshSource !== undefined) boundary.capturedSource = freshSource;
       }
       return;
     }
@@ -2105,8 +2127,11 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       );
     }
 
-    const inputDeadline = Date.now() + AGENT_RESUME_INPUT_TIMEOUT_MS;
     if (provider === "codex") await waitForCodexResumeEnvironmentHydration();
+    // Environment hydration is daemon startup work, not part of the exact
+    // Agent submission budget. Starting this deadline afterward keeps the
+    // backend bound aligned with the enclosing transport contract.
+    const inputDeadline = Date.now() + this.agentResumeInputTimeoutMs;
     const sessionId = resumedAgentSessionIdFromStartCommand(
       observed.paneStartCommand,
       provider,
@@ -2204,10 +2229,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
             Math.min(inputDeadline, Date.now() + AGENT_RESUME_SUBMIT_RETRY_MS),
           );
         }
-        if (freshSource === undefined) {
-          throw new Error("managed Agent did not start a fresh transcript source before the input deadline");
-        }
-        boundary.capturedSource = freshSource;
+        if (freshSource !== undefined) boundary.capturedSource = freshSource;
       }
       return;
     }
@@ -2609,6 +2631,9 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "RECOVERY_REQUIRED",
         "the resumed Agent session changed across its input source boundary",
       );
+    }
+    if (boundary !== undefined && boundary.capturedSource === undefined) {
+      boundary.capturedSource = pendingAgentSource(boundary);
     }
     if (boundary?.capturedSource !== undefined) {
       const source = boundary.capturedSource;
