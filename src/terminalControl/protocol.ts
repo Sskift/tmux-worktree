@@ -21,6 +21,19 @@ export type TerminalControlOwnerKind =
   | "relay-v2"
   | "tw-serve";
 
+/**
+ * The closed set of owner kinds accepted by every terminal-control trust
+ * boundary. Validation logic stays per-domain (different error messages and
+ * trust levels), but the list itself has a single source here.
+ */
+export const TERMINAL_CONTROL_OWNER_KINDS = [
+  "feishu",
+  "dashboard",
+  "local-cli",
+  "relay-v2",
+  "tw-serve",
+] as const satisfies readonly TerminalControlOwnerKind[];
+
 export interface TerminalControlOwner {
   kind: TerminalControlOwnerKind;
   instanceId: string;
@@ -362,13 +375,7 @@ function owner(value: unknown): TerminalControlOwner {
   if (!isRecord(value) || !exactKeys(value, ["kind", "instanceId"])) {
     throw new TerminalControlProtocolError("INVALID_REQUEST", "owner is invalid");
   }
-  const kinds: TerminalControlOwnerKind[] = [
-    "feishu",
-    "dashboard",
-    "local-cli",
-    "relay-v2",
-    "tw-serve",
-  ];
+  const kinds: TerminalControlOwnerKind[] = [...TERMINAL_CONTROL_OWNER_KINDS];
   if (!kinds.includes(value.kind as TerminalControlOwnerKind)) {
     throw new TerminalControlProtocolError("INVALID_REQUEST", "owner.kind is invalid");
   }
@@ -756,19 +763,7 @@ export function parseTerminalControlResponse(
     || !exactKeys(value.error, ["code", "message", "retryable"])) {
     throw new TerminalControlProtocolError("INVALID_REQUEST", "error response envelope is invalid");
   }
-  const codes: TerminalControlErrorCode[] = [
-    "INVALID_REQUEST",
-    "UNSUPPORTED_VERSION",
-    "TARGET_NOT_FOUND",
-    "TARGET_GONE",
-    "PERMISSION_DENIED",
-    "HANDOFF_PENDING",
-    "RECOVERY_REQUIRED",
-    "STALE_OUTPUT_CURSOR",
-    "OPERATION_IN_DOUBT",
-    "RESOURCE_EXHAUSTED",
-    "INTERNAL",
-  ];
+  const codes: TerminalControlErrorCode[] = [...TERMINAL_CONTROL_ERROR_CODES];
   if (!codes.includes(value.error.code as TerminalControlErrorCode)
     || typeof value.error.message !== "string"
     || value.error.message.length === 0

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { types as nodeTypes } from "node:util";
 
+import { canonicalJson } from "../../canonicalJson.js";
 import {
   parseCreateTargetObservationV1Request,
   parseCreateTargetObservationV1Response,
@@ -294,14 +295,8 @@ export function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalJson(record[key])}`
-  )).join(",")}}`;
-}
+// Re-exported for canonicalCreateTargetAdmissionAdapter (historical export site).
+export { canonicalJson };
 
 export function same(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);

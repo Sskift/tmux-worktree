@@ -3,6 +3,7 @@ import {
   type RelayV2FrameMetadata,
 } from "../../../v2/codec.js";
 import type { RelayV2JsonObject } from "../../../v2/codecSchema.js";
+import { createCodecSchemaHelpers } from "../../../v2/codecSchemaHelpers.js";
 import {
   decodeRelayV2StrictUtf8,
   inspectRelayV2Json,
@@ -116,84 +117,18 @@ function codecFailure(error: unknown): never {
   throw error;
 }
 
-function object(value: RelayV2JsonValue): RelayV2JsonObject {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "object" || Array.isArray(value)) reject("type-coercion");
-  return value;
-}
-
-function exact(
-  value: RelayV2JsonObject,
-  required: readonly string[],
-): void {
-  const allowed = new Set(required);
-  for (const key of required) {
-    if (!Object.hasOwn(value, key)) reject("missing-field");
-  }
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) reject("unknown-field");
-  }
-}
-
-function field(value: RelayV2JsonObject, name: string): RelayV2JsonValue {
-  if (!Object.hasOwn(value, name)) reject("missing-field");
-  return value[name]!;
-}
-
-function wellFormed(value: string): void {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) reject("invalid-utf8");
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      reject("invalid-utf8");
-    }
-  }
-}
-
-function stringValue(
-  value: RelayV2JsonValue,
-  maxBytes: number,
-  allowWhitespace = false,
-): string {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  wellFormed(value);
-  if (value.length === 0 || value.includes("\0")) reject("invalid-argument");
-  if (!allowWhitespace && value.trim() !== value) reject("invalid-argument");
-  if (Buffer.byteLength(value, "utf8") > maxBytes) reject("id-byte-limit");
-  return value;
-}
-
-function id(value: RelayV2JsonValue): string {
-  return stringValue(value, 128);
-}
+const {
+  exact,
+  field,
+  id,
+  literal,
+  object,
+  oneOf,
+  stringValue,
+} = createCodecSchemaHelpers(reject, { wellFormedStrings: true });
 
 function name(value: RelayV2JsonValue): string {
-  return stringValue(value, 1_024, true);
-}
-
-function literal<T extends string | number | boolean>(
-  value: RelayV2JsonValue,
-  expected: T,
-): T {
-  if (value !== expected) {
-    if (value === null) reject("forbidden-null");
-    reject("schema-mismatch");
-  }
-  return expected;
-}
-
-function oneOf<const T extends readonly string[]>(
-  value: RelayV2JsonValue,
-  allowed: T,
-): T[number] {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!(allowed as readonly string[]).includes(value)) reject("schema-mismatch");
-  return value as T[number];
+  return stringValue(value, { maxBytes: 1_024, allowOuterWhitespace: true });
 }
 
 function binding(value: RelayV2JsonValue): void {
@@ -294,7 +229,7 @@ function validateError(frame: RelayV2JsonObject): void {
     field(error, "code"),
     ["LARK_BINDINGS_UNAVAILABLE", "LARK_BINDING_INVALID"] as const,
   );
-  stringValue(field(error, "message"), 4_096, true);
+  stringValue(field(error, "message"), { maxBytes: 4_096, allowOuterWhitespace: true });
   if (typeof field(error, "retryable") !== "boolean") reject("type-coercion");
   literal(field(error, "commandDisposition"), "not_applicable");
 }
@@ -302,7 +237,7 @@ function validateError(frame: RelayV2JsonObject): void {
 export function validateRelayLarkBindingsFrame(
   frame: RelayV2JsonObject,
 ): RelayLarkBindingsNormalizedFrame {
-  const type = stringValue(field(frame, "type"), 128);
+  const type = stringValue(field(frame, "type"), { maxBytes: 128 });
   switch (type) {
     case "lark.bindings.get": validateGet(frame); break;
     case "lark.binding.reply_mode.update": validateUpdate(frame); break;

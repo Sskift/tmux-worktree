@@ -1,3 +1,4 @@
+import { canonicalJson } from "../../canonicalJson.js";
 import type { TerminalControlLease, TerminalControlOwner } from "../../terminalControl/protocol.js";
 import type {
   TerminalControlRelayV2ExactObservation,
@@ -86,15 +87,6 @@ function bounded(value: unknown, maxBytes = 128): string {
     throw new TypeError("Relay v2 exact terminal-control identity is invalid");
   }
   return value;
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalJson(record[key])}`
-  )).join(",")}}`;
 }
 
 function input(value: unknown): RelayV2ExactTerminalControlTargetInputV1 {

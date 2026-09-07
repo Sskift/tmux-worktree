@@ -5,6 +5,7 @@ import type {
 } from "../../terminalControl/protocol.js";
 import {
   TERMINAL_CONTROL_MAX_INPUT_BYTES,
+  TERMINAL_CONTROL_OWNER_KINDS,
   TerminalControlProtocolError,
 } from "../../terminalControl/protocol.js";
 import type { TerminalControlRequestInput } from "../../terminalControl/client.js";
@@ -252,9 +253,7 @@ function binding(input: {
   return { target: parsedTarget, owner: parsedOwner, lease: parsedLease };
 }
 
-const OWNER_KINDS = new Set([
-  "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
-]);
+const OWNER_KINDS = new Set<string>(TERMINAL_CONTROL_OWNER_KINDS);
 
 function ownership(value: unknown): TerminalControlOwnershipView {
   if (!isRecord(value) || !exactKeys(value, [

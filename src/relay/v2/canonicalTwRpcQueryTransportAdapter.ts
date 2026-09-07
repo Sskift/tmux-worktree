@@ -2,6 +2,7 @@ import { spawn as spawnChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { types as nodeTypes } from "node:util";
+import { canonicalJson as canonicalDescriptorJson } from "../../canonicalJson.js";
 import { loadConfigFile, type Config } from "../../config.js";
 import {
   RelayV2CanonicalStructuredProcessAdapter,
@@ -402,15 +403,6 @@ function absolutePath(value: unknown): string {
     throw new TypeError("invalid canonical TW RPC v2 query transport path");
   }
   return path;
-}
-
-function canonicalDescriptorJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalDescriptorJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalDescriptorJson(record[key])}`
-  )).join(",")}}`;
 }
 
 function effectiveTargetId(value: object): string {

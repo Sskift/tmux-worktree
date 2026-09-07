@@ -5,6 +5,7 @@ import {
 import type {
   RelayV2JsonObject,
 } from "../../../v2/codecSchema.js";
+import { createCodecSchemaHelpers } from "../../../v2/codecSchemaHelpers.js";
 import {
   decodeRelayV2StrictUtf8,
   inspectRelayV2Json,
@@ -129,143 +130,23 @@ function codecFailure(error: unknown): never {
   throw error;
 }
 
-function object(value: RelayV2JsonValue): RelayV2JsonObject {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "object" || Array.isArray(value)) reject("type-coercion");
-  return value;
-}
-
-function exact(
-  value: RelayV2JsonObject,
-  required: readonly string[],
-  optional: readonly string[] = [],
-): void {
-  const allowed = new Set([...required, ...optional]);
-  for (const key of required) {
-    if (!Object.hasOwn(value, key)) reject("missing-field");
-  }
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) reject("unknown-field");
-  }
-}
-
-function field(value: RelayV2JsonObject, name: string): RelayV2JsonValue {
-  if (!Object.hasOwn(value, name)) reject("missing-field");
-  return value[name]!;
-}
-
-function assertWellFormedUnicode(value: string): void {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) reject("invalid-utf8");
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      reject("invalid-utf8");
-    }
-  }
-}
-
-function stringValue(
-  value: RelayV2JsonValue,
-  options: {
-    allowEmpty?: boolean;
-    allowOuterWhitespace?: boolean;
-    maxBytes?: number;
-  } = {},
-): string {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  assertWellFormedUnicode(value);
-  if (!options.allowEmpty && value.length === 0) reject("invalid-argument");
-  if (value.includes("\0")) reject("invalid-argument");
-  if (!options.allowOuterWhitespace && value.trim() !== value) reject("invalid-argument");
-  if (options.maxBytes !== undefined && Buffer.byteLength(value, "utf8") > options.maxBytes) {
-    reject("id-byte-limit");
-  }
-  return value;
-}
-
-function id(value: RelayV2JsonValue): string {
-  return stringValue(value, { maxBytes: 128 });
-}
-
-function cursor(value: RelayV2JsonValue): string {
-  return stringValue(value, { maxBytes: 1_024 });
-}
-
-function text(value: RelayV2JsonValue, maxBytes: number): string {
-  return stringValue(value, {
-    allowEmpty: true,
-    allowOuterWhitespace: true,
-    maxBytes,
-  });
-}
-
-function literal<T extends string | number | boolean>(value: RelayV2JsonValue, expected: T): T {
-  if (value !== expected) {
-    if (value === null) reject("forbidden-null");
-    reject("schema-mismatch");
-  }
-  return expected;
-}
-
-function oneOf<const T extends readonly string[]>(
-  value: RelayV2JsonValue,
-  allowed: T,
-): T[number] {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!(allowed as readonly string[]).includes(value)) reject("schema-mismatch");
-  return value as T[number];
-}
-
-function nullable<T>(value: RelayV2JsonValue, validator: (item: RelayV2JsonValue) => T): T | null {
-  return value === null ? null : validator(value);
-}
-
-function booleanValue(value: RelayV2JsonValue): boolean {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "boolean") reject("type-coercion");
-  return value;
-}
-
-function integer(value: RelayV2JsonValue, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || Object.is(value, -0)) {
-    reject("type-coercion");
-  }
-  if (value < minimum || value > maximum) reject("invalid-argument");
-  return value;
-}
-
-function counter(value: RelayV2JsonValue): string {
-  if (value === null) reject("forbidden-null");
-  if (typeof value !== "string") reject("type-coercion");
-  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) reject("non-canonical-counter");
-  if (BigInt(value) > UINT64_MAX) reject("counter-overflow");
-  return value;
-}
-
-function positiveCounter(value: RelayV2JsonValue): string {
-  const parsed = counter(value);
-  if (parsed === "0") reject("invalid-argument");
-  return parsed;
-}
-
-function array(
-  value: RelayV2JsonValue,
-  validator: (item: RelayV2JsonValue, index: number) => void,
-  maximum: number,
-  minimum = 0,
-): RelayV2JsonValue[] {
-  if (value === null) reject("forbidden-null");
-  if (!Array.isArray(value)) reject("type-coercion");
-  if (value.length < minimum || value.length > maximum) reject("invalid-argument");
-  value.forEach(validator);
-  return value;
-}
+const {
+  array,
+  booleanValue,
+  counter,
+  cursor,
+  exact,
+  field,
+  id,
+  integer,
+  literal,
+  nullable,
+  object,
+  oneOf,
+  positiveCounter,
+  stringValue,
+  text,
+} = createCodecSchemaHelpers(reject, { wellFormedStrings: true });
 
 function compareCounter(left: string, right: string): number {
   const a = BigInt(left);
