@@ -18,8 +18,6 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenTarget
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialInstall
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialOwner
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
-import java.security.MessageDigest
-import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -370,10 +368,5 @@ class RelayV2TerminalControlCodecBridgeTest {
         private const val HOST_EPOCH = "host-epoch-1"
         private const val STREAM_ID = "stream-1"
         private const val TERMINAL_GENERATION = "terminal-generation-1"
-
-        private fun fingerprint(token: String): String =
-            Base64.getUrlEncoder().withoutPadding().encodeToString(
-                MessageDigest.getInstance("SHA-256").digest(token.toByteArray()),
-            )
     }
 }

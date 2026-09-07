@@ -8,9 +8,8 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotPageFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStructuredError
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Fixtures
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
-import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
-import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentExtensionUnavailableReason
@@ -237,7 +236,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             statusRequestId = "agent-status-1",
             timelineEpoch = "timeline-1",
         )
-        val statusAvailable = fixtureWire("status-available")
+        val statusAvailable = AgentTranscriptLifecycleV1Fixtures.wire("status-available")
         val cases = listOf(
             artifact(
                 statusAvailable.replaceSingleField(
@@ -253,7 +252,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             ),
             artifact("status-available") to harness.fence(requestAdmission = null),
             artifact(
-                fixtureWire("live-entry-redacted").replaceSingleField(
+                AgentTranscriptLifecycleV1Fixtures.wire("live-entry-redacted").replaceSingleField(
                     "\"timelineEpoch\":\"timeline-1\"",
                     "\"timelineEpoch\":\"timeline-other\"",
                 ),
@@ -1411,26 +1410,10 @@ private fun correlatedErrorFrame(
 }
 
 private fun artifact(name: String): AgentTranscriptLifecycleV1PublicFrameArtifact =
-    artifact(fixtureWire(name))
+    artifact(AgentTranscriptLifecycleV1Fixtures.wire(name))
 
 private fun artifact(wire: ByteArray): AgentTranscriptLifecycleV1PublicFrameArtifact =
     AgentTranscriptLifecycleV1Codec().decodePublicFrameArtifact(wire)
-
-private fun fixtureWire(name: String): ByteArray {
-    val resource = "extensions/agent-transcript-lifecycle/v1/golden-frames.json"
-    val source = requireNotNull(
-        AgentTranscriptLifecycleRuntimeConsumerTest::class.java.classLoader
-            ?.getResourceAsStream(resource),
-    ).bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-    val wrapper = RelayV2StrictJson.parseObject(
-        "{\"fixtures\":$source}",
-        RelayV2JsonLimits(64, 1_024, 100_000, 200_000),
-    )
-    val fixtures = wrapper["fixtures"] as List<*>
-    val fixture = fixtures.filterIsInstance<Map<String, Any?>>()
-        .single { it["name"] == name }
-    return (fixture["wire"] as String).toByteArray(StandardCharsets.UTF_8)
-}
 
 private fun ByteArray.replaceSingleField(
     original: String,

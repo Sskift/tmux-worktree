@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
+import com.tmuxworktree.mobile.core.relay.v2.runtime.payload
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -12,7 +13,7 @@ import org.junit.Test
 
 class AgentTranscriptLifecycleV1CodecContractTest {
     private val codec = AgentTranscriptLifecycleV1Codec()
-    private val fixtures = AgentTranscriptLifecycleV1Fixtures()
+    private val fixtures = AgentTranscriptLifecycleV1Fixtures
 
     @Test
     fun everySharedGoldenFrameHasAStableTypedRoundTrip() {
@@ -703,20 +704,27 @@ class AgentTranscriptLifecycleV1CodecContractTest {
     }
 }
 
-private data class AgentTranscriptLifecycleV1GoldenFixture(
+internal data class AgentTranscriptLifecycleV1GoldenFixture(
     val name: String,
     val type: String,
     val wire: String,
 )
 
-private data class AgentTranscriptLifecycleV1InvalidFixture(
+internal data class AgentTranscriptLifecycleV1InvalidFixture(
     val name: String,
     val category: String,
     val expectedError: String,
     val wire: String,
 )
 
-private class AgentTranscriptLifecycleV1Fixtures {
+internal object AgentTranscriptLifecycleV1Fixtures {
+    private val FIXTURE_JSON_LIMITS = RelayV2JsonLimits(
+        maxDepth = 64,
+        maxDirectKeys = 1_024,
+        maxTotalKeys = 100_000,
+        maxNodes = 200_000,
+    )
+
     private val base = "extensions/agent-transcript-lifecycle/v1"
     private val manifest = readObject("$base/manifest.json")
     private val files = manifest.list("files").map(Any?::fixtureMap)
@@ -782,15 +790,6 @@ private class AgentTranscriptLifecycleV1Fixtures {
         requireNotNull(javaClass.classLoader?.getResourceAsStream(path)) {
             "Missing shared Agent transcript/lifecycle fixture $path"
         }.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-
-    companion object {
-        private val FIXTURE_JSON_LIMITS = RelayV2JsonLimits(
-            maxDepth = 64,
-            maxDirectKeys = 1_024,
-            maxTotalKeys = 100_000,
-            maxNodes = 200_000,
-        )
-    }
 }
 
 private fun lifecycleRecord(sequence: String): LinkedHashMap<String, Any?> = linkedMapOf(
@@ -844,10 +843,6 @@ private fun correlatedErrorFrame(
         "error" to error,
     )
 }
-
-@Suppress("UNCHECKED_CAST")
-private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
-    getValue("payload") as MutableMap<String, Any?>
 
 @Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.mutation(): MutableMap<String, Any?> =

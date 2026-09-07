@@ -4,8 +4,6 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.state.*
 import com.tmuxworktree.mobile.core.relay.v2.terminal.*
-import java.security.MessageDigest
-import java.util.Base64
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
@@ -3116,12 +3114,5 @@ class RelayV2TerminalProductionCompositionTest {
         override fun closeGlobally() = Unit
         override fun deleteAllBatches() = Unit
         override fun terminalCheckpoint(key: RelayV2TerminalCheckpointKey) = null
-    }
-
-    private companion object {
-        fun fingerprint(token: String): String =
-            Base64.getUrlEncoder().withoutPadding().encodeToString(
-                MessageDigest.getInstance("SHA-256").digest(token.toByteArray()),
-            )
     }
 }
