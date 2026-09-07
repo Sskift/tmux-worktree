@@ -17,6 +17,10 @@ import {
   isRejectedProxy as rejectedProxy,
   captureExactDataRecord,
 } from "./untrustedSnapshot.js";
+import {
+  splitRawRequestTarget,
+  trimHttpOws,
+} from "./brokerNodeUpgradePlumbing.js";
 
 const REQUEST_INPUT_KEYS = Object.freeze([
   "request",
@@ -157,37 +161,6 @@ function captureRejectSocket(value: unknown): CapturedRejectSocket | null {
   const destroy = captureMethod(value, "destroy");
   if (!end || !destroy) return null;
   return Object.freeze({ receiver: value, end, destroy });
-}
-
-function splitRawRequestTarget(value: unknown): Readonly<{
-  pathname: string;
-  search: string;
-}> | null {
-  if (typeof value !== "string" || value.length === 0 || value[0] !== "/") return null;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x20 || code >= 0x7f || code === 0x23) return null;
-  }
-  const query = value.indexOf("?");
-  return Object.freeze({
-    pathname: query === -1 ? value : value.slice(0, query),
-    search: query === -1 ? "" : value.slice(query),
-  });
-}
-
-function trimHttpOws(value: string): string {
-  let start = 0;
-  let end = value.length;
-  while (start < end && (value.charCodeAt(start) === 0x20 || value.charCodeAt(start) === 0x09)) {
-    start += 1;
-  }
-  while (end > start && (
-    value.charCodeAt(end - 1) === 0x20
-    || value.charCodeAt(end - 1) === 0x09
-  )) {
-    end -= 1;
-  }
-  return value.slice(start, end);
 }
 
 function captureRawHeaderMetadata(value: unknown): Readonly<{

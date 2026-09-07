@@ -26,6 +26,13 @@ import {
   isRejectedProxy as rejectedProxy,
   captureExactDataRecord,
 } from "./untrustedSnapshot.js";
+import {
+  splitRawRequestTarget,
+  trimHttpOws,
+  equivalentBufferView,
+  positiveHeartbeatValue,
+  attachSocketHeartbeat,
+} from "./brokerNodeUpgradePlumbing.js";
 
 const CLIENT_SUBPROTOCOL = "tw-relay.v2";
 const REJECT_END_DEADLINE_MS = 1_000;
@@ -220,37 +227,6 @@ function captureRejectSocket(value: unknown): CapturedRejectSocket | null {
   return captured;
 }
 
-function splitRawRequestTarget(value: unknown): Readonly<{
-  pathname: string;
-  search: string;
-}> | null {
-  if (typeof value !== "string" || value.length === 0 || value[0] !== "/") return null;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x20 || code >= 0x7f || code === 0x23) return null;
-  }
-  const query = value.indexOf("?");
-  return Object.freeze({
-    pathname: query === -1 ? value : value.slice(0, query),
-    search: query === -1 ? "" : value.slice(query),
-  });
-}
-
-function trimHttpOws(value: string): string {
-  let start = 0;
-  let end = value.length;
-  while (start < end && (value.charCodeAt(start) === 0x20 || value.charCodeAt(start) === 0x09)) {
-    start += 1;
-  }
-  while (end > start && (
-    value.charCodeAt(end - 1) === 0x20
-    || value.charCodeAt(end - 1) === 0x09
-  )) {
-    end -= 1;
-  }
-  return value.slice(start, end);
-}
-
 function captureRawHeaders(value: unknown): readonly string[] | null {
   if (rejectedProxy(value) || !Array.isArray(value)) return null;
   try {
@@ -367,65 +343,6 @@ function hasExactNormalizedClientProtocol(request: IncomingMessage): boolean {
   }
 }
 
-function equivalentBufferView(head: Uint8Array): Buffer {
-  return Buffer.isBuffer(head)
-    ? head
-    : Buffer.from(head.buffer, head.byteOffset, head.byteLength);
-}
-
-function positiveHeartbeatValue(
-  value: unknown,
-  fallback: number,
-): number {
-  const selected = value ?? fallback;
-  if (
-    !Number.isSafeInteger(selected)
-    || (selected as number) <= 0
-  ) throw failure();
-  return selected as number;
-}
-
-function attachClientSocketHeartbeat(
-  socket: WebSocket,
-  intervalMs: number,
-  missedPongLimit: number,
-): void {
-  let missedPongs = 0;
-  let stopped = false;
-  let timer: ReturnType<typeof setInterval> | null = null;
-  const tick = (): void => {
-    if (stopped) return;
-    missedPongs += 1;
-    if (missedPongs > missedPongLimit) {
-      stopped = true;
-      if (timer !== null) {
-        clearInterval(timer);
-        timer = null;
-      }
-      try { socket.terminate(); } catch {}
-      return;
-    }
-    try { socket.ping(); } catch {}
-  };
-  const onPong = (): void => {
-    missedPongs = 0;
-  };
-  const cleanup = (): void => {
-    if (stopped) return;
-    stopped = true;
-    if (timer !== null) {
-      clearInterval(timer);
-      timer = null;
-    }
-    try { socket.removeListener("pong", onPong); } catch {}
-    try { socket.removeListener("close", cleanup); } catch {}
-  };
-  socket.on("pong", onPong);
-  socket.once("close", cleanup);
-  tick();
-  timer = setInterval(tick, intervalMs);
-}
-
 function endRejectResponse(
   socket: CapturedRejectSocket,
   status: (typeof REJECT_STATUSES)[number],
@@ -496,10 +413,12 @@ export function createRelayV2BrokerClientWssNodeListenerFreeIngress(
   const heartbeatIntervalMs = positiveHeartbeatValue(
     capturedOptions?.heartbeatIntervalMs,
     DEFAULT_HEARTBEAT_INTERVAL_MS,
+    failure,
   );
   const heartbeatMissedPongLimit = positiveHeartbeatValue(
     capturedOptions?.heartbeatMissedPongLimit,
     DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT,
+    failure,
   );
 
   const brandedSockets = new WeakSet<object>();
@@ -729,7 +648,7 @@ export function createRelayV2BrokerClientWssNodeListenerFreeIngress(
           throw failure();
         }
         upgradedSocket = observation.socket;
-        attachClientSocketHeartbeat(
+        attachSocketHeartbeat(
           upgradedSocket,
           heartbeatIntervalMs,
           heartbeatMissedPongLimit,
