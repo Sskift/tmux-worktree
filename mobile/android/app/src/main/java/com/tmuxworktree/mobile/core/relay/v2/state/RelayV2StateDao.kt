@@ -834,9 +834,6 @@ internal interface RelayV2StateDao {
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptEntry(entry: RelayV2AgentTranscriptEntryEntity)
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
-    fun insertAgentTranscriptEntries(entries: List<RelayV2AgentTranscriptEntryEntity>)
-
     @Query(
         "UPDATE relay_v2_agent_transcript_entries SET " +
             "lastModifiedAgentSeq = :lastModifiedAgentSeq, " +
@@ -1276,9 +1273,6 @@ internal interface RelayV2StateDao {
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptPendingEvent(event: RelayV2AgentTranscriptPendingEventEntity)
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
-    fun insertAgentTranscriptPendingEvents(events: List<RelayV2AgentTranscriptPendingEventEntity>)
-
     @Query(
         "DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
@@ -1422,46 +1416,6 @@ internal interface RelayV2StateDao {
     fun insertAgentTranscriptLifecycleState(
         state: RelayV2AgentTranscriptLifecycleStateEntity,
     )
-
-    @Query(
-        "DELETE FROM relay_v2_agent_transcript_lifecycle_states " +
-            "WHERE profileId = :profileId " +
-            "AND profileActivationGeneration = :profileActivationGeneration " +
-            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
-            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
-            "AND scopeId = :scopeId AND sessionId = :sessionId",
-    )
-    fun deleteAgentTranscriptLifecycleConsumer(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-    )
-
-    @Query(
-        "DELETE FROM relay_v2_agent_transcript_lifecycle_states " +
-            "WHERE profileId = :profileId " +
-            "AND profileActivationGeneration = :profileActivationGeneration " +
-            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
-            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
-            "AND scopeId = :scopeId AND sessionId = :sessionId " +
-            "AND timelineEpochKey = :timelineEpochKey",
-    )
-    fun deleteAgentTranscriptLifecycleState(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpochKey: String,
-    ): Int
 
     @Query(
         "DELETE FROM relay_v2_agent_transcript_lifecycle_states WHERE profileId = :profileId",

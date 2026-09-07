@@ -248,22 +248,6 @@ internal interface RelayV2AgentLifecycleDao {
             "w.eventId > :afterEventId)) ORDER BY w.agentEventSeqOrder, w.eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun currentSourcePageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        sourceEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleEventWitnessEntity>
-
     @Query(
         CURRENT_WITNESS_SELECT +
             "WHERE l.profileId = :profileId " +
@@ -277,21 +261,6 @@ internal interface RelayV2AgentLifecycleDao {
             "w.eventId > :afterEventId)) ORDER BY w.agentEventSeqOrder, w.eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun currentTerminalPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleEventWitnessEntity>
-
     @Query(
         "SELECT DISTINCT w.sourceEpoch " + CURRENT_WITNESS_FROM +
             "WHERE l.profileId = :profileId " +
@@ -380,22 +349,6 @@ internal interface RelayV2AgentLifecycleDao {
             "scopeId, sessionId, timelineEpoch, lifecycleScope, runId, turnIdKey " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun currentGlobalAuditPageAfter(
-        afterProfileId: String,
-        afterProfileActivationGeneration: Long,
-        afterPrincipalId: String,
-        afterClientInstanceId: String,
-        afterHostId: String,
-        afterHostEpoch: String,
-        afterScopeId: String,
-        afterSessionId: String,
-        afterTimelineEpoch: String,
-        afterLifecycleScope: String,
-        afterRunId: String,
-        afterTurnIdKey: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleCurrentGlobalAuditRow>
-
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertCurrent(records: List<RelayV2AgentLifecycleCurrentEntity>)
 
@@ -565,24 +518,6 @@ internal interface RelayV2AgentLifecycleDao {
             "ORDER BY agentEventSeqOrder, eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun witnessIdentityPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        lifecycleScope: String,
-        runId: String,
-        turnIdKey: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleEventWitnessEntity>
-
     /** Namespace-local permanent-chain audit order; callers retain only the prior identity row. */
     @Query(
         "SELECT * FROM relay_v2_agent_lifecycle_event_witnesses " +
@@ -676,24 +611,6 @@ internal interface RelayV2AgentLifecycleDao {
             "ORDER BY lifecycleScope, runId, turnIdKey, agentEventSeqOrder, eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun witnessIdentityAuditPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        afterLifecycleScope: String,
-        afterRunId: String,
-        afterTurnIdKey: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleDigestAuditRow>
-
     @Query(
         "SELECT COUNT(*) AS itemCount, " +
             "COALESCE(SUM(witnessCanonicalUtf8Bytes), 0) AS declaredCanonicalBytes, " +
@@ -722,24 +639,6 @@ internal interface RelayV2AgentLifecycleDao {
             "turnIdKey, agentEventSeqOrder, eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun witnessGlobalAuditPageAfter(
-        afterProfileId: String,
-        afterProfileActivationGeneration: Long,
-        afterPrincipalId: String,
-        afterClientInstanceId: String,
-        afterHostId: String,
-        afterHostEpoch: String,
-        afterScopeId: String,
-        afterSessionId: String,
-        afterTimelineEpoch: String,
-        afterLifecycleScope: String,
-        afterRunId: String,
-        afterTurnIdKey: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleGlobalAuditRow>
-
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertWitnesses(witnesses: List<RelayV2AgentLifecycleEventWitnessEntity>)
 
@@ -851,21 +750,6 @@ internal interface RelayV2AgentLifecycleDao {
             "ORDER BY agentEventSeqOrder, eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun recentEvidenceDigestAuditPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleDigestAuditRow>
-
     @Query(
         "SELECT COUNT(*) AS itemCount, " +
             "COALESCE(SUM(evidenceCanonicalUtf8Bytes), 0) AS declaredCanonicalBytes, " +
@@ -892,21 +776,6 @@ internal interface RelayV2AgentLifecycleDao {
             "hostId, hostEpoch, scopeId, sessionId, timelineEpoch, agentEventSeqOrder, eventId " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun recentEvidenceGlobalAuditPageAfter(
-        afterProfileId: String,
-        afterProfileActivationGeneration: Long,
-        afterPrincipalId: String,
-        afterClientInstanceId: String,
-        afterHostId: String,
-        afterHostEpoch: String,
-        afterScopeId: String,
-        afterSessionId: String,
-        afterTimelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterEventId: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleGlobalAuditRow>
-
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertRecentEvidence(evidence: List<RelayV2AgentRecentEventEvidenceEntity>)
 
@@ -1001,20 +870,6 @@ internal interface RelayV2AgentLifecycleDao {
             "AND n.lifecycleEventId = :lifecycleEventId " +
             "AND n.lifecycleState = :lifecycleState LIMIT 1",
     )
-    fun notificationWitnessByDedupeKey(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        lifecycleEventId: String,
-        lifecycleState: String,
-    ): RelayV2AgentLifecycleEventWitnessEntity?
-
     @Query(
         "SELECT * FROM relay_v2_agent_notification_ledger WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
@@ -1091,22 +946,6 @@ internal interface RelayV2AgentLifecycleDao {
             "ORDER BY n.agentEventSeqOrder, n.lifecycleEventId, n.lifecycleState " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 64 THEN 64 ELSE :limit END",
     )
-    fun pendingNotificationPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterLifecycleEventId: String,
-        afterLifecycleState: String,
-        limit: Int,
-    ): List<RelayV2AgentNotificationLedgerEntity>
-
     @Query(
         "SELECT COUNT(*) AS itemCount, " +
             "COALESCE(SUM(ledgerCanonicalUtf8Bytes), 0) AS declaredCanonicalBytes, " +
@@ -1149,22 +988,6 @@ internal interface RelayV2AgentLifecycleDao {
             "ORDER BY n.agentEventSeqOrder, n.lifecycleEventId, n.lifecycleState " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun notificationDigestAuditPageAfter(
-        profileId: String,
-        profileActivationGeneration: Long,
-        principalId: String,
-        clientInstanceId: String,
-        hostId: String,
-        hostEpoch: String,
-        scopeId: String,
-        sessionId: String,
-        timelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterLifecycleEventId: String,
-        afterLifecycleState: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleDigestAuditRow>
-
     @Query(
         "SELECT COUNT(*) AS itemCount, " +
             "COALESCE(SUM(ledgerCanonicalUtf8Bytes), 0) AS declaredCanonicalBytes, " +
@@ -1193,22 +1016,6 @@ internal interface RelayV2AgentLifecycleDao {
             "n.lifecycleEventId, n.lifecycleState " +
             "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun notificationGlobalAuditPageAfter(
-        afterProfileId: String,
-        afterProfileActivationGeneration: Long,
-        afterPrincipalId: String,
-        afterClientInstanceId: String,
-        afterHostId: String,
-        afterHostEpoch: String,
-        afterScopeId: String,
-        afterSessionId: String,
-        afterTimelineEpoch: String,
-        afterAgentEventSeqOrder: String,
-        afterLifecycleEventId: String,
-        afterLifecycleState: String,
-        limit: Int,
-    ): List<RelayV2AgentLifecycleGlobalAuditRow>
-
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertNotifications(notifications: List<RelayV2AgentNotificationLedgerEntity>)
 
