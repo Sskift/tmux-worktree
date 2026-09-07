@@ -520,9 +520,11 @@ function isCanonicalUnsignedCounter(value: string): boolean {
 }
 
 function isKnownAbsentTmuxServer(result: SyncCommandResult): boolean {
-  return result.status?.kind === "exit"
-    && result.status.code !== 0
-    && /no server running|failed to connect to server/i.test(result.stderr);
+  if (result.status?.kind !== "exit" || result.status.code === 0) return false;
+  return /no server running|failed to connect to server/i.test(result.stderr)
+    || /error connecting to [^\r\n]+ \((?:No such file or directory|Connection refused)\)/i.test(
+      result.stderr,
+    );
 }
 
 function parseLifecycleEntry(line: string): TmuxSessionLifecycleEntry {

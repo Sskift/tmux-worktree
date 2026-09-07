@@ -37,10 +37,54 @@ buildSync({
 });
 const {
   exec: hardBoundExec,
+  listTmuxSessionLifecycleEntries,
   query: hardBoundQuery,
   run: hardBoundRun,
 } = await import(pathToFileURL(tmuxTestModule).href);
 process.once("exit", () => rmSync(tmuxTestRoot, { recursive: true, force: true }));
+
+test("RPC v2 lifecycle discovery treats only an absent tmux server as an empty cut", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "tw-tmux-absent-server-"));
+  const fakeTmux = join(root, "tmux");
+  const previousTmux = process.env.TW_TMUX;
+  const previousResult = process.env.TW_TEST_TMUX_RESULT;
+  t.after(() => {
+    if (previousTmux === undefined) delete process.env.TW_TMUX;
+    else process.env.TW_TMUX = previousTmux;
+    if (previousResult === undefined) delete process.env.TW_TEST_TMUX_RESULT;
+    else process.env.TW_TEST_TMUX_RESULT = previousResult;
+    rmSync(root, { recursive: true, force: true });
+  });
+  writeFileSync(fakeTmux, `#!/bin/sh
+case "$TW_TEST_TMUX_RESULT" in
+  no-server) printf '%s\\n' 'no server running on /tmp/tmux-1001/default' >&2; exit 1 ;;
+  missing-socket) printf '%s\\n' 'error connecting to /tmp/tmux-1001/default (No such file or directory)' >&2; exit 1 ;;
+  stale-socket) printf '%s\\n' 'error connecting to /tmp/tmux-1001/default (Connection refused)' >&2; exit 1 ;;
+  permission) printf '%s\\n' 'error connecting to /tmp/tmux-1001/default (Permission denied)' >&2; exit 1 ;;
+  malformed) printf '%s\\n' 'not-a-lifecycle-record'; exit 0 ;;
+  *) printf '%s\\n' 'unexpected fixture mode' >&2; exit 2 ;;
+esac
+`);
+  chmodSync(fakeTmux, 0o755);
+  process.env.TW_TMUX = fakeTmux;
+
+  for (const mode of ["no-server", "missing-socket", "stale-socket"]) {
+    process.env.TW_TEST_TMUX_RESULT = mode;
+    assert.deepEqual(listTmuxSessionLifecycleEntries(), [], mode);
+  }
+
+  process.env.TW_TEST_TMUX_RESULT = "permission";
+  assert.throws(
+    () => listTmuxSessionLifecycleEntries(),
+    /unable to read tmux lifecycle identity:.*Permission denied/,
+  );
+
+  process.env.TW_TEST_TMUX_RESULT = "malformed";
+  assert.throws(
+    () => listTmuxSessionLifecycleEntries(),
+    /tmux returned malformed lifecycle identity fields/,
+  );
+});
 
 function writeHardBoundFixture(root) {
   const fixture = join(root, "hard-bound-fixture.cjs");
