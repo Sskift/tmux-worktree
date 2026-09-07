@@ -112,7 +112,7 @@ Automation:
   tw terminal-control ...     运行 / 查询本机 terminal input ownership authority
   tw setup                    安装 / 配置向导
   tw doctor                   检查 tmux/git/node 与配置是否就绪
-  tw update                   更新 tw CLI 和 tw-dashboard
+  tw update                   显示 GitHub Release 更新指令（不自动执行）
   tw version | -v             显示版本
   tw help | -h                显示本帮助
 
