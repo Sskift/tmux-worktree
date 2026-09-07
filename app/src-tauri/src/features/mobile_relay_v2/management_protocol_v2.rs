@@ -983,12 +983,12 @@ fn valid_timestamp(value: u64) -> Result<(), ()> {
     }
 }
 
-fn valid_identifier(value: &str) -> Result<(), ()> {
+pub(super) fn valid_identifier(value: &str) -> Result<(), ()> {
     valid_bounded_opaque(value, MAX_IDENTIFIER_BYTES)?;
     reject_credential_value(value)
 }
 
-fn valid_device_label(value: &str) -> Result<(), ()> {
+pub(super) fn valid_device_label(value: &str) -> Result<(), ()> {
     valid_bounded_opaque(value, MAX_DEVICE_LABEL_BYTES)?;
     reject_credential_value(value)
 }

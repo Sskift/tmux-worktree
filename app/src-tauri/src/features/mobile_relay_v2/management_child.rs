@@ -2039,20 +2039,16 @@ fn encode_request(
     Ok(frame)
 }
 
+/// Decode a child-process response frame into a [`ManagementOutcome`].
+///
+/// This is the child-process frame mapping; the wire-level parsing lives in
+/// `management_protocol_v2::decode_response`.
 fn decode_response(
     payload: &[u8],
     expected_request_id: &str,
     operation: ManagementOperation,
 ) -> Result<ManagementOutcome, ()> {
     closed_object_payload(payload)?;
-    decode_v2_response(payload, expected_request_id, operation)
-}
-
-fn decode_v2_response(
-    payload: &[u8],
-    expected_request_id: &str,
-    operation: ManagementOperation,
-) -> Result<ManagementOutcome, ()> {
     let response =
         management_protocol_v2::decode_response(payload, expected_request_id, operation)?;
     Ok(ManagementOutcome {
@@ -2135,7 +2131,7 @@ fn valid_dot_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool
     })
 }
 
-fn fixed_error(code: &str, message: &str) -> ManagementError {
+pub(crate) fn fixed_error(code: &str, message: &str) -> ManagementError {
     ManagementError {
         code: code.to_string(),
         message: message.to_string(),
