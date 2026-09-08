@@ -1412,20 +1412,28 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
   ): Promise<void> {
     const route = this.exactAuthorityRoute(authorityRoute);
     if (!route || route.phase !== "ready" || !this.isAdmitted(route)) {
-      throw new Error("Relay v2 terminal callback targets a stale route binding");
+      // The route was already torn down (normal teardown after disconnect /
+      // fenceAdmission replaced the token). The frame is undeliverable and the
+      // owning stream is reclaimed by the later unbind/detach path, so drop it
+      // quietly. Throwing here escapes across the terminal manager's serializer
+      // as a plain Error and is misclassified as a host-wide fatal, fencing
+      // every other client's terminal for what is a single dead route.
+      return;
     }
     const delivery = this.scheduleRouteTask(route, "callbackTail", async () => {
       if (this.exactAuthorityRoute(authorityRoute) !== route
         || route.phase !== "ready"
         || !this.isAdmitted(route)) {
-        throw new Error("Relay v2 terminal callback targets a stale route binding");
+        // Same as the entry guard above: the route closed while this callback
+        // was queued. Settle without delivering instead of raising a fatal.
+        return;
       }
       const identity = await this.verifyCurrentIdentity(route, null, true);
       if (!identity) throw new Error("Relay v2 terminal callback lost its route fence");
       // Identity verification is asynchronous. A hard terminal deadline may
       // rotate the process-local H3 token while that await is pending.
       if (this.exactAuthorityRoute(authorityRoute) !== route) {
-        throw new Error("Relay v2 terminal callback targets a stale route binding");
+        return;
       }
       this.assertPublicFrameSchema(frame);
       let pending: PendingRequest | undefined;
@@ -1449,8 +1457,12 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         throw new Error("Relay v2 terminal callback returned an invalid frame kind");
       }
       if (!this.enqueueOutbound(route, frame)) {
+        // This route alone cannot keep up: close just that route with 1013 and
+        // let the client reconnect. Do NOT throw — a throw propagates as a
+        // plain Error through the terminal serializer and would fence the
+        // host's entire terminal lane (H3) for a single slow consumer.
         this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
-        throw new Error("Relay v2 terminal callback exceeded bounded route capacity");
+        return;
       }
       if (pending) {
         this.applyTerminalResponseLineage(route, pending, frame);
@@ -1465,8 +1477,9 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       if (!afterCallback) throw new Error("Relay v2 terminal callback lost its post-send fence");
     });
     if (!delivery) {
+      // The route's callback lane is saturated; only this route is affected.
       this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
-      throw new Error("Relay v2 terminal callback exceeded bounded route capacity");
+      return;
     }
     await delivery;
   }
