@@ -46,6 +46,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
+import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionServiceDecisions
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvidence
@@ -2321,6 +2322,66 @@ class RelayV2BaseRuntimeCompositionTest {
                 )
             } finally {
                 harness.close()
+            }
+        }
+
+    @Test
+    fun `service foreground fence holds during bootstrap and on successor composition`() =
+        runBlocking {
+            // START_STICKY restart: no composition yet, bootstrap in flight -> hold foreground.
+            assertTrue(
+                "null composition before bootstrap settles must keep the service alive",
+                RelayConnectionServiceDecisions.keepForeground(
+                    composition = null,
+                    bootstrapSettled = false,
+                ),
+            )
+            // Bootstrap settled with no auto-connect profile -> stop is allowed (fail closed).
+            assertFalse(
+                "null composition after bootstrap settles must allow stopSelf",
+                RelayConnectionServiceDecisions.keepForeground(
+                    composition = null,
+                    bootstrapSettled = true,
+                ),
+            )
+
+            val first = Harness(autoConnect = true)
+            try {
+                // A live (connecting/online) composition always keeps the foreground.
+                assertTrue(
+                    RelayConnectionServiceDecisions.keepForeground(
+                        first.composition,
+                        bootstrapSettled = true,
+                    ),
+                )
+                first.close()
+                withTimeout(TIMEOUT_MS) {
+                    while (!first.composition.isTerminalOrClosed()) delay(1)
+                }
+                // C1 terminal: the old collector decision must now allow stop for C1 alone...
+                assertFalse(
+                    "terminal C1 alone must allow stopSelf",
+                    RelayConnectionServiceDecisions.keepForeground(
+                        first.composition,
+                        bootstrapSettled = true,
+                    ),
+                )
+                // ...but once a successor C2 is installed (the C022 reactivation race), a stale
+                // null/terminal decision must not tear down the foreground keep-alive.
+                val successor = Harness(autoConnect = true)
+                try {
+                    assertTrue(
+                        "successor composition installed during reactivation must hold FGS",
+                        RelayConnectionServiceDecisions.keepForeground(
+                            successor.composition,
+                            bootstrapSettled = true,
+                        ),
+                    )
+                } finally {
+                    successor.close()
+                }
+            } finally {
+                first.close()
             }
         }
 
