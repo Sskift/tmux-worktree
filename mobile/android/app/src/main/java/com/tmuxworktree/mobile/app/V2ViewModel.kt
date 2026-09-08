@@ -35,7 +35,6 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadSta
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateTerminalInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ManualResyncResult
-import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2NetworkHintResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommand
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommandsReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
@@ -174,6 +173,58 @@ internal fun relayV2TerminalResetRecoveryDelayMillis(nextAttempt: Int): Long {
         RELAY_V2_TERMINAL_RESET_RECOVERY_BASE_DELAY_MS *
             (1L shl (nextAttempt - 1))
         ).coerceAtMost(RELAY_V2_TERMINAL_RESET_RECOVERY_MAX_DELAY_MS)
+}
+
+/**
+ * Which network hint (if any) to forward to the v2 composition after a network emission, given
+ * the previously observed edge state. Both directions are edge-gated so that a [combine] replay
+ * of an unchanged network (the NetworkMonitor StateFlow re-emits the current network whenever a
+ * recombined source — e.g. a per-failure composition state — publishes) cannot re-fire a hint:
+ *
+ * - AVAILABLE fires only on a false→true edge OR on a true→true network-handle change (a
+ *   Wi-Fi↔cellular/VPN handover where the socket may be pinned to a now-dead network). This
+ *   matches the old UI collector's `networkChanged` semantics; without it, a half-open socket
+ *   on the abandoned network waited for the 60s silence/backoff ladder.
+ * - LOST fires only on a true→false edge. The old UI collector gated this with `else if
+ *   (changed)`; an unconditional LOST on every offline composition-state replay cancels the
+ *   just-scheduled backoff timer (onNetworkLost cancels connectionAttemptJob without
+ *   rescheduling), parking the retry ladder until the recovery edge.
+ *
+ * [RelayV2NetworkHintEdge] is the persisted edge state; seed it with
+ * [RelayV2NetworkHintEdge.unobserved] before the first emission so a process that starts
+ * offline does not fire a spurious LOST.
+ */
+internal enum class RelayV2NetworkHintAction { AVAILABLE, LOST, NONE }
+
+internal data class RelayV2NetworkHintEdge(
+    val observed: Boolean = false,
+    val available: Boolean = false,
+    val networkHandle: Long? = null,
+) {
+    companion object {
+        val unobserved = RelayV2NetworkHintEdge(observed = false)
+    }
+}
+
+internal fun relayV2NetworkHintAction(
+    previous: RelayV2NetworkHintEdge,
+    available: Boolean,
+    networkHandle: Long?,
+): Pair<RelayV2NetworkHintAction, RelayV2NetworkHintEdge> {
+    val next = RelayV2NetworkHintEdge(
+        observed = true,
+        available = available,
+        networkHandle = networkHandle,
+    )
+    val action = when {
+        available && (!previous.observed || !previous.available ||
+            previous.networkHandle != networkHandle) ->
+            RelayV2NetworkHintAction.AVAILABLE
+        !available && previous.observed && previous.available ->
+            RelayV2NetworkHintAction.LOST
+        else -> RelayV2NetworkHintAction.NONE
+    }
+    return action to next
 }
 
 internal fun shouldRetryRelayV2TerminalOpen(
@@ -697,6 +748,9 @@ internal class RelayV2TerminalRouteRegistry<T : Any>(
 
     fun owner(routeId: String): T? = owners[routeId]
 
+    /** All currently owned routes, as stable (routeId, owner) pairs. */
+    fun entries(): List<Pair<String, T>> = owners.entries.map { it.key to it.value }
+
     fun isClosed(routeId: String): Boolean = routeId in closedRoutes
 
     fun rememberClosed(routeId: String) {
@@ -743,6 +797,15 @@ internal fun <T> planRelayV2TerminalCloseLineage(
         RelayV2TerminalClosePlanStep(owner, ownsRemoteClose(owner))
     }
 }
+
+/**
+ * Process-wide guard for the single network-hint collector. The imperative
+ * composition.onNetworkAvailable/onNetworkLost hints must survive ViewModel disposal (the
+ * composition lives on the process scope for service-only keep-alive); without a process-scoped
+ * collector, a Service-only process after the UI ViewModel is cleared stops receiving immediate
+ * reconnect acceleration/deceleration and falls back to the bounded silence/backoff ladder.
+ */
+private val relayV2ProcessNetworkHintCollectorStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
 class V2ViewModel(
     private val container: AppContainer,
@@ -881,6 +944,11 @@ class V2ViewModel(
     private var notificationPermissionRequestPending = false
     private var relayV2NotificationPreferencesLoaded = false
     private var notificationPermissionRequestClaim: Any? = null
+    // Set when an automatic offer was answered with a denial so it does not nag on every later
+    // resume; an explicit settings toggle may still retry regardless.
+    private var notificationPermissionAutomaticOfferDenied = false
+    // Whether the in-flight request (if any) was the one-time automatic offer vs an explicit tap.
+    private var notificationPermissionRequestAutomatic = false
     private val agentNotificationConfigMutex = Mutex()
     private val notificationPermissionRequestChannel = Channel<Unit>(capacity = 1)
     internal val notificationPermissionRequests: Flow<Unit> =
@@ -2838,6 +2906,125 @@ class V2ViewModel(
         }
     }
 
+    /**
+     * Base transport reached ONLINE (with a current session cut) while a visible terminal route
+     * was left PAUSED by an automatic reset recovery that could not reopen (budget exhausted in a
+     * 30s window, or the bounded wait timed out during a slow host restart). A paused terminal has
+     * no observer edge on base recovery -- the teardown reset fires only once at disconnect -- so
+     * without this it stayed OFFLINE until the user tapped Reconnect. Re-arm exactly once per
+     * ONLINE edge, flowing through the same admit + claim fence as an automatic reset (the manual
+     * Reconnect path shares the single relayV2TerminalResetRecoveryClaim and cannot double open).
+     * The budget still gates storms; a fresh edge after the window ages out gets one more attempt.
+     */
+    private fun armPausedRelayV2TerminalRecoveryOnOnlineEdge(
+        composition: RelayV2BaseRuntimeComposition,
+    ) {
+        val armed = synchronized(relayV2UiFenceLock) {
+            if (relayV2Composition !== composition ||
+                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
+                composition.state.value.phase != RelayV2BaseRuntimePhase.ONLINE
+            ) return
+            val visibleTerminal = _uiState.value.terminal
+            if (visibleTerminal.status == ConnectionStatus.ONLINE ||
+                visibleTerminal.status == ConnectionStatus.CONNECTING ||
+                visibleTerminal.status == ConnectionStatus.RECOVERING
+            ) return
+            val sessionStableId = visibleTerminal.sessionId.takeIf { it.isNotBlank() }
+                ?: return
+            if (relayV2SessionReplyCuts.value[sessionStableId] == null) return
+            val session = _uiState.value.session(sessionStableId) ?: return
+
+            // The paused owner may still occupy the terminal slot (budget-exhausted reset) or have
+            // been withdrawn as a route-only sentinel (bounded wait timed out).
+            val pausedSlot: Pair<String, RelayV2UiTerminalAttachment>? =
+                relayV2Terminal?.takeIf {
+                    it.composition === composition &&
+                        it.fence.sessionStableId == sessionStableId &&
+                        it.detachedCallbackDisposition ==
+                        RelayV2DetachedTerminalCallbackDisposition.PAUSED
+                }?.let { paused ->
+                    val routeId = relayV2TerminalRoutes.entries()
+                        .firstOrNull { (_, owner) -> owner === paused }?.first
+                        ?: return
+                    routeId to paused
+                } ?: relayV2TerminalRoutes.entries().firstOrNull { (routeId, owner) ->
+                    owner.composition === composition &&
+                        owner.fence.sessionStableId == sessionStableId &&
+                        owner.detachedCallbackDisposition ==
+                        RelayV2DetachedTerminalCallbackDisposition.PAUSED &&
+                        !relayV2TerminalRoutes.isClosed(routeId)
+                }
+            val candidate = pausedSlot?.second ?: return
+            val attachmentId = pausedSlot.first
+            val routeCurrent = candidate.fence.ownsRoute(attachmentId) &&
+                relayV2TerminalUiRouteIntentIsCurrent(
+                    candidate.uiTerminalToken,
+                    visibleTerminal,
+                )
+            if (!routeCurrent || candidate.lifecycle.detachRequested()) return
+
+            val reason = RelayV2TerminalResetReason.STREAM_LOST
+            val admission = admitRelayV2TerminalResetRecovery(
+                exactCurrentOwner = true,
+                reason = reason,
+                budget = candidate.resetRecoveryBudget,
+                nowMillis = monotonicClock(),
+            ) ?: return
+            // Charge this attempt to the candidate's sliding window now, before the bounded wait or
+            // detach runs. The budget is normally persisted via the reopening openTerminal intent,
+            // but a 30s ONLINE+cut timeout or a detach exception pauses without ever minting a new
+            // attachment; without writing it back here, a storm of ONLINE edges could re-admit the
+            // same PAUSED attachment past the 3/30s storm budget. Mirrors the observer.reset path
+            // (`issued.resetRecoveryBudget = admission.budget`).
+            candidate.resetRecoveryBudget = admission.budget
+
+            // A withdrawn (route-only) sentinel must re-claim the recovery slot, exactly like the
+            // late detached-open response path; a still-installed owner keeps the slot it holds.
+            val recoveryClaim = Any()
+            if (relayV2Terminal == null) {
+                val claimedSlot = claimDetachedRelayV2TerminalRecoverySlot(
+                    current = RelayV2TerminalRecoverySlot(
+                        owner = relayV2Terminal,
+                        claim = relayV2TerminalResetRecoveryClaim,
+                    ),
+                    issued = candidate,
+                    claim = recoveryClaim,
+                ) ?: return
+                relayV2Terminal = claimedSlot.owner
+                relayV2TerminalResetRecoveryClaim = claimedSlot.claim
+            } else if (relayV2Terminal !== candidate) {
+                return
+            } else {
+                relayV2TerminalResetRecoveryClaim = recoveryClaim
+            }
+
+            candidate.detachedCallbackDisposition =
+                RelayV2DetachedTerminalCallbackDisposition.RECOVER
+            val recoveringTerminal = TerminalStreamState(
+                sessionId = sessionStableId,
+                status = ConnectionStatus.RECOVERING,
+                resetReason = reason.name.lowercase(),
+            )
+            val recovery = RelayV2UiTerminalResetRecovery(
+                claim = recoveryClaim,
+                issued = candidate,
+                routeIntent = recoveringTerminal,
+                detach = candidate.lifecycle.requestDetach(),
+                callbacks = candidate.parser.fenceAttachment(),
+                nextAttempt = admission.nextAttempt,
+                nextBudget = admission.budget,
+            )
+            candidate.uiTerminalToken = recoveringTerminal
+            _uiState.value = _uiState.value.copy(
+                terminal = recoveringTerminal,
+                actionError = null,
+            )
+            Triple(session, attachmentId, recovery)
+        }
+        val (session, attachmentId, recovery) = armed
+        recoverRelayV2TerminalAfterReset(session, attachmentId, recovery)
+    }
+
     private fun recoverRelayV2TerminalAfterReset(
         session: RelaySession,
         attachmentId: String,
@@ -3146,6 +3333,7 @@ class V2ViewModel(
         }
         viewModelScope.launch {
             val issued = current.issued
+            var detachSucceeded = false
             try {
                 // Abort the exact accepted platform mutation while the old runtime admission is
                 // still live; its registration lease keeps this barrier closed until ParserFailed
@@ -3167,6 +3355,7 @@ class V2ViewModel(
                         closeRemote = retirement.closeRemote,
                     )
                 }
+                detachSucceeded = true
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -3178,31 +3367,37 @@ class V2ViewModel(
                 if (failurePublished) {
                     emit(V2UiEffect.Notice("Terminal renderer recovery could not fully detach"))
                 }
-                return@launch
             }
-            synchronized(relayV2UiFenceLock) {
-                val withdrawn = withdrawRetiredRelayV2TerminalRecoverySlot(
-                    current = RelayV2TerminalRecoverySlot(
-                        owner = relayV2Terminal,
-                        claim = relayV2TerminalResetRecoveryClaim,
-                    ),
-                    issued = issued,
-                    claim = current.slotClaim,
-                )
-                if (withdrawn != null) {
-                    relayV2Terminal = withdrawn.owner
-                    // Renderer retirement owns this route teardown; cancel any older automatic
-                    // recovery claim rather than leaving a claim with no local sentinel.
-                    relayV2TerminalResetRecoveryClaim = null
-                }
-                if (current.closeLineageOldestFirst != null) {
-                    relayV2TerminalRoutes.removeOwner(attachmentId, issued)
+            if (detachSucceeded) {
+                synchronized(relayV2UiFenceLock) {
+                    val withdrawn = withdrawRetiredRelayV2TerminalRecoverySlot(
+                        current = RelayV2TerminalRecoverySlot(
+                            owner = relayV2Terminal,
+                            claim = relayV2TerminalResetRecoveryClaim,
+                        ),
+                        issued = issued,
+                        claim = current.slotClaim,
+                    )
+                    if (withdrawn != null) {
+                        relayV2Terminal = withdrawn.owner
+                        // Renderer retirement owns this route teardown; cancel any older automatic
+                        // recovery claim rather than leaving a claim with no local sentinel.
+                        relayV2TerminalResetRecoveryClaim = null
+                    }
+                    if (current.closeLineageOldestFirst != null) {
+                        relayV2TerminalRoutes.removeOwner(attachmentId, issued)
+                    }
                 }
             }
             // The platform mutation was settled before drain; this step only releases the old
-            // WebView generation and publishes its bounded renderer rebuild.
+            // WebView generation and publishes its bounded renderer rebuild. It MUST run even when
+            // the detach chain threw (e.g. an offline transport made the close lease stale):
+            // leaving pendingLoss occupied rejects every later WebView bind and the manual rebuild
+            // flag, producing a permanent black screen with a dead Reconnect button. Both calls
+            // are idempotent (parserAbortClaimed/completionClaimed guards).
+            rendererLoss.abortParserMutationBeforeAttachmentDetach()
             val rebuilt = rendererLoss.completeAfterAttachmentDetach()
-            if (!rebuilt && rendererLoss.isRendererLoss) {
+            if (detachSucceeded && !rebuilt && rendererLoss.isRendererLoss) {
                 publishTerminalRendererRecoveryPaused(
                     issued = issued,
                     retirementRecoveryClaim = current.slotClaim,
@@ -3515,13 +3710,30 @@ class V2ViewModel(
     /** Activity reports the actual platform result; issuing a request never calls this method. */
     internal fun updateNotificationPermission(granted: Boolean) {
         val composition = synchronized(relayV2UiFenceLock) {
+            // The offer reached the user (the STARTED collector consumed it, or it was answered),
+            // so this is the point at which the one-time automatic offer may be durably spent.
+            // Consuming it before delivery lost the offer permanently when the buffered channel
+            // element died with the process and the durable marker had already been written.
+            val wasAutomaticOffer = notificationPermissionRequestPending &&
+                notificationPermissionRequestAutomatic
             notificationPermissionGranted = granted
             notificationPermissionRequestPending = false
+            notificationPermissionRequestAutomatic = false
             notificationPermissionRequestClaim = null
-            relayV2Composition
+            if (wasAutomaticOffer && !granted) {
+                notificationPermissionAutomaticOfferDenied = true
+            }
+            Triple(relayV2Composition, wasAutomaticOffer, granted)
         }
-        composition?.let { current ->
-            viewModelScope.launch { syncAgentNotificationConfig(current) }
+        val (current, wasAutomaticOffer, grantedNow) = composition
+        if (wasAutomaticOffer && !grantedNow) {
+            // Best effort: spend the one-time durable offer now that the prompt was actually shown
+            // and declined. A storage failure leaves it unspent; the in-memory denied flag still
+            // stops nagging for this process, and the next launch may offer once more.
+            viewModelScope.launch { runCatching { preferencesStore.claimAutomaticAgentNotificationPermissionOffer() } }
+        }
+        current?.let { compositionCurrent ->
+            viewModelScope.launch { syncAgentNotificationConfig(compositionCurrent) }
         }
     }
 
@@ -3538,6 +3750,33 @@ class V2ViewModel(
         expectedComposition: RelayV2BaseRuntimeComposition,
         automatic: Boolean,
     ) {
+        // For the automatic one-time offer, defer consuming the durable marker until the prompt is
+        // actually answered (updateNotificationPermission). An explicit toggle is always allowed
+        // to retry; it must merely be able to read the marker. Gate the automatic path on the
+        // durable marker up front (read-only) so a spent offer does not even enqueue a prompt.
+        if (automatic) {
+            val alreadyOffered = try {
+                preferencesStore.automaticAgentNotificationPermissionOffered()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                // Fail closed: when the durable state cannot be read, do not nag automatically.
+                return
+            }
+            if (alreadyOffered) return
+        } else {
+            val markerReadable = try {
+                preferencesStore.claimAutomaticAgentNotificationPermissionOffer()
+                true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                false
+            }
+            // The explicit toggle may retry after denial, but still needs a readable marker.
+            if (!markerReadable) return
+        }
+
         val requestClaim = synchronized(relayV2UiFenceLock) {
             if (notificationPermissionRequestPending ||
                 !notificationPermissionRequestEligibleLocked(expectedComposition, automatic)
@@ -3547,23 +3786,10 @@ class V2ViewModel(
                 val claim = Any()
                 notificationPermissionRequestClaim = claim
                 notificationPermissionRequestPending = true
+                notificationPermissionRequestAutomatic = automatic
                 claim
             }
         } ?: return
-        val durableClaimed = try {
-            preferencesStore.claimAutomaticAgentNotificationPermissionOffer()
-        } catch (cancelled: CancellationException) {
-            clearNotificationPermissionRequestClaim(requestClaim)
-            throw cancelled
-        } catch (_: Throwable) {
-            null
-        }
-        // Automatic activation owns only a fresh durable claim. An explicit toggle may retry
-        // after denial, but still requires the already-offered marker to be durably readable.
-        if (durableClaimed == null || (automatic && durableClaimed == false)) {
-            clearNotificationPermissionRequestClaim(requestClaim)
-            return
-        }
         val stillCurrent = synchronized(relayV2UiFenceLock) {
             notificationPermissionRequestClaim === requestClaim &&
                 notificationPermissionRequestPending &&
@@ -3587,9 +3813,11 @@ class V2ViewModel(
             relayV2Composition === expectedComposition &&
             state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 &&
             state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE &&
-            (!automatic || relayV2NotificationPreferencesLoaded && with(state.preferences) {
-                waitingNotifications || failedNotifications || completedNotifications
-            })
+            (!automatic ||
+                !notificationPermissionAutomaticOfferDenied &&
+                    relayV2NotificationPreferencesLoaded && with(state.preferences) {
+                        waitingNotifications || failedNotifications || completedNotifications
+                    })
     }
 
     private fun clearNotificationPermissionRequestClaim(requestClaim: Any) {
@@ -3597,6 +3825,7 @@ class V2ViewModel(
             if (notificationPermissionRequestClaim === requestClaim) {
                 notificationPermissionRequestClaim = null
                 notificationPermissionRequestPending = false
+                notificationPermissionRequestAutomatic = false
             }
         }
     }
@@ -4433,6 +4662,7 @@ class V2ViewModel(
             )
         }
         resumeRelayV2PendingCreations(composition)
+        startProcessRelayV2NetworkHintCollection()
         viewModelScope.launch {
             composition.state.collect { runtime ->
                 val connectionFailure =
@@ -4493,6 +4723,9 @@ class V2ViewModel(
                         ))
                     }
                 }
+                // Base transport ONLINE edge: a terminal left PAUSED after a slow host restart or
+                // a budget window gets one bounded automatic re-arm instead of waiting for a tap.
+                armPausedRelayV2TerminalRecoveryOnOnlineEdge(composition)
             }
         }
         viewModelScope.launch {
@@ -4631,33 +4864,60 @@ class V2ViewModel(
                     }
                     true
                 }
-                if (current) syncAgentNotificationConfig(composition)
+                if (current) {
+                    syncAgentNotificationConfig(composition)
+                    // The ONLINE-edge arm below fires on the composition-state collector, but a
+                    // session cut arrives later on this independent productProjection collector
+                    // (host registration + discovery after a slow restart). Re-evaluate here once
+                    // the cut is installed so a PAUSED terminal whose cut lagged the ONLINE edge
+                    // is still auto-armed instead of waiting for a tap. armPaused is idempotent:
+                    // it returns once the disposition leaves PAUSED or a claim is held.
+                    armPausedRelayV2TerminalRecoveryOnOnlineEdge(composition)
+                }
             }
         }
         viewModelScope.launch {
+            // UI-scope collector owns only the networkAvailable health projection. The imperative
+            // reconnect hints are driven process-wide by startProcessRelayV2NetworkHintCollection
+            // so they keep reaching the service-living composition after this ViewModel is cleared.
             container.networkMonitor.state.collect { network ->
-                val available = network.available
-                val changed = available != _uiState.value.networkAvailable
-                val networkChanged = available && network.networkHandle != activeNetworkHandle
                 activeNetworkHandle = network.networkHandle
-                _uiState.update { it.copy(networkAvailable = available) }
+                _uiState.update { it.copy(networkAvailable = network.available) }
                 refreshDecoratedHealth()
-                val current = synchronized(relayV2UiFenceLock) {
-                    if (relayV2Composition !== composition ||
-                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
-                    ) null else composition
-                } ?: return@collect
-                if (available) {
-                    if ((changed || networkChanged) && _uiState.value.preferences.autoConnect) {
-                        val hint = current.onNetworkAvailable()
-                        if (hint == RelayV2NetworkHintResult.RECONNECTING) {
-                            _uiState.update { it.copy(isConnecting = true) }
-                        }
-                    }
-                } else if (changed) {
-                    current.onNetworkLost()
-                }
             }
+        }
+    }
+
+    /**
+     * Launches (once per process) a network collector on [RelayV2ConnectionRegistry]'s
+     * process-lifetime scope that forwards network changes to whichever v2 composition is
+     * installed. The composition hints are idempotent and already fence on closed / terminal
+     * failure / reconnectEnabled, so driving them from the process scope is safe and makes
+     * service-only keep-alive accelerate reconnect on network recovery (and decelerate on loss)
+     * even after every UI ViewModel has been cleared.
+     */
+    private fun startProcessRelayV2NetworkHintCollection() {
+        if (!relayV2ProcessNetworkHintCollectorStarted.compareAndSet(false, true)) return
+        RelayV2ConnectionRegistry.scope.launch {
+            var edge = RelayV2NetworkHintEdge.unobserved
+            combine(
+                RelayV2ConnectionRegistry.composition,
+                container.networkMonitor.state,
+            ) { composition, network -> composition to network }
+                .collect { (composition, network) ->
+                    if (composition == null) return@collect
+                    val (action, nextEdge) = relayV2NetworkHintAction(
+                        previous = edge,
+                        available = network.available,
+                        networkHandle = network.networkHandle,
+                    )
+                    when (action) {
+                        RelayV2NetworkHintAction.AVAILABLE -> composition.onNetworkAvailable()
+                        RelayV2NetworkHintAction.LOST -> composition.onNetworkLost()
+                        RelayV2NetworkHintAction.NONE -> Unit
+                    }
+                    edge = nextEdge
+                }
         }
     }
 

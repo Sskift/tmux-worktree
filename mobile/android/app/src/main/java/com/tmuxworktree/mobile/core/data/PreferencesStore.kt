@@ -984,6 +984,10 @@ class PreferencesStore internal constructor(
         return claimed
     }
 
+    /** Whether the one-time automatic permission offer was already delivered. */
+    internal suspend fun automaticAgentNotificationPermissionOffered(): Boolean =
+        store.data.first()[Keys.automaticAgentNotificationPermissionOffered] == true
+
     suspend fun setDarkThemeEnabled(enabled: Boolean) {
         store.edit { it[Keys.darkThemeEnabled] = enabled }
     }
