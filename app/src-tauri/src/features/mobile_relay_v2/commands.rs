@@ -126,10 +126,14 @@ pub(crate) struct MobileRelayV2ManagementCommandState {
     // (which has no desired-state watchdog) is rebuilt from the call path.
     // Self-hosted owners and the permanent-unavailable state must never spawn a
     // DefaultProduction child on this path — they are rebuilt by the connector
-    // watchdog / explicit Start Center. Set once at construction from the
-    // launch selection; the owner may transiently be StartFailed(ChannelClosed)
-    // in BOTH modes, so the owner match arms cannot tell them apart without it.
-    allow_default_production_respawn: bool,
+    // watchdog / explicit Start Center. The owner may transiently be
+    // StartFailed(ChannelClosed) in BOTH modes, so the owner match arms cannot
+    // tell them apart without it. It follows the owner LINEAGE, not the
+    // construction-time selection: a Dashboard that starts in default
+    // production and is switched to self-hosted in-app (first Save + Deploy +
+    // Start Center replaces the same singleton) must flip it to false at the
+    // moment the self-hosted replacement claims the owner.
+    allow_default_production_respawn: AtomicBool,
     resurrect: Mutex<RespawnBudget>,
     #[cfg(test)]
     rebuild_override: Mutex<Option<RebuildOverrideFactory>>,
@@ -329,7 +333,7 @@ impl MobileRelayV2ManagementCommandState {
             artifacts,
             disposed: AtomicBool::new(false),
             rebuild_handle: Mutex::new(rebuild_handle),
-            allow_default_production_respawn,
+            allow_default_production_respawn: AtomicBool::new(allow_default_production_respawn),
             resurrect: Mutex::new(RespawnBudget::fresh()),
             #[cfg(test)]
             rebuild_override: Mutex::new(None),
@@ -518,7 +522,10 @@ impl MobileRelayV2ManagementCommandState {
         // owner would spawn an unrelated DefaultProduction child and publish
         // enrollment/QR data for the production shipping root. Self-hosted
         // faults are rebuilt by the connector watchdog and Start Center.
-        if !self.allow_default_production_respawn {
+        if !self
+            .allow_default_production_respawn
+            .load(Ordering::Acquire)
+        {
             return Err(ManagementStartError::ChannelClosed);
         }
         #[cfg(not(test))]
@@ -545,6 +552,16 @@ impl MobileRelayV2ManagementCommandState {
         let previous = {
             let mut owner = self.owner.lock().unwrap();
             if self.disposed.load(Ordering::Acquire) {
+                return Err(ManagementStartError::ChannelClosed);
+            }
+            // Re-check the mode latch under the owner lock: a self-hosted
+            // replacement that claimed the owner between the unlocked check
+            // above and here has already flipped it, and its StartFailed
+            // lineage must not be resurrected as default production.
+            if !self
+                .allow_default_production_respawn
+                .load(Ordering::Acquire)
+            {
                 return Err(ManagementStartError::ChannelClosed);
             }
             match &*owner {
@@ -621,6 +638,8 @@ impl MobileRelayV2ManagementCommandState {
                     launch_key: ManagementLaunchKey::DefaultProduction,
                     manager,
                 };
+                self.allow_default_production_respawn
+                    .store(true, Ordering::Release);
                 drop(owner);
                 completion.complete(ManagementCleanupOutcome::Clean);
                 Ok(())
@@ -891,43 +910,11 @@ impl MobileRelayV2ManagementCommandState {
         // plus the clean-close budget) runs WITHOUT the owner lock so status
         // polls and concurrent management calls observe Replacing promptly
         // instead of blocking on the mutex for tens of seconds.
-        let leader_previous = {
-            let mut owner = self.owner.lock().unwrap();
-            if self.disposed.load(Ordering::Acquire) {
-                return Err(ManagementStartError::ChannelClosed);
-            }
-            if reuse_ready_child
-                && matches!(
-                    &*owner,
-                    ManagementCommandOwner::Ready {
-                        launch_key,
-                        manager,
-                    } if launch_key == &desired_key && manager.is_reusable_after_observation()
-                )
-            {
-                return Ok(());
-            }
-            self.artifacts.clear();
-            let previous = std::mem::replace(
-                &mut *owner,
-                ManagementCommandOwner::Replacing(completion.clone()),
-            );
-            match previous {
-                ManagementCommandOwner::Replacing(previous) => {
-                    // Another replacement owns this epoch. Wait for it (outside
-                    // the lock) and never spawn a competing child.
-                    drop(owner);
-                    let cleanup = previous.wait();
-                    completion.complete(cleanup);
-                    return Err(if cleanup == ManagementCleanupOutcome::RecoveryRequired {
-                        ManagementStartError::RecoveryRequired
-                    } else {
-                        ManagementStartError::ChannelClosed
-                    });
-                }
-                leader => leader,
-            }
-        };
+        let leader_previous =
+            match self.claim_replacement(&desired_key, reuse_ready_child, &completion)? {
+                Some(previous) => previous,
+                None => return Ok(()),
+            };
 
         // Phase 2: drain the old owner and spawn the replacement without the
         // owner lock held. RecoveryRequired stays fail-closed.
@@ -949,9 +936,77 @@ impl MobileRelayV2ManagementCommandState {
         let candidate = ManagementChildManager::start_selected(app, selection);
         let settled = settle_candidate_start(candidate, commit_ready);
 
-        // Phase 3: re-take the lock to publish the terminal owner. Re-validate
-        // the disposed fence: a shutdown that raced the spawn must drain the
-        // freshly started child instead of publishing a live Ready owner.
+        // Phase 3: re-take the lock to publish the terminal owner.
+        self.publish_replacement(settled, published_key, &completion)
+    }
+
+    /// Phase 1 of a self-hosted replacement: under the owner lock, either
+    /// fast-path a reusable child (`Ok(None)`), coalesce behind an in-flight
+    /// replacement (`Err`), or publish Replacing and return the previous owner
+    /// for the caller to drain (`Ok(Some(previous))`). Claiming leadership also
+    /// moves the respawn mode latch to the requested lineage, so any
+    /// StartFailed(ChannelClosed) this owner later degrades into is attributed
+    /// to the self-hosted mode and never lazily resurrected as default
+    /// production.
+    fn claim_replacement(
+        &self,
+        desired_key: &ManagementLaunchKey,
+        reuse_ready_child: bool,
+        completion: &Arc<ManagementDrainCompletion>,
+    ) -> Result<Option<ManagementCommandOwner>, ManagementStartError> {
+        let mut owner = self.owner.lock().unwrap();
+        if self.disposed.load(Ordering::Acquire) {
+            return Err(ManagementStartError::ChannelClosed);
+        }
+        if reuse_ready_child
+            && matches!(
+                &*owner,
+                ManagementCommandOwner::Ready {
+                    launch_key,
+                    manager,
+                } if launch_key == desired_key && manager.is_reusable_after_observation()
+            )
+        {
+            return Ok(None);
+        }
+        self.artifacts.clear();
+        let previous = std::mem::replace(
+            &mut *owner,
+            ManagementCommandOwner::Replacing(completion.clone()),
+        );
+        match previous {
+            ManagementCommandOwner::Replacing(previous) => {
+                // Another replacement owns this epoch. Wait for it (outside
+                // the lock) and never spawn a competing child.
+                drop(owner);
+                let cleanup = previous.wait();
+                completion.complete(cleanup);
+                Err(if cleanup == ManagementCleanupOutcome::RecoveryRequired {
+                    ManagementStartError::RecoveryRequired
+                } else {
+                    ManagementStartError::ChannelClosed
+                })
+            }
+            leader => {
+                self.allow_default_production_respawn.store(
+                    *desired_key == ManagementLaunchKey::DefaultProduction,
+                    Ordering::Release,
+                );
+                Ok(Some(leader))
+            }
+        }
+    }
+
+    /// Phase 3 of a self-hosted replacement: re-take the owner lock and publish
+    /// the terminal owner. Re-validates the disposed fence: a shutdown that
+    /// raced the spawn must drain the freshly started child instead of
+    /// publishing a live Ready owner.
+    fn publish_replacement(
+        &self,
+        settled: Result<ManagementChildManager, ManagementStartError>,
+        published_key: ManagementLaunchKey,
+        completion: &Arc<ManagementDrainCompletion>,
+    ) -> Result<(), ManagementStartError> {
         let mut owner = self.owner.lock().unwrap();
         if self.disposed.load(Ordering::Acquire) {
             if let Ok(manager) = settled {
@@ -967,6 +1022,10 @@ impl MobileRelayV2ManagementCommandState {
         }
         match settled {
             Ok(manager) => {
+                self.allow_default_production_respawn.store(
+                    published_key == ManagementLaunchKey::DefaultProduction,
+                    Ordering::Release,
+                );
                 *owner = ManagementCommandOwner::Ready {
                     launch_key: published_key,
                     manager,
@@ -1011,6 +1070,13 @@ impl MobileRelayV2ManagementCommandState {
             ManagementCommandOwner::Ready { launch_key, .. }
                 if launch_key == expected_launch_key =>
             {
+                // The abandoned owner keeps its lineage: a self-hosted owner
+                // degraded to StartFailed(ChannelClosed) here must be rebuilt
+                // by Start Center / the watchdog, never lazily as production.
+                self.allow_default_production_respawn.store(
+                    *expected_launch_key == ManagementLaunchKey::DefaultProduction,
+                    Ordering::Release,
+                );
                 let completion = Arc::new(ManagementDrainCompletion::pending());
                 let previous = std::mem::replace(
                     &mut *owner,
@@ -1751,7 +1817,9 @@ mod tests {
             ),
         );
         assert!(
-            !state.allow_default_production_respawn,
+            !state
+                .allow_default_production_respawn
+                .load(Ordering::Acquire),
             "self-hosted construction must disable default-production respawn"
         );
         let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1855,6 +1923,110 @@ mod tests {
             spawns.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "failed-stop abandon must not be resurrected as default production"
+        );
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_state_switched_to_self_hosted_in_app_never_lazily_respawns_production() {
+        // Rereview C014(b)/D034: the management state is a singleton that the
+        // Dashboard constructs in DEFAULT production when no self-hosted config
+        // exists yet (lib.rs start()). The user's first in-app Save + Deploy +
+        // Start Center then calls restart_self_hosted on that SAME state, which
+        // publishes Ready{SelfHosted}. A construction-time latch stays "true"
+        // across that switch, so when the self-hosted owner later degrades to
+        // StartFailed(ChannelClosed) (projection failure, or the C015
+        // failed-stop abandon), the next non-connector call would lazily spawn
+        // a DefaultProduction child and hand out production-root enrollment/QR
+        // data. The latch must follow the owner lineage set at replacement.
+        let default_manager = ManagementChildManager::start_v2_command_regression_script(
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while IFS= read -r request; do exit 94; done".to_string(),
+            [94u8; 16],
+        )
+        .expect("default owner starts");
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start(Ok(
+            default_manager,
+        )));
+        assert!(
+            state
+                .allow_default_production_respawn
+                .load(Ordering::Acquire),
+            "default-production construction enables lazy respawn"
+        );
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = resurrect_live_script();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[95u8; 16], [96u8; 16]],
+                )
+            });
+        }
+
+        // In-app switch: drive the same claim/publish phases restart_self_hosted
+        // uses (the spawn itself needs a Tauri AppHandle, so the test supplies
+        // the settled self-hosted child directly).
+        let self_hosted_key = self_hosted_test_launch_key();
+        let completion = Arc::new(ManagementDrainCompletion::pending());
+        let previous = state
+            .claim_replacement(&self_hosted_key, false, &completion)
+            .expect("claims leadership")
+            .expect("default owner is replaced, not reused");
+        assert_eq!(
+            drain_command_owner(previous),
+            ManagementCleanupOutcome::Clean
+        );
+        let self_hosted_manager = ManagementChildManager::start_v2_command_regression_script(
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while IFS= read -r request; do exit 97; done".to_string(),
+            [97u8; 16],
+        )
+        .expect("self-hosted owner starts");
+        state
+            .publish_replacement(
+                Ok(self_hosted_manager),
+                self_hosted_key.clone(),
+                &completion,
+            )
+            .expect("publishes the self-hosted owner");
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+        assert!(
+            !state
+                .allow_default_production_respawn
+                .load(Ordering::Acquire),
+            "switching the singleton to self-hosted must disable lazy production respawn"
+        );
+
+        // Degrade the self-hosted owner the way a failed config-drain stop does.
+        state.abandon_self_hosted_owner_after_failed_stop(&self_hosted_key);
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed)
+        ));
+
+        // Non-connector calls (status / QR enrollment) are routed with
+        // launch_key=None: they must fail closed, never spawn production.
+        for operation in [
+            MobileRelayV2ManagementOperation::Status,
+            MobileRelayV2ManagementOperation::CreateEnrollment,
+        ] {
+            let result = state.call(operation);
+            assert!(result.is_err(), "{operation:?} stays closed: {result:?}");
+            assert_eq!(result.unwrap_err().code, CHANNEL_CLOSED_CODE);
+        }
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a self-hosted lineage must never be resurrected as default production"
         );
         assert!(matches!(
             &*state.owner.lock().unwrap(),
