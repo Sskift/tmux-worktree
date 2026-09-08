@@ -1615,6 +1615,52 @@ test("a delayed turn reply never blocks lease renewal or permits concurrent unli
   }
 });
 
+test("a group message arriving while the final reply card delivers is not steered", async () => {
+  const h = harness();
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markAnswerStarted = () => {};
+  const answerStarted = new Promise((resolve) => { markAnswerStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "the final answer");
+    h.lark.beforeReply = async ({ messageId }) => {
+      if (messageId === "om-one") {
+        markAnswerStarted();
+        await replyBarrier;
+      }
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await answerStarted;
+    assert.equal(h.bridge.snapshot().activeTurns[0].status, "replying");
+
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+
+    const steerInputs = h.control.inputs.filter(({ operationId }) =>
+      String(operationId).startsWith("feishu-steer-"));
+    assert.equal(steerInputs.length, 0, "a replying turn must not accept steering injection");
+    assert.equal(h.control.inputs.length, 1, "the follow-up message must not be injected");
+    const followup = h.lark.replies.find((reply) => reply.messageId === "om-two");
+    assert.ok(followup, "the follow-up sender must get a retry notice card");
+    assert.match(followup.text, /最终回复卡正在投递/);
+
+    releaseReply();
+    await pollPromise;
+    assert.equal(currentTurn(h).status, "completed");
+    assert.equal(h.control.inputs.length, 1, "no delayed injection after the reply lands");
+  } finally {
+    releaseReply();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an external non-force handoff waits for inherited Agent completion", async () => {
   const h = harness();
   try {

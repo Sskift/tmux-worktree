@@ -877,6 +877,23 @@ export class FeishuBridge {
         return;
       }
 
+      const activeTurn = this.activeTurn(binding.id);
+      if (activeTurn?.status === "replying") {
+        // The final reply card is being delivered; the turn is already
+        // finalized and no longer polled. Steering here would inject the
+        // message into a closed turn while promising a follow-up that would
+        // never come, so ask the user to resend after delivery, exactly like
+        // the activity-watch "sending" gate.
+        this.rememberEvent(event.event_id);
+        await this.safeInform(
+          binding,
+          event.message_id,
+          "最终回复卡正在投递，本条消息未注入终端；请在回复送达后重试。",
+          `turn-replying-${event.event_id}`,
+        );
+        return;
+      }
+
       await this.requireRenderedSnapshotCapability();
       const target = await this.control.ownershipStatus(binding.controlTargetId);
       if (this.isFeishuDrainingView(binding, lease, target)) {
@@ -891,7 +908,6 @@ export class FeishuBridge {
         return;
       }
       this.assertLeaseView(binding, lease, target);
-      const activeTurn = this.activeTurn(binding.id);
       if (activeTurn) {
         await this.steerActiveTurn(
           binding,
