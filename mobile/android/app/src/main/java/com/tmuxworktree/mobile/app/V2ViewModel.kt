@@ -697,6 +697,9 @@ internal class RelayV2TerminalRouteRegistry<T : Any>(
 
     fun owner(routeId: String): T? = owners[routeId]
 
+    /** All currently owned routes, as stable (routeId, owner) pairs. */
+    fun entries(): List<Pair<String, T>> = owners.entries.map { it.key to it.value }
+
     fun isClosed(routeId: String): Boolean = routeId in closedRoutes
 
     fun rememberClosed(routeId: String) {
@@ -2838,6 +2841,118 @@ class V2ViewModel(
         }
     }
 
+    /**
+     * Base transport reached ONLINE (with a current session cut) while a visible terminal route
+     * was left PAUSED by an automatic reset recovery that could not reopen (budget exhausted in a
+     * 30s window, or the bounded wait timed out during a slow host restart). A paused terminal has
+     * no observer edge on base recovery -- the teardown reset fires only once at disconnect -- so
+     * without this it stayed OFFLINE until the user tapped Reconnect. Re-arm exactly once per
+     * ONLINE edge, flowing through the same admit + claim fence as an automatic reset (the manual
+     * Reconnect path shares the single relayV2TerminalResetRecoveryClaim and cannot double open).
+     * The budget still gates storms; a fresh edge after the window ages out gets one more attempt.
+     */
+    private fun armPausedRelayV2TerminalRecoveryOnOnlineEdge(
+        composition: RelayV2BaseRuntimeComposition,
+    ) {
+        val armed = synchronized(relayV2UiFenceLock) {
+            if (relayV2Composition !== composition ||
+                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
+                composition.state.value.phase != RelayV2BaseRuntimePhase.ONLINE
+            ) return
+            val visibleTerminal = _uiState.value.terminal
+            if (visibleTerminal.status == ConnectionStatus.ONLINE ||
+                visibleTerminal.status == ConnectionStatus.CONNECTING ||
+                visibleTerminal.status == ConnectionStatus.RECOVERING
+            ) return
+            val sessionStableId = visibleTerminal.sessionId.takeIf { it.isNotBlank() }
+                ?: return
+            if (relayV2SessionReplyCuts.value[sessionStableId] == null) return
+            val session = _uiState.value.session(sessionStableId) ?: return
+
+            // The paused owner may still occupy the terminal slot (budget-exhausted reset) or have
+            // been withdrawn as a route-only sentinel (bounded wait timed out).
+            val pausedSlot: Pair<String, RelayV2UiTerminalAttachment>? =
+                relayV2Terminal?.takeIf {
+                    it.composition === composition &&
+                        it.fence.sessionStableId == sessionStableId &&
+                        it.detachedCallbackDisposition ==
+                        RelayV2DetachedTerminalCallbackDisposition.PAUSED
+                }?.let { paused ->
+                    val routeId = relayV2TerminalRoutes.entries()
+                        .firstOrNull { (_, owner) -> owner === paused }?.first
+                        ?: return
+                    routeId to paused
+                } ?: relayV2TerminalRoutes.entries().firstOrNull { (routeId, owner) ->
+                    owner.composition === composition &&
+                        owner.fence.sessionStableId == sessionStableId &&
+                        owner.detachedCallbackDisposition ==
+                        RelayV2DetachedTerminalCallbackDisposition.PAUSED &&
+                        !relayV2TerminalRoutes.isClosed(routeId)
+                }
+            val candidate = pausedSlot?.second ?: return
+            val attachmentId = pausedSlot.first
+            val routeCurrent = candidate.fence.ownsRoute(attachmentId) &&
+                relayV2TerminalUiRouteIntentIsCurrent(
+                    candidate.uiTerminalToken,
+                    visibleTerminal,
+                )
+            if (!routeCurrent || candidate.lifecycle.detachRequested()) return
+
+            val reason = RelayV2TerminalResetReason.STREAM_LOST
+            val admission = admitRelayV2TerminalResetRecovery(
+                exactCurrentOwner = true,
+                reason = reason,
+                budget = candidate.resetRecoveryBudget,
+                nowMillis = monotonicClock(),
+            ) ?: return
+
+            // A withdrawn (route-only) sentinel must re-claim the recovery slot, exactly like the
+            // late detached-open response path; a still-installed owner keeps the slot it holds.
+            val recoveryClaim = Any()
+            if (relayV2Terminal == null) {
+                val claimedSlot = claimDetachedRelayV2TerminalRecoverySlot(
+                    current = RelayV2TerminalRecoverySlot(
+                        owner = relayV2Terminal,
+                        claim = relayV2TerminalResetRecoveryClaim,
+                    ),
+                    issued = candidate,
+                    claim = recoveryClaim,
+                ) ?: return
+                relayV2Terminal = claimedSlot.owner
+                relayV2TerminalResetRecoveryClaim = claimedSlot.claim
+            } else if (relayV2Terminal !== candidate) {
+                return
+            } else {
+                relayV2TerminalResetRecoveryClaim = recoveryClaim
+            }
+
+            candidate.detachedCallbackDisposition =
+                RelayV2DetachedTerminalCallbackDisposition.RECOVER
+            val recoveringTerminal = TerminalStreamState(
+                sessionId = sessionStableId,
+                status = ConnectionStatus.RECOVERING,
+                resetReason = reason.name.lowercase(),
+            )
+            val recovery = RelayV2UiTerminalResetRecovery(
+                claim = recoveryClaim,
+                issued = candidate,
+                routeIntent = recoveringTerminal,
+                detach = candidate.lifecycle.requestDetach(),
+                callbacks = candidate.parser.fenceAttachment(),
+                nextAttempt = admission.nextAttempt,
+                nextBudget = admission.budget,
+            )
+            candidate.uiTerminalToken = recoveringTerminal
+            _uiState.value = _uiState.value.copy(
+                terminal = recoveringTerminal,
+                actionError = null,
+            )
+            Triple(session, attachmentId, recovery)
+        }
+        val (session, attachmentId, recovery) = armed
+        recoverRelayV2TerminalAfterReset(session, attachmentId, recovery)
+    }
+
     private fun recoverRelayV2TerminalAfterReset(
         session: RelaySession,
         attachmentId: String,
@@ -4501,6 +4616,9 @@ class V2ViewModel(
                         ))
                     }
                 }
+                // Base transport ONLINE edge: a terminal left PAUSED after a slow host restart or
+                // a budget window gets one bounded automatic re-arm instead of waiting for a tap.
+                armPausedRelayV2TerminalRecoveryOnOnlineEdge(composition)
             }
         }
         viewModelScope.launch {
