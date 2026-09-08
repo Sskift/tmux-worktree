@@ -200,7 +200,10 @@ test("stale managed-state lock owner cannot remove the replacement lock", () => 
   const first = acquireManagedStateLock(lockPath);
   const ownerPath = join(lockPath, "owner.json");
   const stale = JSON.parse(readFileSync(ownerPath, "utf8"));
-  writeFileSync(ownerPath, `${JSON.stringify({ ...stale, createdAt: 0 })}\n`, { mode: 0o600 });
+  // A reclaimable stale lock must be both older than the threshold AND owned by
+  // a process that no longer exists. Point the record at a reaped child pid.
+  const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+  writeFileSync(ownerPath, `${JSON.stringify({ ...stale, pid: deadPid, createdAt: 0 })}\n`, { mode: 0o600 });
 
   const second = acquireManagedStateLock(lockPath);
   assert.notEqual(first.owner, second.owner);
@@ -210,6 +213,70 @@ test("stale managed-state lock owner cannot remove the replacement lock", () => 
 
   releaseManagedStateLock(second);
   assert.equal(existsSync(lockPath), false, "current owner releases its own state lock");
+});
+
+test("managed-state lock is never stolen from a live slow holder", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-state-lock-live-holder-"));
+  const lockPath = join(root, "state.json.lock");
+  const readyPath = join(root, "ready");
+  const holderScript = `
+    import { writeFileSync } from "node:fs";
+    import { acquireManagedStateLock } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/state.js")).href)};
+    const [lockPath, readyPath] = process.argv.slice(-2);
+    const lock = acquireManagedStateLock(lockPath);
+    writeFileSync(readyPath, lock.owner);
+    setTimeout(() => {}, 60_000);
+  `;
+  const holder = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", holderScript, lockPath, readyPath],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const deadliner = Date.now() + 5_000;
+  while (!existsSync(readyPath) && Date.now() < deadliner) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(existsSync(readyPath), "holder acquired the lock");
+  try {
+    // Holder is alive; backdate the owner record past the stale threshold. The
+    // pid-liveness gate must keep the lock non-stale despite the old age.
+    const ownerPath = join(lockPath, "owner.json");
+    const record = JSON.parse(readFileSync(ownerPath, "utf8"));
+    writeFileSync(ownerPath, `${JSON.stringify({ ...record, createdAt: 0 })}\n`, { mode: 0o600 });
+
+    const waiterResult = join(root, "waiter.json");
+    const waiterScript = `
+      import { writeFileSync } from "node:fs";
+      import { acquireManagedStateLock } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/state.js")).href)};
+      const [lockPath, resultPath] = process.argv.slice(-2);
+      try {
+        const lock = acquireManagedStateLock(lockPath);
+        writeFileSync(resultPath, JSON.stringify({ ok: true, owner: lock.owner }));
+      } catch (error) {
+        writeFileSync(resultPath, JSON.stringify({ ok: false, message: String((error && error.message) || error) }));
+      }
+    `;
+    const waiter = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", waiterScript, lockPath, waiterResult],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const waiterExit = new Promise((resolve) => waiter.once("exit", resolve));
+    await waiterExit;
+    const outcome = JSON.parse(readFileSync(waiterResult, "utf8"));
+    assert.equal(outcome.ok, false, "waiter must fail rather than steal a live holder's lock");
+    assert.match(outcome.message, /timed out waiting for managed state lock/);
+    assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).pid, record.pid, "live holder kept the lock");
+
+    // Once the holder process dies, the same old+dead record is reclaimed.
+    holder.kill("SIGKILL");
+    await new Promise((resolve) => holder.once("exit", resolve));
+    const reclaimed = acquireManagedStateLock(lockPath);
+    assert.ok(reclaimed.owner, "dead stale holder's lock is reclaimed");
+    releaseManagedStateLock(reclaimed);
+  } finally {
+    holder.kill("SIGKILL");
+  }
 });
 
 test("query, exec, and run hard-kill TERM-ignoring command groups at timeout", (t) => {

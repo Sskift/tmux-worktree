@@ -124,7 +124,10 @@ test("stale config lock owner cannot remove the replacement lock", () => {
   const first = acquireConfigFileLock(lockPath);
   const ownerPath = join(lockPath, "owner.json");
   const stale = JSON.parse(readFileSync(ownerPath, "utf8"));
-  writeFileSync(ownerPath, `${JSON.stringify({ ...stale, createdAt: 0 })}\n`, { mode: 0o600 });
+  // A reclaimable stale lock must be both older than the threshold AND owned by
+  // a process that no longer exists. Point the record at a reaped child pid.
+  const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+  writeFileSync(ownerPath, `${JSON.stringify({ ...stale, pid: deadPid, createdAt: 0 })}\n`, { mode: 0o600 });
 
   const second = acquireConfigFileLock(lockPath);
   assert.notEqual(first.owner, second.owner);
@@ -134,6 +137,63 @@ test("stale config lock owner cannot remove the replacement lock", () => {
 
   releaseConfigFileLock(second);
   assert.equal(existsSync(lockPath), false, "current owner releases its own lock");
+});
+
+test("config lock is never stolen from a live slow holder", async () => {
+  const root = tmpDir("tw-host-lock-live-holder-");
+  const lockPath = join(root, "config.lock");
+  const readyPath = join(root, "ready");
+  const holderScript = `
+    import { writeFileSync } from "node:fs";
+    import { acquireConfigFileLock } from ${JSON.stringify(hostsModuleUrl.href)};
+    const [lockPath, readyPath] = process.argv.slice(-2);
+    const lock = acquireConfigFileLock(lockPath);
+    writeFileSync(readyPath, lock.owner);
+    setTimeout(() => {}, 60_000);
+  `;
+  const holder = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", holderScript, lockPath, readyPath],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  try {
+    await waitForFile(readyPath);
+    const ownerPath = join(lockPath, "owner.json");
+    const record = JSON.parse(readFileSync(ownerPath, "utf8"));
+    writeFileSync(ownerPath, `${JSON.stringify({ ...record, createdAt: 0 })}\n`, { mode: 0o600 });
+
+    const waiterResult = join(root, "waiter.json");
+    const waiterScript = `
+      import { writeFileSync } from "node:fs";
+      import { acquireConfigFileLock } from ${JSON.stringify(hostsModuleUrl.href)};
+      const [lockPath, resultPath] = process.argv.slice(-2);
+      try {
+        const lock = acquireConfigFileLock(lockPath);
+        writeFileSync(resultPath, JSON.stringify({ ok: true, owner: lock.owner }));
+      } catch (error) {
+        writeFileSync(resultPath, JSON.stringify({ ok: false, message: String((error && error.message) || error) }));
+      }
+    `;
+    const waiter = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", waiterScript, lockPath, waiterResult],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const waiterExit = new Promise((resolve) => waiter.once("exit", resolve));
+    await waiterExit;
+    const outcome = JSON.parse(readFileSync(waiterResult, "utf8"));
+    assert.equal(outcome.ok, false, "waiter must fail rather than steal a live holder's lock");
+    assert.match(outcome.message, /等待配置写锁超时|timed out.*config/i);
+    assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).pid, record.pid, "live holder kept the lock");
+
+    holder.kill("SIGKILL");
+    await new Promise((resolve) => holder.once("exit", resolve));
+    const reclaimed = acquireConfigFileLock(lockPath);
+    assert.ok(reclaimed.owner, "dead stale holder's lock is reclaimed");
+    releaseConfigFileLock(reclaimed);
+  } finally {
+    holder.kill("SIGKILL");
+  }
 });
 
 test("tw host mutation waits for a concurrent config lock owner", async () => {
