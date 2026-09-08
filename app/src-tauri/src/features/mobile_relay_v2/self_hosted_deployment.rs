@@ -1570,7 +1570,17 @@ fn save_config_replacement_after_management_barrier(
             {
                 return Ok(());
             }
-            let _ = management.dispose();
+            // The connector stop failed (slow devbox, a poisoned child, or a
+            // connector that never returned to exact stopped). The old child is
+            // unusable, but the terminal dispose() would latch the process-level
+            // `disposed` fence and permanently brick every later call, replace
+            // and watchdog restart until the Dashboard restarts. Instead mark
+            // the owner recoverable (StartFailed(ChannelClosed), never
+            // RecoveryRequired) without touching `disposed`; the next Start
+            // Center / watchdog replace rebuilds a fresh child. The config save
+            // still fails this attempt so the persisted desired state stays
+            // consistent with the drained child.
+            management.abandon_self_hosted_owner_after_failed_stop(launch_key);
             Err(
                 "Relay v2 self-hosted Host could not be stopped before replacing configuration"
                     .to_string(),
