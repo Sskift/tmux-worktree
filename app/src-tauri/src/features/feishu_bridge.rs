@@ -1457,194 +1457,233 @@ pub(crate) async fn feishu_groups_list(
 }
 
 #[tauri::command]
-pub(crate) fn feishu_binding_create(
+pub(crate) async fn feishu_binding_create(
     app: tauri::AppHandle,
     state: State<'_, Arc<FeishuBridgeRuntimeState>>,
     pty_state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     args: FeishuBindingInput,
 ) -> Result<Value, String> {
-    let reply_mode = FeishuReplyMode::parse(&args.reply_mode)?;
-    let probe = ensure_server(&app, state.inner().as_ref())?;
-    if probe.disposition != BridgeProbeDisposition::Current {
-        return Err(
-            "FEISHU_BRIDGE_UPGRADE_REQUIRED: unlink existing groups and retry after the legacy bridge becomes idle"
-                .to_string(),
-        );
-    }
-    require_turn_capabilities(&probe)?;
-    let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
-    let mut params = json!({
-        "chatId": args.chat_id,
-        "chatName": args.chat_name,
-        "sessionName": args.session_name,
-        "createdBy": args.created_by,
-        "allowedSenderIds": args.allowed_sender_ids,
-        "mentionOnly": args.mention_only,
-    });
-    if let Some(session_summary) = args.session_summary.as_ref() {
-        params
-            .as_object_mut()
-            .ok_or("binding.create params are invalid")?
-            .insert("sessionSummary".to_string(), json!(session_summary));
-    }
-    if let Some(reply_mode) = reply_mode_param {
-        params
-            .as_object_mut()
-            .ok_or("binding.create params are invalid")?
-            .insert("replyMode".to_string(), json!(reply_mode));
-    }
-    let pty_id = args
-        .attachment_id
-        .ok_or("Feishu Dashboard binding requires a controlled PTY attachment")?;
-    with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
-        control.ensure_local_transfer_target(&args.session_name)?;
-        // Dashboard PTYs acquire their interactive lease lazily. Linking a
-        // group is itself a transfer mutation, so refresh any cached lease and
-        // acquire one while the same PTY mutex still excludes input/resize.
-        // Feishu ownership and recovery states continue to fail closed in the
-        // canonical authority.
-        refresh_pty_control_status(&app, control_state.inner().as_ref(), control);
-        let dashboard_lease = acquire_pty_control(&app, control_state.inner().as_ref(), control)
-            .map_err(|error| error.to_string())?;
-        let mut params = params;
-        params
-            .as_object_mut()
-            .ok_or("binding.create params are invalid")?
-            .insert("dashboardLease".to_string(), dashboard_lease);
-        let result = request("binding.create", params);
-        refresh_after_transfer_attempt(&app, control_state.inner().as_ref(), control);
-        result
+    let state = Arc::clone(state.inner());
+    let pty_state = Arc::clone(pty_state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let reply_mode = FeishuReplyMode::parse(&args.reply_mode)?;
+        let probe = ensure_server(&app, state.as_ref())?;
+        if probe.disposition != BridgeProbeDisposition::Current {
+            return Err(
+                "FEISHU_BRIDGE_UPGRADE_REQUIRED: unlink existing groups and retry after the legacy bridge becomes idle"
+                    .to_string(),
+            );
+        }
+        require_turn_capabilities(&probe)?;
+        let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
+        let mut params = json!({
+            "chatId": args.chat_id,
+            "chatName": args.chat_name,
+            "sessionName": args.session_name,
+            "createdBy": args.created_by,
+            "allowedSenderIds": args.allowed_sender_ids,
+            "mentionOnly": args.mention_only,
+        });
+        if let Some(session_summary) = args.session_summary.as_ref() {
+            params
+                .as_object_mut()
+                .ok_or("binding.create params are invalid")?
+                .insert("sessionSummary".to_string(), json!(session_summary));
+        }
+        if let Some(reply_mode) = reply_mode_param {
+            params
+                .as_object_mut()
+                .ok_or("binding.create params are invalid")?
+                .insert("replyMode".to_string(), json!(reply_mode));
+        }
+        let pty_id = args
+            .attachment_id
+            .ok_or("Feishu Dashboard binding requires a controlled PTY attachment")?;
+        with_pty_control(pty_state.as_ref(), &pty_id, |control| {
+            control.ensure_local_transfer_target(&args.session_name)?;
+            // Dashboard PTYs acquire their interactive lease lazily. Linking a
+            // group is itself a transfer mutation, so refresh any cached lease and
+            // acquire one while the same PTY mutex still excludes input/resize.
+            // Feishu ownership and recovery states continue to fail closed in the
+            // canonical authority.
+            refresh_pty_control_status(&app, control_state.as_ref(), control);
+            let dashboard_lease = acquire_pty_control(&app, control_state.as_ref(), control)
+                .map_err(|error| error.to_string())?;
+            let mut params = params;
+            params
+                .as_object_mut()
+                .ok_or("binding.create params are invalid")?
+                .insert("dashboardLease".to_string(), dashboard_lease);
+            let result = request("binding.create", params);
+            refresh_after_transfer_attempt(&app, control_state.as_ref(), control);
+            result
+        })
     })
+    .await
+    .map_err(|error| format!("join Feishu binding create: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn feishu_binding_update_reply_mode(
+pub(crate) async fn feishu_binding_update_reply_mode(
     app: tauri::AppHandle,
     state: State<'_, Arc<FeishuBridgeRuntimeState>>,
     binding_id: String,
     reply_mode: String,
 ) -> Result<Value, String> {
-    let reply_mode = FeishuReplyMode::parse(&reply_mode)?;
-    let probe = ensure_server(&app, state.inner().as_ref())?;
-    require_reply_mode_capability(&probe)?;
-    request(
-        "binding.update",
-        json!({
-            "bindingId": binding_id,
-            "replyMode": reply_mode.as_str(),
-        }),
-    )
-}
-
-#[tauri::command]
-pub(crate) fn feishu_binding_pause(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
-    binding_id: String,
-    force: bool,
-) -> Result<Value, String> {
-    ensure_server(&app, state.inner().as_ref())?;
-    request(
-        "binding.pause",
-        json!({ "bindingId": binding_id, "force": force }),
-    )
-}
-
-#[tauri::command]
-pub(crate) fn feishu_binding_resume(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
-    binding_id: String,
-) -> Result<Value, String> {
-    let probe = ensure_server(&app, state.inner().as_ref())?;
-    require_turn_capabilities(&probe)?;
-    request("binding.resume", json!({ "bindingId": binding_id }))
-}
-
-#[tauri::command]
-pub(crate) fn feishu_binding_repair(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
-    binding_id: String,
-) -> Result<Value, String> {
-    let probe = ensure_server(&app, state.inner().as_ref())?;
-    require_turn_capabilities(&probe)?;
-    request("binding.repair", json!({ "bindingId": binding_id }))
-}
-
-#[tauri::command]
-pub(crate) fn feishu_binding_remove(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
-    binding_id: String,
-    force: bool,
-) -> Result<Value, String> {
-    let probe = ensure_server(&app, state.inner().as_ref())?;
-    if probe.disposition == BridgeProbeDisposition::LegacyOccupied {
-        match legacy_binding_remove_action(&probe.snapshot, &binding_id, force)? {
-            LegacyBindingRemoveAction::AlreadyRemoved => {
-                return Ok(json!({ "removed": true }));
-            }
-            LegacyBindingRemoveAction::UpgradeCurrent => {
-                return remove_binding_after_legacy_migration(
-                    &app,
-                    state.inner().as_ref(),
-                    &binding_id,
-                    force,
-                );
-            }
-            LegacyBindingRemoveAction::UseLegacy => {}
-        }
-    }
-    request_binding_remove_confirming_absence(
-        &binding_id,
-        force,
-        bridge_has_capability(&probe, REMOVE_ORIGIN_BRIDGE_CAPABILITY),
-    )
-}
-
-#[tauri::command]
-pub(crate) fn feishu_binding_takeover(
-    app: tauri::AppHandle,
-    bridge_state: State<'_, Arc<FeishuBridgeRuntimeState>>,
-    pty_state: State<'_, Arc<PtyState>>,
-    control_state: State<'_, Arc<TerminalControlState>>,
-    binding_id: String,
-    pty_id: String,
-    force: bool,
-) -> Result<Value, String> {
-    ensure_server(&app, bridge_state.inner().as_ref())?;
-    with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
-        let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
-        ensure_binding_matches_pty(control, &target)?;
-        let dashboard_owner_instance = control.dashboard_owner_instance()?;
-        let result = request(
-            "binding.takeover",
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let reply_mode = FeishuReplyMode::parse(&reply_mode)?;
+        let probe = ensure_server(&app, state.as_ref())?;
+        require_reply_mode_capability(&probe)?;
+        request(
+            "binding.update",
             json!({
                 "bindingId": binding_id,
-                "dashboardOwnerInstance": dashboard_owner_instance,
-                "force": force,
+                "replyMode": reply_mode.as_str(),
             }),
-        );
-        match result {
-            Ok(dashboard_lease) => {
-                if let Err(error) = control.adopt_dashboard_lease(dashboard_lease.clone()) {
-                    refresh_after_transfer_attempt(&app, control_state.inner().as_ref(), control);
-                    return Err(error);
+        )
+    })
+    .await
+    .map_err(|error| format!("join Feishu binding update reply mode: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn feishu_binding_pause(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    binding_id: String,
+    force: bool,
+) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_server(&app, state.as_ref())?;
+        request(
+            "binding.pause",
+            json!({ "bindingId": binding_id, "force": force }),
+        )
+    })
+    .await
+    .map_err(|error| format!("join Feishu binding pause: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn feishu_binding_resume(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    binding_id: String,
+) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let probe = ensure_server(&app, state.as_ref())?;
+        require_turn_capabilities(&probe)?;
+        request("binding.resume", json!({ "bindingId": binding_id }))
+    })
+    .await
+    .map_err(|error| format!("join Feishu binding resume: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn feishu_binding_repair(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    binding_id: String,
+) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let probe = ensure_server(&app, state.as_ref())?;
+        require_turn_capabilities(&probe)?;
+        request("binding.repair", json!({ "bindingId": binding_id }))
+    })
+    .await
+    .map_err(|error| format!("join Feishu binding repair: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn feishu_binding_remove(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    binding_id: String,
+    force: bool,
+) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let probe = ensure_server(&app, state.as_ref())?;
+        if probe.disposition == BridgeProbeDisposition::LegacyOccupied {
+            match legacy_binding_remove_action(&probe.snapshot, &binding_id, force)? {
+                LegacyBindingRemoveAction::AlreadyRemoved => {
+                    return Ok(json!({ "removed": true }));
                 }
-                Ok(dashboard_lease)
-            }
-            Err(error) => {
-                refresh_after_transfer_attempt(&app, control_state.inner().as_ref(), control);
-                Err(error)
+                LegacyBindingRemoveAction::UpgradeCurrent => {
+                    return remove_binding_after_legacy_migration(
+                        &app,
+                        state.as_ref(),
+                        &binding_id,
+                        force,
+                    );
+                }
+                LegacyBindingRemoveAction::UseLegacy => {}
             }
         }
+        request_binding_remove_confirming_absence(
+            &binding_id,
+            force,
+            bridge_has_capability(&probe, REMOVE_ORIGIN_BRIDGE_CAPABILITY),
+        )
     })
+    .await
+    .map_err(|error| format!("join Feishu binding remove: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn feishu_binding_return(
+pub(crate) async fn feishu_binding_takeover(
+    app: tauri::AppHandle,
+    bridge_state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    pty_state: State<'_, Arc<PtyState>>,
+    control_state: State<'_, Arc<TerminalControlState>>,
+    binding_id: String,
+    pty_id: String,
+    force: bool,
+) -> Result<Value, String> {
+    let bridge_state = Arc::clone(bridge_state.inner());
+    let pty_state = Arc::clone(pty_state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_server(&app, bridge_state.as_ref())?;
+        with_pty_control(pty_state.as_ref(), &pty_id, |control| {
+            let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
+            ensure_binding_matches_pty(control, &target)?;
+            let dashboard_owner_instance = control.dashboard_owner_instance()?;
+            let result = request(
+                "binding.takeover",
+                json!({
+                    "bindingId": binding_id,
+                    "dashboardOwnerInstance": dashboard_owner_instance,
+                    "force": force,
+                }),
+            );
+            match result {
+                Ok(dashboard_lease) => {
+                    if let Err(error) = control.adopt_dashboard_lease(dashboard_lease.clone()) {
+                        refresh_after_transfer_attempt(&app, control_state.as_ref(), control);
+                        return Err(error);
+                    }
+                    Ok(dashboard_lease)
+                }
+                Err(error) => {
+                    refresh_after_transfer_attempt(&app, control_state.as_ref(), control);
+                    Err(error)
+                }
+            }
+        })
+    })
+    .await
+    .map_err(|error| format!("join Feishu binding takeover: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn feishu_binding_return(
     app: tauri::AppHandle,
     bridge_state: State<'_, Arc<FeishuBridgeRuntimeState>>,
     pty_state: State<'_, Arc<PtyState>>,
@@ -1652,22 +1691,29 @@ pub(crate) fn feishu_binding_return(
     binding_id: String,
     pty_id: String,
 ) -> Result<Value, String> {
-    let probe = ensure_server(&app, bridge_state.inner().as_ref())?;
-    require_turn_capabilities(&probe)?;
-    with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
-        let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
-        ensure_binding_matches_pty(control, &target)?;
-        let dashboard_lease = control.current_dashboard_lease()?;
-        let result = request(
-            "binding.return",
-            json!({
-                "bindingId": binding_id,
-                "dashboardLease": dashboard_lease,
-            }),
-        );
-        refresh_after_transfer_attempt(&app, control_state.inner().as_ref(), control);
-        result
+    let bridge_state = Arc::clone(bridge_state.inner());
+    let pty_state = Arc::clone(pty_state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let probe = ensure_server(&app, bridge_state.as_ref())?;
+        require_turn_capabilities(&probe)?;
+        with_pty_control(pty_state.as_ref(), &pty_id, |control| {
+            let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
+            ensure_binding_matches_pty(control, &target)?;
+            let dashboard_lease = control.current_dashboard_lease()?;
+            let result = request(
+                "binding.return",
+                json!({
+                    "bindingId": binding_id,
+                    "dashboardLease": dashboard_lease,
+                }),
+            );
+            refresh_after_transfer_attempt(&app, control_state.as_ref(), control);
+            result
+        })
     })
+    .await
+    .map_err(|error| format!("join Feishu binding return: {error}"))?
 }
 
 #[cfg(test)]
@@ -2113,5 +2159,34 @@ mod tests {
                 .expect("already removed binding"),
             LegacyBindingRemoveAction::AlreadyRemoved
         );
+    }
+
+    #[test]
+    fn binding_commands_run_off_the_main_thread() {
+        // The 8 feishu_binding_* commands perform blocking bridge/terminal I/O
+        // (up to ~15s per RPC, ~8s readiness polling). On macOS the Tauri IPC
+        // handler runs on the AppKit main thread, so a synchronous command body
+        // freezes the whole Dashboard (typing, polling, buttons) for the whole
+        // RPC. They must therefore be `async fn` whose body runs inside
+        // spawn_blocking — same shape as feishu_bridge_status/save_profile.
+        // The thread model itself cannot be asserted at runtime; this is the
+        // compile-time source pin prescribed by the concurrency fix (C040).
+        let source = include_str!("feishu_bridge.rs");
+        for command in [
+            "feishu_binding_create",
+            "feishu_binding_update_reply_mode",
+            "feishu_binding_pause",
+            "feishu_binding_resume",
+            "feishu_binding_repair",
+            "feishu_binding_remove",
+            "feishu_binding_takeover",
+            "feishu_binding_return",
+        ] {
+            let needle = format!("pub(crate) async fn {command}(");
+            assert!(
+                source.contains(&needle),
+                "{command} must be an `async fn` so its blocking I/O runs in spawn_blocking, not on the AppKit main thread"
+            );
+        }
     }
 }
