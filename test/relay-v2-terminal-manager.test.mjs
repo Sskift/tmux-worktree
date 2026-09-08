@@ -1136,6 +1136,63 @@ test("resume emits opened then contiguous raw-byte replay, live output, and fina
   ));
 });
 
+test("unbind parks a detached stream's read pump and resume re-arms it (C052 churn wedge)", async () => {
+  // A9: each abandoned/route-detached stream used to keep its observed-byte
+  // plane tail pump running against the exact-control daemon with no reader.
+  // Dozens of such pumps continuously held the daemon's single store lock,
+  // starving the prepare/observe lock every NEW terminal.open needs and
+  // wedging the host's terminal serializer for its life. unbind() must park
+  // the pump (pause) for the detached lease; resume must re-arm it (resume).
+  const h = harness();
+  const request = goldenOpen();
+  await h.manager.open(request);
+  const firstOpened = opened(h.sent, request.requestId);
+  const handle = h.backend.opens[0].handle;
+  assert.equal(handle.paused, false, "the live stream read pump starts running");
+
+  // Detach the stream (the owning client dropped without a terminal.close).
+  await h.manager.unbind(AUTH, ROUTE_ONE);
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 1);
+  assert.equal(handle.paused, true, "unbind() must park the detached stream's read pump");
+  const pausesAfterDetach = handle.pauseCalls;
+  const resumesAfterDetach = handle.resumeCalls;
+
+  // A repeated unbind / sweep on the same detached stream must not resume the
+  // parked pump (no bound route can deliver output to it).
+  await h.manager.sweep();
+  assert.equal(handle.resumeCalls, resumesAfterDetach,
+    "a detached stream's pump is not re-armed until it is live+route-bound again");
+  assert.equal(handle.paused, true);
+
+  // A seamless resume re-binds a new route and re-arms the pump; post-resume
+  // output streams on the new route.
+  const initial = Buffer.from([0x61]);
+  await handle.emit(initial);
+  const routeTwo = { connectorId: "connector-two", routeId: "route-two", routeFence: "fence-two" };
+  const beforeResume = h.sent.length;
+  await h.manager.open(goldenOpen({
+    route: routeTwo,
+    requestId: "resume-rearm",
+    openId: "resume-rearm-id",
+    mode: "resume",
+    resume: {
+      generation: firstOpened.payload.generation,
+      nextOffset: "0",
+      resumeToken: firstOpened.payload.resumeToken,
+    },
+  }));
+  assert.equal(handle.paused, false, "resume re-arms the read pump once live+bound");
+  assert.ok(handle.resumeCalls > resumesAfterDetach, "resume() must be invoked on re-attach");
+  const live = Buffer.from([0x62]);
+  await handle.emit(live);
+  const resumed = h.sent.slice(beforeResume)
+    .filter(({ route }) => route.routeId === routeTwo.routeId);
+  assert.equal(resumed[0].frame.type, "terminal.opened");
+  assert.equal(resumed.some(({ frame }) => frame.type === "terminal.output"), true,
+    "post-resume output streams to the newly bound route");
+  void pausesAfterDetach;
+});
+
 test("route and generation fences reject stale input, and output ACK cannot exceed sent bytes", async () => {
   const h = harness();
   const request = goldenOpen();
