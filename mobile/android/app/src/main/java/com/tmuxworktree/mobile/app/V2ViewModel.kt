@@ -175,6 +175,58 @@ internal fun relayV2TerminalResetRecoveryDelayMillis(nextAttempt: Int): Long {
         ).coerceAtMost(RELAY_V2_TERMINAL_RESET_RECOVERY_MAX_DELAY_MS)
 }
 
+/**
+ * Which network hint (if any) to forward to the v2 composition after a network emission, given
+ * the previously observed edge state. Both directions are edge-gated so that a [combine] replay
+ * of an unchanged network (the NetworkMonitor StateFlow re-emits the current network whenever a
+ * recombined source — e.g. a per-failure composition state — publishes) cannot re-fire a hint:
+ *
+ * - AVAILABLE fires only on a false→true edge OR on a true→true network-handle change (a
+ *   Wi-Fi↔cellular/VPN handover where the socket may be pinned to a now-dead network). This
+ *   matches the old UI collector's `networkChanged` semantics; without it, a half-open socket
+ *   on the abandoned network waited for the 60s silence/backoff ladder.
+ * - LOST fires only on a true→false edge. The old UI collector gated this with `else if
+ *   (changed)`; an unconditional LOST on every offline composition-state replay cancels the
+ *   just-scheduled backoff timer (onNetworkLost cancels connectionAttemptJob without
+ *   rescheduling), parking the retry ladder until the recovery edge.
+ *
+ * [RelayV2NetworkHintEdge] is the persisted edge state; seed it with
+ * [RelayV2NetworkHintEdge.unobserved] before the first emission so a process that starts
+ * offline does not fire a spurious LOST.
+ */
+internal enum class RelayV2NetworkHintAction { AVAILABLE, LOST, NONE }
+
+internal data class RelayV2NetworkHintEdge(
+    val observed: Boolean = false,
+    val available: Boolean = false,
+    val networkHandle: Long? = null,
+) {
+    companion object {
+        val unobserved = RelayV2NetworkHintEdge(observed = false)
+    }
+}
+
+internal fun relayV2NetworkHintAction(
+    previous: RelayV2NetworkHintEdge,
+    available: Boolean,
+    networkHandle: Long?,
+): Pair<RelayV2NetworkHintAction, RelayV2NetworkHintEdge> {
+    val next = RelayV2NetworkHintEdge(
+        observed = true,
+        available = available,
+        networkHandle = networkHandle,
+    )
+    val action = when {
+        available && (!previous.observed || !previous.available ||
+            previous.networkHandle != networkHandle) ->
+            RelayV2NetworkHintAction.AVAILABLE
+        !available && previous.observed && previous.available ->
+            RelayV2NetworkHintAction.LOST
+        else -> RelayV2NetworkHintAction.NONE
+    }
+    return action to next
+}
+
 internal fun shouldRetryRelayV2TerminalOpen(
     error: RelayV2TerminalCorrelatedError,
     attempt: Int,
@@ -4847,19 +4899,24 @@ class V2ViewModel(
     private fun startProcessRelayV2NetworkHintCollection() {
         if (!relayV2ProcessNetworkHintCollectorStarted.compareAndSet(false, true)) return
         RelayV2ConnectionRegistry.scope.launch {
-            var lastAvailable = false
+            var edge = RelayV2NetworkHintEdge.unobserved
             combine(
                 RelayV2ConnectionRegistry.composition,
                 container.networkMonitor.state,
             ) { composition, network -> composition to network }
                 .collect { (composition, network) ->
                     if (composition == null) return@collect
-                    if (network.available) {
-                        if (!lastAvailable) composition.onNetworkAvailable()
-                    } else {
-                        composition.onNetworkLost()
+                    val (action, nextEdge) = relayV2NetworkHintAction(
+                        previous = edge,
+                        available = network.available,
+                        networkHandle = network.networkHandle,
+                    )
+                    when (action) {
+                        RelayV2NetworkHintAction.AVAILABLE -> composition.onNetworkAvailable()
+                        RelayV2NetworkHintAction.LOST -> composition.onNetworkLost()
+                        RelayV2NetworkHintAction.NONE -> Unit
                     }
-                    lastAvailable = network.available
+                    edge = nextEdge
                 }
         }
     }
