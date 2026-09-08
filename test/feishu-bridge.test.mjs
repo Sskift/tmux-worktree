@@ -229,6 +229,7 @@ class FakeControlClient {
     this.beforeRetainedStale = undefined;
     this.beforeInput = undefined;
     this.beforeCommit = undefined;
+    this.beforeRenew = undefined;
     this.failInputAfterCommit = false;
     this.ownershipStatusCalls = 0;
     this.failOwnershipStatusAt = undefined;
@@ -420,6 +421,10 @@ class FakeControlClient {
 
   async renewLease(lease, ttlMs) {
     this.record("lease.renew", { lease: structuredClone(lease), ...(ttlMs === undefined ? {} : { ttlMs }) });
+    if (this.beforeRenew) await this.beforeRenew({ lease: structuredClone(lease) });
+    // The authority validates the carried lease when it processes the request
+    // (after any queueing/lock wait), so a lease rotated while this RPC was in
+    // flight is rejected here — mirroring validateLease on the daemon.
     this.assertLease(lease, true);
     const queuedError = this.renewErrors.shift();
     if (queuedError) throw queuedError;
@@ -2127,6 +2132,69 @@ test("a slow agent-message injection does not block the lease renewal RPC", asyn
     assert.equal(renewDone, true);
   } finally {
     releaseInput();
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a renewal RPC answered after the lease was rotated must not fence the new lease", async () => {
+  const h = harness();
+  let releaseRenew = () => {};
+  const renewBarrier = new Promise((resolve) => { releaseRenew = resolve; });
+  let renewBarrierArmed = true;
+  try {
+    const created = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    const bindingId = created.id;
+    const firstFence = h.control.target.fence;
+    assert.equal(h.control.target.state, "HELD");
+
+    // Issue a renewal and hold its RPC in flight on the renew lane.
+    h.control.beforeRenew = async () => {
+      if (renewBarrierArmed) await renewBarrier;
+    };
+    const renewInFlight = h.bridge.renewLeases();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "the renewal RPC must be in flight",
+    );
+
+    // While that RPC is still in flight, force-pause (releases the old lease,
+    // fence rotates) and resume (acquires a fresh lease with a new fence); the
+    // binding returns to active.
+    await h.bridge.pauseBinding(bindingId, true);
+    await h.bridge.resumeBinding(bindingId);
+    const resumedState = h.store.read();
+    const resumedBinding = resumedState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(resumedBinding.status, "active");
+    assert.notEqual(h.control.target.fence, firstFence, "resume must acquire a new-generation lease");
+
+    // Now release the stuck renewal. The authority rejects the old-generation
+    // lease (fence mismatch → PERMISSION_DENIED). That verdict belongs to the
+    // released lease, so the freshly resumed binding must stay active.
+    renewBarrierArmed = false;
+    releaseRenew();
+    await renewInFlight;
+
+    const finalState = h.store.read();
+    const finalBinding = finalState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(finalBinding.status, "active", "a stale-generation renewal verdict must not mark the binding stale");
+    assert.equal(finalBinding.staleReason, undefined);
+    // The renewal sweep keeps the current lease map entry in place.
+    const renewCalls = h.control.requests.filter(({ type }) => type === "lease.renew");
+    assert.equal(renewCalls.length, 1);
+
+    // The current lease still renews cleanly on the next sweep (no poisoned state).
+    await h.bridge.renewLeases();
+    const afterState = h.store.read();
+    const afterBinding = afterState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(afterBinding.status, "active");
+  } finally {
+    renewBarrierArmed = false;
+    releaseRenew();
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }

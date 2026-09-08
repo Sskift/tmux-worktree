@@ -1104,6 +1104,24 @@ export class FeishuBridge {
       const currentLease = this.leases.get(bindingId);
       const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
       if (!currentLease || !binding || binding.status !== "active") return;
+      // Generation check: the RPC was issued for the lease carried in `lease`
+      // (a synchronously-collected snapshot). While that RPC was in flight on
+      // the renew lane, the serial lane may have released and re-acquired
+      // (pause/resume, remove/rebind, force-takeover/return) — rotating the
+      // leaseId/fence/controlEpoch. An answer for a released lease must never
+      // fence a freshly acquired, healthy lease: drop the stale verdict. The
+      // next 20s sweep renews the current lease. Renewal itself only bumps the
+      // lease revision, never fence/leaseId/controlEpoch, so same-generation
+      // renewals still match. The renewed-vs-current comparison below stays as
+      // defense in depth.
+      if (
+        lease.controlEpoch !== currentLease.controlEpoch
+        || lease.leaseId !== currentLease.leaseId
+        || lease.fence !== currentLease.fence
+      ) {
+        this.renewTransientFailures.delete(bindingId);
+        return;
+      }
       if (rpcError !== undefined) {
         if (this.isRetryableLeaseRenewalFailure(rpcError)) {
           const firstFailedAt = this.renewTransientFailures.get(bindingId) ?? this.now();
