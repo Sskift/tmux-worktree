@@ -5,11 +5,15 @@ import test from "node:test";
 import {
   DashboardBackendProvider,
 } from "../src/platform/DashboardBackendContext.tsx";
+import type { MobileRelayV2SelfHostedConfigInput } from "../src/platform/domainTypes.ts";
+import type { MobileRelayV2SelfHostedStatus } from "../src/platform/domainTypes.ts";
+import type { MobileRelayV2SelfHostedDeploymentPort } from "../src/platform/dashboardBackend.ts";
 import { createFakeDashboardBackend } from "../src/platform/fakeBackend.ts";
+import { RelayV2SelfHostedPanel } from "../src/dashboard/Settings/RelayV2SelfHostedPanel.tsx";
 import {
-  RelayV2SelfHostedPanel,
+  createRelayV2SelfHostedPanelController,
   createRelayV2SelfHostedRequestGate,
-} from "../src/dashboard/Settings/RelayV2SelfHostedPanel.tsx";
+} from "../src/dashboard/Settings/relayV2SelfHostedPanelController.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -21,10 +25,75 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function savedStatus(config: MobileRelayV2SelfHostedConfigInput): MobileRelayV2SelfHostedStatus {
+  return {
+    feature: "explicit_self_hosted",
+    configured: true,
+    config,
+    bundleStatus: "ready",
+    tlsStatus: "ready",
+    centerStatus: "stopped",
+    hostBootstrapAvailable: false,
+    hostBootstrapPending: false,
+    hostCredentialProvisioned: true,
+    profileProvisioned: true,
+    connectorDesiredRunning: false,
+    effective: false,
+    bootstrapRotationPending: false,
+    remoteTlsKeyPath: "",
+    remoteTlsCertificatePath: "",
+    remoteTlsCaPath: "",
+    remoteProfilePath: "",
+    remoteStateDirectory: "",
+    error: null,
+  };
+}
+
+const savedConfig: MobileRelayV2SelfHostedConfigInput = {
+  enabled: true,
+  brokerHostId: "devbox-old",
+  issuerUrl: "https://old-relay.example.com/",
+  listenHost: "10.0.0.1",
+  listenPort: 8788,
+  tlsKeyPath: "/tls/key.pem",
+  tlsCertificatePath: "/tls/cert.pem",
+  tlsCaPath: "/tls/ca.pem",
+  externalTlsManagement: false,
+};
+
+function deferredDeployment() {
+  const status = deferred<MobileRelayV2SelfHostedStatus>();
+  const saveConfig = deferred<MobileRelayV2SelfHostedStatus>();
+  const calls: Array<keyof MobileRelayV2SelfHostedDeploymentPort> = [];
+  const deployment: MobileRelayV2SelfHostedDeploymentPort = {
+    status: () => {
+      calls.push("status");
+      return status.promise;
+    },
+    saveConfig: () => {
+      calls.push("saveConfig");
+      return saveConfig.promise;
+    },
+    deploy: () => {
+      throw new Error("not used in this test");
+    },
+    startCenter: () => {
+      throw new Error("not used in this test");
+    },
+    rotateExpiredHostBootstrap: () => {
+      throw new Error("not used in this test");
+    },
+    stopCenter: () => {
+      throw new Error("not used in this test");
+    },
+  };
+  return { deployment, status, saveConfig, calls };
+}
+
 test("C035: a user keystroke supersedes the in-flight mount status probe", () => {
   const gate = createRelayV2SelfHostedRequestGate();
 
-  // Mount effect issues the one-shot status() token (RelayV2SelfHostedPanel useEffect).
+  // Mount effect issues the one-shot status() token (panel controller mount()).
   const mountRequest = gate.request();
   assert.equal(gate.canPublish(mountRequest), true);
 
@@ -77,6 +146,112 @@ test("C035: a run() failure surfaces only while it is still the latest request",
   await Promise.allSettled([mountFailure.promise, runFailure.promise]);
 
   assert.deepEqual(notices, ["save failed"]);
+});
+
+// --- Wiring tests: these drive the same controller the panel mounts, so they
+// go red if the panel's effect/run/update wiring stops calling the gate. ---
+
+test("C035 wiring: late mount status() response does not overwrite unsaved keystrokes", async () => {
+  const { deployment, status } = deferredDeployment();
+  const states: string[] = [];
+  const controller = createRelayV2SelfHostedPanelController(deployment, (next) => {
+    states.push(next.draft.issuerUrl);
+  });
+
+  controller.mount();
+  // User edits while the SSH status probe is still in flight.
+  controller.update("enabled", true);
+  controller.update("issuerUrl", "https://typed-by-user.example.com/");
+  assert.equal(controller.state.draft.issuerUrl, "https://typed-by-user.example.com/");
+
+  // The slow mount probe finally returns the on-disk (old) config.
+  status.resolve(savedStatus(savedConfig));
+  await status.promise;
+  // Flush the controller's .then() microtask.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    controller.state.draft.issuerUrl,
+    "https://typed-by-user.example.com/",
+    "late mount status() response must not clobber the user's unsaved input",
+  );
+  assert.equal(controller.state.status, null, "fenced mount response must not publish status either");
+  assert.equal(controller.state.notice, null);
+});
+
+test("C035 wiring: unmounted mount probe never publishes on resolve", async () => {
+  const { deployment, status } = deferredDeployment();
+  let publishes = 0;
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {
+    publishes += 1;
+  });
+
+  controller.mount();
+  controller.unmount();
+  status.resolve(savedStatus(savedConfig));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(publishes, 0, "unmounted probe must not publish state");
+  assert.equal(controller.state.status, null);
+});
+
+test("C035 wiring: run('save') result publishes and a later stale mount response stays fenced", async () => {
+  const { deployment, status, saveConfig } = deferredDeployment();
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {});
+
+  controller.mount();
+  // Fill in a valid draft (external TLS so no file paths are required).
+  controller.update("enabled", true);
+  controller.update("brokerHostId", "devbox-new");
+  controller.update("issuerUrl", "https://new-relay.example.com/");
+  controller.update("listenHost", "10.1.2.3");
+  controller.update("externalTlsManagement", true);
+
+  const runComplete = controller.run("save");
+  // The save resolves with the freshly persisted config.
+  const savedNew: MobileRelayV2SelfHostedConfigInput = {
+    ...savedConfig,
+    brokerHostId: "devbox-new",
+    issuerUrl: "https://new-relay.example.com/",
+    listenHost: "10.1.2.3",
+    externalTlsManagement: true,
+    tlsKeyPath: "",
+    tlsCertificatePath: "",
+    tlsCaPath: "",
+  };
+  saveConfig.resolve(savedStatus(savedNew));
+  await runComplete;
+
+  assert.equal(controller.state.status?.config?.issuerUrl, "https://new-relay.example.com/");
+  assert.equal(controller.state.draft.issuerUrl, "https://new-relay.example.com/");
+  assert.match(controller.state.notice ?? "", /saved/);
+
+  // Now the stale mount probe (issued before the save) resolves with the old config.
+  status.resolve(savedStatus(savedConfig));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    controller.state.draft.issuerUrl,
+    "https://new-relay.example.com/",
+    "stale mount probe must not roll the form back after a completed save",
+  );
+  assert.equal(controller.state.status?.config?.brokerHostId, "devbox-new");
+});
+
+test("C035 wiring: late mount probe failure after a user edit shows no error notice", async () => {
+  const { deployment, status } = deferredDeployment();
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {});
+
+  controller.mount();
+  controller.update("enabled", true);
+  status.reject(new Error("ssh probe timed out"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    controller.state.notice,
+    null,
+    "a fenced-off mount failure must not surface over the user's editing session",
+  );
 });
 
 test("C035: panel renders through the dashboard backend provider", () => {
