@@ -4048,6 +4048,13 @@ export class RelayV2BrokerCore {
     }
     this.discardQueuedRouteData(carrier, route);
     this.discardQueuedClientData(route);
+    // A client-initiated unbind is a fence sibling of authorization/offline:
+    // route.open may already be in flight to the host, so a crossing
+    // route.opened/route.rejected must hit the benign late-ACK branches rather
+    // than be scored as a stale frame that 4400s the whole carrier.
+    if (route.status === "opening" && route.firstApplicationFrame === "pending") {
+      route.firstApplicationFrame = "unavailable";
+    }
     route.status = "closing";
     const frame = {
       carrierVersion: 1,
