@@ -12,9 +12,9 @@ use super::{
     invalidate_host_status_cache, is_git_worktree_dir,
     json_number_texts_semantically_equal_for_test, kill_legacy_plain_terminal, kill_legacy_session,
     layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
-    list_orphaned_worktrees, load_hosts, load_layout_from_path, load_pending_cleanup,
-    load_terminals, orphaned_worktrees, parse_local_worktree_rpc_response, parse_session_key,
-    probe_local_agents_in_paths, project_from_config, projects_from_config,
+    list_orphaned_worktrees, load_automations_from_disk, load_hosts, load_layout_from_path,
+    load_pending_cleanup, load_terminals, orphaned_worktrees, parse_local_worktree_rpc_response,
+    parse_session_key, probe_local_agents_in_paths, project_from_config, projects_from_config,
     projects_from_config_with_home, read_dashboard_config_lock_owner, remote_config_for_host,
     remote_file_exists_for_host, remote_home_dir_for_host, remote_orphaned_worktrees,
     remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
@@ -27,13 +27,13 @@ use super::{
     tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
     user_bin_search_paths, validate_ssh_host_fields, worktree_has_uncommitted_changes,
     worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
-    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
-    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
-    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
-    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
-    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
-    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
-    REQUIRED_TW_RPC_CAPABILITIES,
+    AutomationRun, AutomationRunInFlight, AutomationStatus, AutomationTriggerType,
+    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
+    DashboardLayoutClassification, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
+    GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
+    LocalTwRpcRuntime, OrphanedWorktree, Project, RemoveMissingProjectArgs, RestoreArgs,
+    SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT,
+    GIT_FETCH_INTERVAL_SECONDS, REQUIRED_TW_RPC_CAPABILITIES,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -246,6 +246,7 @@ fn sample_automation() -> Automation {
         last_run_at: None,
         last_status: AutomationStatus::Idle,
         last_session: None,
+        run_in_flight: None,
         created_at: "2026-06-11T00:00:00Z".to_string(),
         updated_at: "2026-06-11T00:00:00Z".to_string(),
     }
@@ -737,6 +738,7 @@ fn automation_command_shell_quotes_non_empty_instruction() {
 
 #[test]
 fn overlap_skip_requires_running_or_queued_status_with_live_session() {
+    let now = 1_000_000u64;
     let running = Automation {
         overlap: AutomationOverlap::Skip,
         last_status: AutomationStatus::Running,
@@ -752,16 +754,54 @@ fn overlap_skip_requires_running_or_queued_status_with_live_session() {
         ..running.clone()
     };
 
-    assert!(should_skip_automation_overlap(&running, true));
-    assert!(should_skip_automation_overlap(&queued, true));
-    assert!(!should_skip_automation_overlap(&running, false));
-    assert!(!should_skip_automation_overlap(&failed, true));
+    assert!(should_skip_automation_overlap(&running, true, now));
+    assert!(should_skip_automation_overlap(&queued, true, now));
+    assert!(!should_skip_automation_overlap(&running, false, now));
+    assert!(!should_skip_automation_overlap(&failed, true, now));
     assert!(!should_skip_automation_overlap(
         &Automation {
             overlap: AutomationOverlap::Queue,
             ..running
         },
         true,
+        now,
+    ));
+
+    // A fresh in-flight claim dedups during the session-less create window,
+    // before last_status=Running/last_session are persisted.
+    let fresh_in_flight = Automation {
+        overlap: AutomationOverlap::Skip,
+        last_status: AutomationStatus::Idle,
+        last_session: None,
+        run_in_flight: Some(AutomationRunInFlight {
+            run_id: "run-claim".to_string(),
+            started_at_ms: now,
+        }),
+        ..sample_automation()
+    };
+    assert!(should_skip_automation_overlap(&fresh_in_flight, false, now));
+    // A stale claim (process died in the create window) must not latch the
+    // fence shut; with no live session this run proceeds.
+    let stale_in_flight = Automation {
+        run_in_flight: Some(AutomationRunInFlight {
+            run_id: "run-stale".to_string(),
+            started_at_ms: now - 11 * 60 * 1000,
+        }),
+        ..fresh_in_flight.clone()
+    };
+    assert!(!should_skip_automation_overlap(
+        &stale_in_flight,
+        false,
+        now
+    ));
+    // overlap=queue never dedups on an in-flight claim (it allows concurrency).
+    assert!(!should_skip_automation_overlap(
+        &Automation {
+            overlap: AutomationOverlap::Queue,
+            ..fresh_in_flight
+        },
+        false,
+        now,
     ));
 }
 
@@ -851,6 +891,322 @@ fn automation_trigger_delegates_to_canonical_worktree_creator() {
 
     restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
     restore_env("HOME", original_home);
+}
+
+fn set_automation_test_home(home: &Path) {
+    unsafe {
+        std::env::set_var("TW_DASHBOARD_HOME", home);
+        std::env::set_var("HOME", home);
+    }
+}
+
+fn restore_automation_test_env(home: Option<String>, dashboard: Option<String>) {
+    restore_env("TW_DASHBOARD_HOME", dashboard);
+    restore_env("HOME", home);
+}
+
+#[test]
+fn concurrent_trigger_and_save_keeps_both_automations() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-seed".to_string()),
+        name: Some("Seed".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do seed work".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("seed automation");
+
+    let creator_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creator_started_for_thread = std::sync::Arc::clone(&creator_started);
+    let trigger = std::thread::spawn(move || {
+        trigger_automation_with_creator(seeded.id.clone(), move |_args| {
+            creator_started_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Model the multi-second worktree creation window, during which the
+            // main thread saves a *different* automation.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok("seed-session".to_string())
+        })
+    });
+
+    while !creator_started.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    save_automation(SaveAutomationInput {
+        id: Some("auto-concurrent".to_string()),
+        name: Some("Concurrent Edit".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("concurrent work".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("concurrent save");
+
+    let run = trigger
+        .join()
+        .expect("trigger thread panicked")
+        .expect("trigger");
+    assert_eq!(run.status, AutomationStatus::Running);
+
+    let automations = load_automations_from_disk().expect("load automations");
+    let ids: std::collections::HashSet<String> = automations
+        .iter()
+        .map(|automation| automation.id.clone())
+        .collect();
+    assert!(
+        ids.contains("auto-seed") && ids.contains("auto-concurrent"),
+        "lost update: concurrent save was clobbered by trigger write-back; ids={ids:?}"
+    );
+    let seed = automations
+        .iter()
+        .find(|automation| automation.id == "auto-seed")
+        .expect("seed present");
+    assert_eq!(seed.last_status, AutomationStatus::Running);
+    assert_eq!(seed.last_session.as_deref(), Some("seed-session"));
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn concurrent_skip_triggers_overlapping_create_window_dedup_to_single_session() {
+    // Regression for the R1/B1 review gap: two triggers of the same
+    // overlap=skip automation landing inside the same create window both pass
+    // the phase-1 dedup snapshot (last_status=Running/last_session is only
+    // written in phase 2) and each spawn its own worktree/agent. The fix writes
+    // a durable in-flight claim in phase 1 so the second trigger skips.
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-skip".to_string()),
+        name: Some("SkipRun".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do skip work".to_string()),
+        overlap: Some(AutomationOverlap::Skip),
+    })
+    .expect("seed automation");
+
+    let creator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Held once the first creator has entered, so it stays inside the create
+    // window until both triggers have passed phase 1.
+    let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+    let spawn_trigger = |creator_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                         gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+                         id: String| {
+        std::thread::spawn(move || {
+            trigger_automation_with_creator(id, move |_args| {
+                let count = creator_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let (mutex, condvar) = &*gate;
+                if count == 1 {
+                    // First creator: park until released, modelling the
+                    // multi-second worktree/agent create window.
+                    let mut released = mutex.lock().expect("gate lock");
+                    while !*released {
+                        released = condvar.wait(released).expect("gate wait");
+                    }
+                }
+                Ok(format!("skip-session-{count}"))
+            })
+        })
+    };
+
+    let t1 = spawn_trigger(
+        std::sync::Arc::clone(&creator_calls),
+        std::sync::Arc::clone(&gate),
+        seeded.id.clone(),
+    );
+
+    // Wait until the first trigger is parked inside its create window.
+    while creator_calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second trigger while the first is still creating: the in-flight claim
+    // must make this one skip WITHOUT invoking the creator at all.
+    let second = trigger_automation_with_creator(seeded.id.clone(), move |_args| {
+        panic!("creator must not be invoked for the deduped second trigger");
+    })
+    .expect("second trigger");
+
+    assert_eq!(
+        second.status,
+        AutomationStatus::Skipped,
+        "second concurrent trigger must be skipped by the in-flight claim"
+    );
+    assert_eq!(
+        creator_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one worktree/agent session may be created"
+    );
+
+    // Release the parked first creator, then await its phase 2.
+    {
+        let (mutex, condvar) = &*gate;
+        let mut released = mutex.lock().expect("gate lock");
+        *released = true;
+        condvar.notify_all();
+    }
+    let first = t1
+        .join()
+        .expect("first trigger thread panicked")
+        .expect("first trigger");
+    assert_eq!(first.status, AutomationStatus::Running);
+
+    // After phase 2 real Running state is persisted for the single run.
+    let automations = load_automations_from_disk().expect("load automations");
+    let record = automations
+        .iter()
+        .find(|automation| automation.id == seeded.id)
+        .expect("automation present");
+    assert_eq!(record.last_status, AutomationStatus::Running);
+
+    let runs = list_automation_runs(Some(seeded.id.clone())).expect("list runs");
+    let statuses: Vec<_> = runs.iter().map(|run| run.status).collect();
+    assert!(
+        statuses.contains(&AutomationStatus::Running)
+            && statuses.contains(&AutomationStatus::Skipped),
+        "expected one Running run and one Skipped run, got {statuses:?}"
+    );
+    assert_eq!(runs.len(), 2);
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn failed_create_clears_in_flight_claim_and_marks_failed() {
+    // The in-flight claim must be rolled back when create() fails, rather than
+    // lingering until the stale TTL.
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-fail".to_string()),
+        name: Some("FailRun".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do failing work".to_string()),
+        overlap: Some(AutomationOverlap::Skip),
+    })
+    .expect("seed automation");
+
+    let run = trigger_automation_with_creator(seeded.id.clone(), |_args| {
+        Err("worktree creation exploded".to_string())
+    })
+    .expect("trigger returns an Err run");
+    assert_eq!(run.status, AutomationStatus::Failed);
+
+    let automations = load_automations_from_disk().expect("load automations");
+    let record = automations
+        .iter()
+        .find(|automation| automation.id == seeded.id)
+        .expect("automation present");
+    assert_eq!(record.last_status, AutomationStatus::Failed);
+    assert!(
+        record.run_in_flight.is_none(),
+        "failed create must clear the in-flight claim"
+    );
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn corrupt_automation_file_is_quarantined_and_loads_empty() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let automations_file = home.join(".tw-dashboard-automations.json");
+    // Half-written / torn JSON, as left by a non-atomic write interrupted mid-flush.
+    fs::write(&automations_file, r#"[{"id":"auto-broken","name":"x""#).expect("write torn file");
+
+    let loaded = load_automations_from_disk().expect("corrupt file must not hard-error");
+    assert!(
+        loaded.is_empty(),
+        "corrupt file should fall back to empty list"
+    );
+    assert!(
+        !automations_file.exists(),
+        "corrupt file should have been quarantined away"
+    );
+    let backups: Vec<_> = fs::read_dir(&home)
+        .expect("read home")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".tw-dashboard-automations.json.corrupt-"))
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "expected one quarantine backup: {backups:?}"
+    );
+
+    // The surface must recover: a fresh save succeeds on the now-empty state.
+    save_automation(SaveAutomationInput {
+        id: Some("auto-recovered".to_string()),
+        name: Some("Recovered".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("after recovery".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("save after quarantine");
+    let after = load_automations_from_disk().expect("load after recovery");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, "auto-recovered");
+
+    restore_automation_test_env(original_home, original_dashboard_home);
 }
 
 #[test]
