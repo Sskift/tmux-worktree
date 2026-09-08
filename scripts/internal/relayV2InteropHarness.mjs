@@ -24,6 +24,112 @@ const BROKER_READY_DEADLINE_MS = 15_000;
 const HOST_READY_DEADLINE_MS = 15_000;
 
 /**
+ * Spawn an interop host process against an existing broker and wire its
+ * dashboard-management stdio. Shared by startInteropTopology and the fault
+ * injection runner (host restart / dual-host scenarios).
+ *
+ * `config` carries the spawn env inputs: tlsCertPath, profilePath,
+ * bootstrapSecretPath (all optional beyond the trusted home + CA), and an
+ * optional explicit trustedHome (a fresh mkdtemp under /private/tmp is created
+ * when omitted). Returns { hostProc, hostLog, hostExitCode(), hostRequest,
+ * hostTrustedHome }.
+ */
+export function spawnInteropHost(config = {}) {
+  const hostTrustedHome = config.hostTrustedHome
+    ?? realpathSync.native(mkdtempSync("/private/tmp/relay-v2-host-"));
+  chmodSync(hostTrustedHome, 0o700);
+
+  const env = {
+    ...process.env,
+    HOME: hostTrustedHome,
+    TW_HOST_TRUSTED_HOME: hostTrustedHome,
+    TW_HOST_HTTPS_CA: config.tlsCertPath,
+    TW_HOST_WSS_CA: config.tlsCertPath,
+  };
+  if (config.profilePath) env.TW_HOST_PROFILE_INPUT = config.profilePath;
+  if (config.bootstrapSecretPath) env.TW_HOST_BOOTSTRAP_SECRET_INPUT = config.bootstrapSecretPath;
+
+  const hostProc = spawn(process.execPath, [
+    "scripts/internal/relayV2InteropHost.mjs",
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env,
+  });
+
+  const hostLog = [];
+  let hostExitCode = null;
+  hostProc.stderr.on("data", (d) => hostLog.push(d.toString()));
+  hostProc.on("exit", (code) => { hostExitCode = code; });
+
+  let hostBuffer = "";
+  const hostRequests = new Map();
+  let hostReadyFrame = null;
+  hostProc.stdout.on("data", (d) => {
+    hostBuffer += d.toString();
+    let idx;
+    while ((idx = hostBuffer.indexOf("\n")) !== -1) {
+      const line = hostBuffer.slice(0, idx);
+      hostBuffer = hostBuffer.slice(idx + 1);
+      if (!line) continue;
+      try {
+        const frame = JSON.parse(line);
+        if (frame.protocolVersion === 2 && frame.contract) {
+          hostReadyFrame = frame;
+        } else if (frame.requestId && hostRequests.has(frame.requestId)) {
+          const resolve = hostRequests.get(frame.requestId);
+          hostRequests.delete(frame.requestId);
+          resolve(frame);
+        }
+      } catch {}
+    }
+  });
+
+  function hostRequest(operation, input = null) {
+    return new Promise((resolve, reject) => {
+      const requestId = "dmgmt2." + randomBytes(16).toString("base64url");
+      const frame = JSON.stringify({
+        protocolVersion: 2,
+        requestId,
+        operation,
+        input,
+      }) + "\n";
+      hostRequests.set(requestId, resolve);
+      hostProc.stdin.write(frame);
+      setTimeout(() => {
+        if (hostRequests.has(requestId)) {
+          hostRequests.delete(requestId);
+          reject(new Error(`host request ${operation} timed out`));
+        }
+      }, 10000);
+    });
+  }
+
+  const ready = new Promise((resolve, reject) => {
+    const deadline = Date.now() + HOST_READY_DEADLINE_MS;
+    const check = () => {
+      if (hostReadyFrame) return resolve();
+      if (hostProc.exitCode !== null) {
+        return reject(new Error(
+          `host exited early (code=${hostExitCode}); stderr: ${hostLog.join("").slice(-2000)}`,
+        ));
+      }
+      if (Date.now() >= deadline) return reject(new Error("host startup timed out"));
+      setTimeout(check, 100);
+    };
+    check();
+  });
+
+  return {
+    hostProc,
+    hostLog,
+    hostExitCode: () => hostExitCode,
+    hostRequest,
+    hostTrustedHome,
+    ready,
+  };
+}
+
+/**
  * Start the full interop topology (TLS, broker, host, enrollment, redeem).
  *
  * Options:
@@ -124,87 +230,18 @@ export async function startInteropTopology(options = {}) {
   // -------------------------------------------------------------------------
   // Host (with dashboard management stdio)
   // -------------------------------------------------------------------------
-  const hostProc = spawn(process.execPath, [
-    "scripts/internal/relayV2InteropHost.mjs",
-  ], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      HOME: hostTrustedHome,
-      TW_HOST_TRUSTED_HOME: hostTrustedHome,
-      TW_HOST_HTTPS_CA: tlsCertPath,
-      TW_HOST_WSS_CA: tlsCertPath,
-      TW_HOST_PROFILE_INPUT: profilePath,
-      TW_HOST_BOOTSTRAP_SECRET_INPUT: bootstrapSecretPath,
-    },
+  const spawned = spawnInteropHost({
+    tlsCertPath,
+    profilePath,
+    bootstrapSecretPath,
+    hostTrustedHome,
   });
-
-  const hostLog = [];
-  let hostExitCode = null;
-  hostProc.stderr.on("data", (d) => hostLog.push(d.toString()));
-  hostProc.on("exit", (code) => { hostExitCode = code; });
-
-  let hostBuffer = "";
-  const hostRequests = new Map();
-  let hostReadyFrame = null;
-  hostProc.stdout.on("data", (d) => {
-    hostBuffer += d.toString();
-    let idx;
-    while ((idx = hostBuffer.indexOf("\n")) !== -1) {
-      const line = hostBuffer.slice(0, idx);
-      hostBuffer = hostBuffer.slice(idx + 1);
-      if (!line) continue;
-      try {
-        const frame = JSON.parse(line);
-        if (frame.protocolVersion === 2 && frame.contract) {
-          hostReadyFrame = frame;
-        } else if (frame.requestId && hostRequests.has(frame.requestId)) {
-          const resolve = hostRequests.get(frame.requestId);
-          hostRequests.delete(frame.requestId);
-          resolve(frame);
-        }
-      } catch {}
-    }
-  });
-
-  await new Promise((resolve, reject) => {
-    const deadline = Date.now() + HOST_READY_DEADLINE_MS;
-    const check = () => {
-      if (hostReadyFrame) return resolve();
-      if (hostProc.exitCode !== null) {
-        console.error("Host exit code:", hostExitCode);
-        console.error("Host stderr:", hostLog.join(""));
-        console.error("Host stdout buffer:", hostBuffer);
-        return reject(new Error("host exited early"));
-      }
-      if (Date.now() >= deadline) return reject(new Error("host startup timed out"));
-      setTimeout(check, 100);
-    };
-    check();
-  });
+  const hostProc = spawned.hostProc;
+  const hostLog = spawned.hostLog;
+  const hostExitCode = spawned.hostExitCode;
+  const hostRequest = spawned.hostRequest;
+  await spawned.ready;
   console.log("[setup] host dashboard management ready");
-
-  function hostRequest(operation, input = null) {
-    return new Promise((resolve, reject) => {
-      const requestId = "dmgmt2." + randomBytes(16).toString("base64url");
-      const frame = JSON.stringify({
-        protocolVersion: 2,
-        requestId,
-        operation,
-        input,
-      }) + "\n";
-      hostRequests.set(requestId, resolve);
-      hostProc.stdin.write(frame);
-      setTimeout(() => {
-        if (hostRequests.has(requestId)) {
-          hostRequests.delete(requestId);
-          console.error("Host stderr on timeout:", hostLog.join(""));
-          console.error("Broker log on timeout:", brokerLog.join(""));
-          reject(new Error(`host request ${operation} timed out`));
-        }
-      }, 10000);
-    });
-  }
 
   // Bootstrap host credentials.
   const bootstrapResp = await hostRequest("bootstrap_host");
@@ -283,13 +320,15 @@ export async function startInteropTopology(options = {}) {
     brokerPort,
     hostProc,
     hostLog,
-    hostExitCode: () => hostExitCode,
+    hostExitCode,
     hostRequest,
     issuerUrl,
     relayUrl,
     clientRelayUrl,
     hostId,
     hostTrustedHome,
+    profilePath,
+    bootstrapSecretPath,
     clientCreds,
     clientInstanceId,
     enrollment,

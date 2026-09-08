@@ -26,6 +26,7 @@
     "test:cli": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
     "test:only": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:interop": "npm run build && node scripts/relay-v2-interop.mjs",
+    "test:fault-injection": "node scripts/relay-v2-fault-injection.mjs",
     "verify": "sh scripts/verify.sh core",
     "verify:interop": "sh scripts/verify.sh interop",
     "verify:android": "sh scripts/verify.sh android",
