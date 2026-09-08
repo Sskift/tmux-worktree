@@ -3186,23 +3186,27 @@ test("Feishu bridge startup fails when the event consumer cannot spawn", async (
   }
 });
 
-test("flapping event consumer (ready then immediate exit) never publishes running and resubscribes immediately", async () => {
-  // Regression for the ready/done race: lark-cli resolves 'ready' on the
-  // child 'spawn' event, before the subscription is established. A child
-  // that exits immediately after spawn must not be reported as 'running';
-  // the bridge must stay in 'backoff' and resubscribe (immediately on the
-  // first failure, then bounded backoff).
+test("fast-flapping consumer (ready then quick exit) backs off instead of reconnect-storming", async () => {
+  // Regression for the backoff counter reset point (D015): the attempt
+  // counter must reset only after a subscription stays up for the stability
+  // grace window, NOT the moment ready resolves. A child that reaches ready
+  // and then dies ~20ms later (deterministic post-setup flap) must keep
+  // accumulating attempts so the reconnect delay grows to the 4s cap. With
+  // the old reset-on-ready logic this ran at ~25 respawns/sec; with the
+  // stability timer the same persistent flap is bounded to a handful over
+  // the same window.
   const h = harness();
   let subscribes = 0;
   h.lark.subscribe = () => {
     subscribes += 1;
-    // ready and done settle in the same microtask batch, mirroring spawn
-    // followed by an immediate child exit. done rejects so the exit handler
-    // records the failure reason.
+    let rejectDone;
+    const done = new Promise((_, reject) => { rejectDone = reject; });
+    // ready resolves (subscription launched) then the child dies quickly.
+    setTimeout(() => rejectDone(new Error(`lark-cli event consumer exited 4: network reset (flap ${subscribes})`)), 20);
     return {
       child: undefined,
       ready: Promise.resolve(),
-      done: Promise.reject(new Error(`lark-cli event consumer exited 1: flap ${subscribes}`)),
+      done,
       stop() {},
     };
   };
@@ -3215,13 +3219,66 @@ test("flapping event consumer (ready then immediate exit) never publishes runnin
   });
   try {
     await server.start();
-    // Let the immediate (0ms) retry fire; it flaps as well.
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.ok(subscribes >= 2, `the flapping consumer was resubscribed immediately (got ${subscribes})`);
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    // ~20ms-per-flap with no growing backoff would be ~60+ respawns in this
+    // window (the old storm measured ~25/sec). Bounded backoff yields a
+    // handful: 0ms, 250ms, 500ms, 1s, ...
+    assert.ok(subscribes <= 10,
+      `persistent flap must back off, not storm (got ${subscribes} subscribes in 2.5s)`);
     const snapshot = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
-    assert.equal(snapshot.eventConsumer.state, "backoff",
-      "a consumer that exits immediately after spawn must never be reported running");
-    assert.match(snapshot.eventConsumer.error ?? "", /flap|consumer/);
+    assert.match(snapshot.eventConsumer.error ?? "", /flap|network|consumer/);
+  } finally {
+    await server.stop();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("consumer that survives the stability window resets backoff for an immediate reconnect", async () => {
+  // Companion to D015: a genuinely established subscription that stays up
+  // past the grace window is treated as healthy, so a LATER transient drop
+  // reconnects immediately (0ms) rather than at the capped delay. This is
+  // the flip side of the storm fix — fast flaps accumulate, stable runs reset.
+  const h = harness();
+  let subscribes = 0;
+  let killCurrent;
+  h.lark.subscribe = () => {
+    subscribes += 1;
+    let resolveDone;
+    let rejectDone;
+    const done = new Promise((resolve, reject) => {
+      resolveDone = resolve;
+      rejectDone = reject;
+    });
+    killCurrent = () => rejectDone(new Error("lark-cli event consumer exited 4: transient network reset"));
+    return {
+      child: undefined,
+      ready: Promise.resolve(),
+      done,
+      stop() { resolveDone(); },
+    };
+  };
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    lark: h.lark,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+  });
+  try {
+    await server.start();
+    const afterFirstSubscribe = subscribes;
+    assert.equal(afterFirstSubscribe, 1);
+    // Let the stability grace window elapse so the counter resets.
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
+    const healthySnapshot = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
+    assert.equal(healthySnapshot.eventConsumer.state, "running");
+    // The established consumer now drops transiently.
+    killCurrent();
+    // Because the counter was reset by the grace timer, the retry is the
+    // "first" attempt (0ms): a fresh subscribe happens almost immediately.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.ok(subscribes >= afterFirstSubscribe + 1,
+      `a stable consumer's later drop must reconnect immediately (got ${subscribes} subscribes)`);
   } finally {
     await server.stop();
     rmSync(h.root, { recursive: true, force: true });

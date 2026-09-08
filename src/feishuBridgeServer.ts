@@ -27,6 +27,11 @@ const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const INSTANCE_LOCK_STALE_MS = 30_000;
+// A subscription that survives this long after being reported healthy is
+// treated as established: only then is the bounded-backoff counter reset.
+// A consumer that dies within the grace window keeps accumulating attempts,
+// so a persistent flap backs off to the cap instead of reconnect-storming.
+const CONSUMER_STABILITY_GRACE_MS = 2_000;
 export const FEISHU_BRIDGE_CAPABILITIES = [
   "binding.lifecycle-notices.v1",
   "binding.create.session-summary.v1",
@@ -351,6 +356,7 @@ export class FeishuBridgeServer {
   private pollTimer?: ReturnType<typeof setInterval>;
   private renewTimer?: ReturnType<typeof setInterval>;
   private restartTimer?: ReturnType<typeof setTimeout>;
+  private consumerStabilityTimer?: ReturnType<typeof setTimeout>;
   private consumerRestartAttempts = 0;
   private pollInFlight = false;
   private renewInFlight = false;
@@ -464,6 +470,7 @@ export class FeishuBridgeServer {
       if (this.pollTimer) clearInterval(this.pollTimer);
       if (this.renewTimer) clearInterval(this.renewTimer);
       if (this.restartTimer) clearTimeout(this.restartTimer);
+      if (this.consumerStabilityTimer) clearTimeout(this.consumerStabilityTimer);
       this.consumer?.stop();
       await new Promise<void>((resolve) => {
         if (!this.server.listening) resolve();
@@ -482,6 +489,11 @@ export class FeishuBridgeServer {
     this.bridge.setEventConsumerHealth("starting");
     this.consumer = this.lark.subscribe((event) => this.bridge.handleEvent(event));
     const consumer = this.consumer;
+    if (this.consumerStabilityTimer) {
+      clearTimeout(this.consumerStabilityTimer);
+      this.consumerStabilityTimer = undefined;
+    }
+    let stabilityTimer: ReturnType<typeof setTimeout> | undefined;
     // Track whether the child already exited by the time ready settles.
     // ready resolves on the 'spawn' event (process launched), not once the
     // lark-cli subscription is established; a child that exits in the same
@@ -492,12 +504,14 @@ export class FeishuBridgeServer {
     void consumer.done.then(
       () => {
         consumerSettledBeforeReady = true;
+        if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = undefined; }
         if (!this.stopping) {
           this.bridge.setEventConsumerHealth("backoff", "Feishu event consumer exited");
         }
       },
       (error) => {
         consumerSettledBeforeReady = true;
+        if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = undefined; }
         if (this.stopping) return;
         const message = error instanceof Error ? error.message : String(error);
         this.bridge.setEventConsumerHealth("backoff", message);
@@ -507,8 +521,12 @@ export class FeishuBridgeServer {
       if (this.stopping) return;
       // Bounded reconnect backoff: immediate first retry after an exit,
       // then 250ms, 500ms, 1s, 2s, capped at 4s while failures persist.
-      // Health stays 'backoff' throughout, so the UI keeps the Link action
-      // disabled instead of flashing a fake healthy state.
+      // The attempt counter is reset only by the stability timer once a
+      // subscription stays up for the grace window (see below) — NOT when
+      // ready resolves — so a child that spawns, reads as ready, and then
+      // dies within the grace window keeps accumulating attempts and backs
+      // off to the cap instead of reconnect-storming. Health stays 'backoff'
+      // throughout, so the UI keeps the Link action disabled.
       const attempt = this.consumerRestartAttempts + 1;
       this.consumerRestartAttempts = attempt;
       const delayMs = attempt <= 1 ? 0 : Math.min(250 * 2 ** (attempt - 2), 4_000);
@@ -527,8 +545,17 @@ export class FeishuBridgeServer {
       // aborts and the supervisor reports the real cause.
       await consumer.ready;
       if (!this.stopping && this.consumer === consumer && !consumerSettledBeforeReady) {
-        this.consumerRestartAttempts = 0;
         this.bridge.setEventConsumerHealth("running");
+        // Reset the bounded-backoff counter only after the subscription has
+        // stayed up for the grace window. If this consumer exits before the
+        // timer fires (fast flap), the done handler cancels it and the
+        // accumulated attempts drive the delay up to the 4s cap.
+        stabilityTimer = setTimeout(() => {
+          if (this.stopping || this.consumer !== consumer) return;
+          this.consumerRestartAttempts = 0;
+        }, CONSUMER_STABILITY_GRACE_MS);
+        stabilityTimer.unref();
+        this.consumerStabilityTimer = stabilityTimer;
       } else if (!this.stopping && this.consumer === consumer) {
         // ready resolved but the child already exited (flap): stay in
         // backoff; the done.finally timer resubscribes (immediately on the
