@@ -3046,6 +3046,50 @@ test("a fully persisted prepared reply resumes with the same idempotency key aft
   }
 });
 
+test("a persisted Typing reaction handle is deleted after restart without adding CrossMark", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await flushBestEffortEffects();
+    assert.deepEqual(
+      h.lark.reactionCreates.map(({ emojiType }) => emojiType),
+      ["Typing"],
+    );
+    const persisted = h.store.read().turns.at(-1);
+    assert.equal(persisted.processingReactionId, "reaction-1", "the Typing handle is persisted");
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-crash",
+      botOpenId: "ou-bot",
+    });
+    h.lark.reactionDeletes.length = 0;
+    h.lark.reactionCreates.length = 0;
+    restarted.initializeAfterRestart();
+    await flushBestEffortEffects();
+
+    assert.deepEqual(
+      h.lark.reactionDeletes,
+      [{ messageId: "om-one", reactionId: "reaction-1" }],
+      "the orphaned Typing reaction is removed using its persisted handle",
+    );
+    assert.deepEqual(
+      h.lark.reactionCreates.map(({ emojiType }) => emojiType),
+      [],
+      "restart never stacks a CrossMark on a reaction whose creation window is unknown",
+    );
+    await restarted.close();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("late controller epoch or output generation never posts a marked reply", async () => {
   for (const scenario of [
     { name: "epoch", mutate: (control) => { control.target.controlEpoch = "epoch-late"; } },

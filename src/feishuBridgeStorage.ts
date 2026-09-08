@@ -117,6 +117,7 @@ export interface FeishuTurn {
   output: string;
   operationId: string;
   outboundAttemptId: string;
+  processingReactionId?: string;
   createdAt: string;
   deadlineAt: string;
   lastOutputAt?: string;
@@ -359,7 +360,7 @@ function isTurn(value: unknown): value is FeishuTurn {
     "operationId", "outboundAttemptId", "createdAt", "deadlineAt",
   ], [
     "outputGeneration", "cursor", "markerNonce", "outputRemainderBase64",
-    "lastOutputAt", "markerSeenAt", "completedAt", "error",
+    "lastOutputAt", "markerSeenAt", "completedAt", "error", "processingReactionId",
   ])) return false;
   const statuses: FeishuTurnStatus[] = [
     "prepared", "awaiting", "replying", "completed", "cancelled", "timed-out", "recovery-required",
@@ -380,6 +381,7 @@ function isTurn(value: unknown): value is FeishuTurn {
       || (value.outputGeneration !== undefined && value.cursor !== undefined))
     && typeof value.output === "string" && Buffer.byteLength(value.output, "utf8") <= 128 * 1024
     && isIso(value.createdAt) && isIso(value.deadlineAt)
+    && (value.processingReactionId === undefined || isSafeText(value.processingReactionId))
     && [value.lastOutputAt, value.markerSeenAt, value.completedAt]
       .every((item) => item === undefined || isIso(item))
     && (value.error === undefined || isSafeText(value.error, 4096));

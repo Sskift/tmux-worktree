@@ -354,6 +354,21 @@ export class FeishuBridge {
         this.queueBindingLifecycle(binding, "control-needs-confirm");
       }
     }
+    // Reborn Typing reactions: a handle persisted before the crash must be
+    // deleted. Restart never adds CrossMark — without a live process the add
+    // Typing acknowledgement window is unknown, and the design rule is never
+    // to stack CrossMark on a Typing reaction we cannot identify and remove.
+    for (const turn of this.state.turns) {
+      if (!turn.processingReactionId) continue;
+      this.pendingProcessingReactions.set(turn.messageId, {
+        state: "created",
+        reactionId: turn.processingReactionId,
+      });
+      if (turn.status === "recovery-required" || turn.status === "cancelled"
+        || turn.status === "completed" || turn.status === "timed-out") {
+        this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
+      }
+    }
     if (changed) this.persist();
     else this.queuePreparedOutboundAttempts();
   }
@@ -2532,6 +2547,16 @@ export class FeishuBridge {
       this.pendingProcessingReactions.set(messageId, {
         state: "created",
         reactionId: result.reactionId,
+      });
+      // Persist the known Typing handle on the owning turn so a crash/restart
+      // can still delete it. It stays best-effort; a crash in the
+      // acknowledgement window leaves an unrecoverable (but cosmetic) Typing.
+      await this.serial(async () => {
+        const turn = this.state.turns.find((candidate) => candidate.messageId === messageId);
+        if (turn?.processingReactionId !== result.reactionId) {
+          if (turn) turn.processingReactionId = result.reactionId;
+          this.persist();
+        }
       });
     } catch (error) {
       process.stderr.write(`[feishu-bridge] add Typing reaction failed: ${error instanceof Error ? error.message : String(error)}\n`);
