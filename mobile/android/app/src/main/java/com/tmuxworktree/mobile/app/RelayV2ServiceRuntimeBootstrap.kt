@@ -69,10 +69,20 @@ private object HeadlessRelayV2DisconnectBarrier : RelayProfileDisconnectBarrier 
         barrierId: String,
     ): RelayProfileDisconnectReceipt {
         val composition = RelayV2ConnectionRegistry.composition.value
-        return if (composition != null && composition.activeProfileIdentity == profile) {
+        if (composition == null || composition.activeProfileIdentity != profile) {
+            return RelayProfileDisconnectReceipt(profile, barrierId)
+        }
+        // Align with the ViewModel barrier: the drained composition is permanently fenced even
+        // when the network drain throws, so close it and drop it from the process registry in a
+        // finally. Registry.clear is identity-checked, so a successor composition installed
+        // concurrently is never torn down here. Without this the headless (no-UI) isolation
+        // path leaves a drained/half-hung composition and actor registered until a later grant
+        // revocation or ViewModel install happens to reclaim it.
+        return try {
             composition.disconnectAndDrain(profile, barrierId)
-        } else {
-            RelayProfileDisconnectReceipt(profile, barrierId)
+        } finally {
+            runCatching { composition.close() }
+            RelayV2ConnectionRegistry.clear(composition)
         }
     }
 }
