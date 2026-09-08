@@ -12,9 +12,9 @@ use super::{
     invalidate_host_status_cache, is_git_worktree_dir,
     json_number_texts_semantically_equal_for_test, kill_legacy_plain_terminal, kill_legacy_session,
     layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
-    list_orphaned_worktrees, load_hosts, load_layout_from_path, load_pending_cleanup,
-    load_terminals, orphaned_worktrees, parse_local_worktree_rpc_response, parse_session_key,
-    probe_local_agents_in_paths, project_from_config, projects_from_config,
+    list_orphaned_worktrees, load_automations_from_disk, load_hosts, load_layout_from_path,
+    load_pending_cleanup, load_terminals, orphaned_worktrees, parse_local_worktree_rpc_response,
+    parse_session_key, probe_local_agents_in_paths, project_from_config, projects_from_config,
     projects_from_config_with_home, read_dashboard_config_lock_owner, remote_config_for_host,
     remote_file_exists_for_host, remote_home_dir_for_host, remote_orphaned_worktrees,
     remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
@@ -851,6 +851,157 @@ fn automation_trigger_delegates_to_canonical_worktree_creator() {
 
     restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
     restore_env("HOME", original_home);
+}
+
+fn set_automation_test_home(home: &Path) {
+    unsafe {
+        std::env::set_var("TW_DASHBOARD_HOME", home);
+        std::env::set_var("HOME", home);
+    }
+}
+
+fn restore_automation_test_env(home: Option<String>, dashboard: Option<String>) {
+    restore_env("TW_DASHBOARD_HOME", dashboard);
+    restore_env("HOME", home);
+}
+
+#[test]
+fn concurrent_trigger_and_save_keeps_both_automations() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-seed".to_string()),
+        name: Some("Seed".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do seed work".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("seed automation");
+
+    let creator_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creator_started_for_thread = std::sync::Arc::clone(&creator_started);
+    let trigger = std::thread::spawn(move || {
+        trigger_automation_with_creator(seeded.id.clone(), move |_args| {
+            creator_started_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Model the multi-second worktree creation window, during which the
+            // main thread saves a *different* automation.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok("seed-session".to_string())
+        })
+    });
+
+    while !creator_started.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    save_automation(SaveAutomationInput {
+        id: Some("auto-concurrent".to_string()),
+        name: Some("Concurrent Edit".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("concurrent work".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("concurrent save");
+
+    let run = trigger
+        .join()
+        .expect("trigger thread panicked")
+        .expect("trigger");
+    assert_eq!(run.status, AutomationStatus::Running);
+
+    let automations = load_automations_from_disk().expect("load automations");
+    let ids: std::collections::HashSet<String> = automations
+        .iter()
+        .map(|automation| automation.id.clone())
+        .collect();
+    assert!(
+        ids.contains("auto-seed") && ids.contains("auto-concurrent"),
+        "lost update: concurrent save was clobbered by trigger write-back; ids={ids:?}"
+    );
+    let seed = automations
+        .iter()
+        .find(|automation| automation.id == "auto-seed")
+        .expect("seed present");
+    assert_eq!(seed.last_status, AutomationStatus::Running);
+    assert_eq!(seed.last_session.as_deref(), Some("seed-session"));
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn corrupt_automation_file_is_quarantined_and_loads_empty() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let automations_file = home.join(".tw-dashboard-automations.json");
+    // Half-written / torn JSON, as left by a non-atomic write interrupted mid-flush.
+    fs::write(&automations_file, r#"[{"id":"auto-broken","name":"x""#).expect("write torn file");
+
+    let loaded = load_automations_from_disk().expect("corrupt file must not hard-error");
+    assert!(
+        loaded.is_empty(),
+        "corrupt file should fall back to empty list"
+    );
+    assert!(
+        !automations_file.exists(),
+        "corrupt file should have been quarantined away"
+    );
+    let backups: Vec<_> = fs::read_dir(&home)
+        .expect("read home")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".tw-dashboard-automations.json.corrupt-"))
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "expected one quarantine backup: {backups:?}"
+    );
+
+    // The surface must recover: a fresh save succeeds on the now-empty state.
+    save_automation(SaveAutomationInput {
+        id: Some("auto-recovered".to_string()),
+        name: Some("Recovered".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("after recovery".to_string()),
+        overlap: Some(AutomationOverlap::Queue),
+    })
+    .expect("save after quarantine");
+    let after = load_automations_from_disk().expect("load after recovery");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, "auto-recovered");
+
+    restore_automation_test_env(original_home, original_dashboard_home);
 }
 
 #[test]
