@@ -1890,6 +1890,85 @@ test("RESET yields its own producer lease before exact target replacement", asyn
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
 });
 
+test("C037: uncertain producer release on RESET yields request-scoped BUSY, never host-wide fatal", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-c037-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const resolver = new FakeResolver();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: resolver,
+      now: () => 1_000_000,
+    });
+    const h = harness({
+      resolver,
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+    });
+    const fatalErrors = [];
+    const recovery = terminal.captureRelayV2TerminalManagerRecoveryBinding(h.manager, lineage);
+    assert.ok(recovery);
+    assert.equal(recovery.installFatalSink((error) => fatalErrors.push(error)), true);
+
+    const sourceRequest = goldenOpen({
+      requestId: "c037-source",
+      streamId: "c037-stream",
+      openId: "c037-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(sourceRequest);
+    const source = opened(h.sent, sourceRequest.requestId);
+    // Establish a live producer lease so unbind/detach leaves a retiringLease.
+    await h.manager.input({
+      ...streamContext(source),
+      inputSeq: "1",
+      data: Buffer.from("c037-hold-producer-lease"),
+    });
+
+    // Detach (route teardown). The release answer is lost -> retiringLease hangs.
+    h.authority.releaseResults.push(new Error("release answer lost in flight"));
+    await h.manager.unbind(AUTH, ROUTE_ONE);
+    assert.equal(fatalErrors.length, 0, "detach uncertain release must never be fatal");
+
+    const resetRequest = goldenOpen({
+      requestId: "c037-reset",
+      streamId: sourceRequest.streamId,
+      openId: "c037-reset-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+
+    // Reconcile also cannot confirm (control plane still down / continuity
+    // unknown): the RESET must fail as request-scoped BUSY, not INTERNAL.
+    h.authority.continuityResults.push(new Error("continuity probe lost"));
+    await assert.rejects(h.manager.open(resetRequest), managerError("BUSY"));
+    assert.equal(fatalErrors.length, 0, "uncertain RESET release must not fence the host H3 lane");
+    assert.ok(
+      fatalErrors.every((error) => error.code !== "INTERNAL"),
+      "no INTERNAL authority failure may reach the fatal sink",
+    );
+    // The old lease was asked to release exactly once (by detach); the reset
+    // attempt must not have fired a duplicate release before reconcile.
+    assert.equal(h.authority.releaseCalls.length, 1);
+
+    // Retry once the control plane converges: continuity reports the lease is
+    // gone (false), reconcile clears retiringLease, and the RESET succeeds.
+    h.authority.continuityResults.push(false);
+    await h.manager.open({ ...resetRequest, requestId: "c037-reset-retry" });
+    const recovered = opened(h.sent, "c037-reset-retry");
+    assert.equal(recovered.payload.disposition, "reset");
+    assert.equal(fatalErrors.length, 0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("durable RESET refreshes only the exact controller epoch after terminal-control restart", async () => {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-control-restart-"));
   try {
