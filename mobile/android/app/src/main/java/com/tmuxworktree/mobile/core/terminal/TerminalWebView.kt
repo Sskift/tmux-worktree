@@ -73,6 +73,28 @@ internal object TerminalParserMutationTimeoutPolicy {
     const val CALLBACK_MILLIS = 30_000L
 }
 
+/**
+ * Bounds parser-ACK timeouts to a scheduler. Production uses the async main-looper handler; unit
+ * tests inject a deterministic scheduler so the controller can be exercised without a WebView.
+ */
+internal interface TerminalParserCallbackScheduler {
+    fun postDelayed(block: Runnable, delayMillis: Long): Boolean
+    fun removeCallbacks(block: Runnable)
+}
+
+internal object AndroidMainTerminalParserCallbackScheduler : TerminalParserCallbackScheduler {
+    private val handler by lazy {
+        HandlerCompat.createAsync(Looper.getMainLooper())
+    }
+
+    override fun postDelayed(block: Runnable, delayMillis: Long): Boolean =
+        handler.postDelayed(block, delayMillis)
+
+    override fun removeCallbacks(block: Runnable) {
+        handler.removeCallbacks(block)
+    }
+}
+
 /** A normal route close intentionally discards its final view mutation after stream detach. */
 internal fun terminalParserMutationAppliedOnViewLoss(kind: TerminalWebViewLossKind): Boolean =
     kind == TerminalWebViewLossKind.VIEW_DISPOSED
@@ -287,14 +309,11 @@ internal class TerminalWebViewOwnership {
 }
 
 @Stable
-class TerminalWebViewController internal constructor() {
+class TerminalWebViewController internal constructor(
+    private val parserCallbackScheduler: TerminalParserCallbackScheduler =
+        AndroidMainTerminalParserCallbackScheduler,
+) {
     private val lock = Any()
-    // Parser ACK/timeout ownership must cross a WebView frame even while Chromium or Compose has
-    // installed a main-queue synchronization barrier. A regular Handler can be starved behind
-    // that barrier indefinitely while asynchronous vsync/input work keeps the UI superficially
-    // alive, leaving the durable checkpoint stuck on one parser write. The async Handler keeps
-    // both the bounded timeout and its exact settlement runnable live in that condition.
-    private val parserCallbackHandler = HandlerCompat.createAsync(Looper.getMainLooper())
     private val ownership = TerminalWebViewOwnership()
     private val pendingScripts = ArrayDeque<String>()
     private var pendingScriptBytes = 0
@@ -307,14 +326,47 @@ class TerminalWebViewController internal constructor() {
     var isReady: Boolean = false
         private set
 
-    internal fun bind(view: WebView): Boolean = synchronized(lock) {
-        val alreadyBound = ownership.currentView() === view
-        if (!ownership.bind(view)) return@synchronized false
-        if (!alreadyBound) isReady = false
-        true
+    internal fun bind(view: Any): Boolean {
+        val displacedMutation = synchronized(lock) {
+            val previousView = ownership.currentView()
+            val wasReady = isReady
+            if (!ownership.bind(view)) return false
+            if (previousView != null && previousView !== view) {
+                // Navigation composes the successor terminal route before disposing the old one,
+                // so the old WebView's loss is never recorded (it is no longer the bound view).
+                // A parser mutation still in flight for that displaced view would otherwise own
+                // the single slot until its bounded timeout, rejecting every successor write for
+                // up to CALLBACK_MILLIS. Settle it as failed immediately, exactly like a view
+                // loss, so the runtime's existing applied=false reset/replay self-heals at once.
+                settleDisplacedViewStateLocked()
+            } else {
+                if (!wasReady) isReady = false
+                null
+            }
+        }
+        // Invoke the durable completion off the controller lock, matching the view-loss path.
+        displacedMutation?.let { settleParserMutation(it, applied = false) }
+        return true
     }
 
-    internal fun markReady(view: WebView): TerminalWebViewParserBinding? {
+    /**
+     * Mirrors the [loseView] cleanup for a view displaced by a successor bind whose disposal was
+     * never recorded. Caller holds [lock]; returns the in-flight mutation to settle as failed.
+     */
+    private fun settleDisplacedViewStateLocked(): PendingParserMutation? {
+        val mutation = parserMutation
+        isReady = false
+        pendingScripts.clear()
+        pendingScriptBytes = 0
+        pendingTerminalOutput.clear()
+        terminalWriteInFlight = false
+        terminalOutputGeneration += 1
+        controlledOutput.reset()
+        parserMutation = null
+        return mutation
+    }
+
+    internal fun markReady(view: Any): TerminalWebViewParserBinding? {
         val ready = synchronized(lock) {
             ownership.renewContentGeneration(view) ?: return null
             val binding = ownership.currentBinding(this, view) ?: return null
@@ -332,11 +384,12 @@ class TerminalWebViewController internal constructor() {
             )
         }
         val posted = postToView(ready.view) {
+            val view = ready.view as WebView
             if (!ownsReadyView(ready.view, ready.binding)) return@postToView
             for (script in ready.scripts) {
                 if (!ownsReadyView(ready.view, ready.binding)) return@postToView
                 if (runCatching {
-                        ready.view.evaluateJavascript(script, null)
+                        view.evaluateJavascript(script, null)
                     }.isFailure
                 ) return@postToView
             }
@@ -351,7 +404,7 @@ class TerminalWebViewController internal constructor() {
     }
 
     internal fun rendererLost(
-        view: WebView,
+        view: Any,
         didCrash: Boolean,
         allowAutomaticRebuild: Boolean,
     ): TerminalWebViewRendererLoss? = loseView(
@@ -361,7 +414,7 @@ class TerminalWebViewController internal constructor() {
         allowAutomaticRebuild = allowAutomaticRebuild,
     )
 
-    internal fun viewDisposed(view: WebView): TerminalWebViewRendererLoss? = loseView(
+    internal fun viewDisposed(view: Any): TerminalWebViewRendererLoss? = loseView(
         view = view,
         kind = TerminalWebViewLossKind.VIEW_DISPOSED,
         didCrash = false,
@@ -369,7 +422,7 @@ class TerminalWebViewController internal constructor() {
     )
 
     private fun loseView(
-        view: WebView,
+        view: Any,
         kind: TerminalWebViewLossKind,
         didCrash: Boolean,
         allowAutomaticRebuild: Boolean,
@@ -400,7 +453,7 @@ class TerminalWebViewController internal constructor() {
             parserMutation = null
             loss to mutation
         }
-        mutation?.let { parserCallbackHandler.removeCallbacks(it.timeout) }
+        mutation?.let { parserCallbackScheduler.removeCallbacks(it.timeout) }
         if (kind == TerminalWebViewLossKind.VIEW_DISPOSED) {
             mutation?.completion?.invoke(terminalParserMutationAppliedOnViewLoss(kind))
         }
@@ -424,7 +477,7 @@ class TerminalWebViewController internal constructor() {
         isReady && ownership.owns(binding)
     }
 
-    internal fun acceptsBridgeEvent(view: WebView): Boolean = synchronized(lock) {
+    internal fun acceptsBridgeEvent(view: Any): Boolean = synchronized(lock) {
         ownership.currentView() === view
     }
 
@@ -457,7 +510,7 @@ class TerminalWebViewController internal constructor() {
     )
 
     internal fun completeParserMutation(
-        view: WebView,
+        view: Any,
         callbackId: String,
         applied: Boolean,
     ) {
@@ -475,7 +528,7 @@ class TerminalWebViewController internal constructor() {
             val output = controlledOutput.push(data)
             if (output.isEmpty()) return@synchronized null
             appendTerminalOutput(output)
-            val readyView = (ownership.currentView() as? WebView)?.takeIf { isReady }
+            val readyView = ownership.currentView()?.takeIf { isReady }
             val binding = ownership.currentBinding(this)?.takeIf { readyView != null }
             if (readyView == null || terminalWriteInFlight) {
                 null
@@ -514,18 +567,20 @@ class TerminalWebViewController internal constructor() {
     fun focus() {
         val target = currentReadyWebView() ?: return
         postToView(target.view) {
+            val view = target.view as WebView
             if (!ownsReadyView(target.view, target.binding)) return@postToView
-            if (!target.view.requestFocus() && !target.view.hasFocus()) return@postToView
+            if (!view.requestFocus() && !view.hasFocus()) return@postToView
             runCatching {
-                target.view.evaluateJavascript("window.twFocus&&window.twFocus();") {
+                view.evaluateJavascript("window.twFocus&&window.twFocus();") {
                     postToView(target.view) restart@{
+                        val resumed = target.view as WebView
                         if (!ownsReadyView(target.view, target.binding)) return@restart
-                        val inputMethodManager = target.view.context
+                        val inputMethodManager = resumed.context
                             .getSystemService(InputMethodManager::class.java)
                             ?: return@restart
-                        inputMethodManager.restartInput(target.view)
+                        inputMethodManager.restartInput(resumed)
                         inputMethodManager.showSoftInput(
-                            target.view,
+                            resumed,
                             InputMethodManager.SHOW_IMPLICIT,
                         )
                     }
@@ -537,13 +592,14 @@ class TerminalWebViewController internal constructor() {
     fun blur() {
         val target = currentReadyWebView() ?: return
         postToView(target.view) {
+            val view = target.view as WebView
             if (!ownsReadyView(target.view, target.binding)) return@postToView
             runCatching {
-                target.view.evaluateJavascript("window.twBlur&&window.twBlur();", null)
+                view.evaluateJavascript("window.twBlur&&window.twBlur();", null)
             }
-            target.view.context.getSystemService(InputMethodManager::class.java)
-                ?.hideSoftInputFromWindow(target.view.windowToken, 0)
-            target.view.clearFocus()
+            view.context.getSystemService(InputMethodManager::class.java)
+                ?.hideSoftInputFromWindow(view.windowToken, 0)
+            view.clearFocus()
         }
     }
 
@@ -556,16 +612,17 @@ class TerminalWebViewController internal constructor() {
             terminalOutputGeneration += 1
             controlledOutput.reset()
             val mutation = parserMutation.also { parserMutation = null }
-            val view = (ownership.currentView() as? WebView)?.takeIf { isReady }
+            val view = ownership.currentView()?.takeIf { isReady }
             val binding = ownership.currentBinding(this)?.takeIf { view != null }
             view?.let { BoundWebView(it, checkNotNull(binding)) } to mutation
         }
         settleParserMutation(parserMutation, applied = false)
         readyView?.let { target ->
             postToView(target.view) {
+                val view = target.view as WebView
                 if (!ownsReadyView(target.view, target.binding)) return@postToView
                 runCatching {
-                    target.view.evaluateJavascript("window.twReset&&window.twReset('');", null)
+                    view.evaluateJavascript("window.twReset&&window.twReset('');", null)
                 }
             }
         }
@@ -573,7 +630,7 @@ class TerminalWebViewController internal constructor() {
 
     private fun evaluate(script: String) {
         val readyView = synchronized(lock) {
-            val view = ownership.currentView() as? WebView
+            val view = ownership.currentView()
             if (view == null || !isReady) {
                 enqueuePending(script)
                 null
@@ -584,13 +641,14 @@ class TerminalWebViewController internal constructor() {
         }
         readyView?.let { target ->
             postToView(target.view) {
+                val view = target.view as WebView
                 if (!ownsReadyView(target.view, target.binding)) return@postToView
-                runCatching { target.view.evaluateJavascript(script, null) }
+                runCatching { view.evaluateJavascript(script, null) }
             }
         }
     }
 
-    private fun registerParserMutation(
+    internal fun registerParserMutation(
         binding: TerminalWebViewParserBinding,
         callbackId: String,
         script: String,
@@ -609,7 +667,7 @@ class TerminalWebViewController internal constructor() {
             return true
         }
         val view = synchronized(lock) {
-            val readyView = (ownership.view(binding) as? WebView)?.takeIf { isReady }
+            val readyView = ownership.view(binding)?.takeIf { isReady }
                 ?: return false
             if (parserMutation != null) return false
             val timeout = Runnable { failParserMutation(callbackId) }
@@ -619,7 +677,7 @@ class TerminalWebViewController internal constructor() {
         val timeout = synchronized(lock) {
             parserMutation?.takeIf { it.callbackId == callbackId }?.timeout
         } ?: return false
-        if (!parserCallbackHandler.postDelayed(
+        if (!parserCallbackScheduler.postDelayed(
                 timeout,
                 TerminalParserMutationTimeoutPolicy.SUBMISSION_MILLIS,
             )
@@ -643,8 +701,8 @@ class TerminalWebViewController internal constructor() {
             // unattached Android View queue. Terminal assets can finish loading from the local
             // asset loader before Compose attaches the WebView; starting the clock at registration
             // would then let the timeout win before this runnable submitted any JavaScript.
-            parserCallbackHandler.removeCallbacks(timeout)
-            if (!parserCallbackHandler.postDelayed(
+            parserCallbackScheduler.removeCallbacks(timeout)
+            if (!parserCallbackScheduler.postDelayed(
                     timeout,
                     TerminalParserMutationTimeoutPolicy.CALLBACK_MILLIS,
                 )
@@ -656,7 +714,7 @@ class TerminalWebViewController internal constructor() {
             // exact mutation pending until TwBridge ACK, the existing bounded timeout, or a view
             // loss cut that takes and later aborts its false before attachment detach.
             runCatching {
-                view.evaluateJavascript(script) { _ ->
+                (view as WebView).evaluateJavascript(script) { _ ->
                     // Submission result is not the parser ACK. TwBridge or timeout settles it.
                 }
             }
@@ -681,7 +739,7 @@ class TerminalWebViewController internal constructor() {
         applied: Boolean,
     ) {
         mutation ?: return
-        parserCallbackHandler.removeCallbacks(mutation.timeout)
+        parserCallbackScheduler.removeCallbacks(mutation.timeout)
         mutation.completion(applied)
     }
 
@@ -723,14 +781,14 @@ class TerminalWebViewController internal constructor() {
     }
 
     private fun ownsReadyView(
-        view: WebView,
+        view: Any,
         binding: TerminalWebViewParserBinding,
     ): Boolean = synchronized(lock) {
         isReady && ownership.view(binding) === view
     }
 
     private fun currentReadyWebView(): BoundWebView? = synchronized(lock) {
-        val view = (ownership.currentView() as? WebView)?.takeIf { isReady }
+        val view = ownership.currentView()?.takeIf { isReady }
             ?: return@synchronized null
         val binding = ownership.currentBinding(this) ?: return@synchronized null
         BoundWebView(view, binding)
@@ -742,8 +800,8 @@ class TerminalWebViewController internal constructor() {
         }
     }
 
-    private fun postToView(view: WebView, block: () -> Unit): Boolean =
-        runCatching { view.post(block) }.getOrDefault(false)
+    private fun postToView(view: Any, block: () -> Unit): Boolean =
+        runCatching { (view as WebView).post(block) }.getOrDefault(false)
 
     private fun releaseTerminalDrain(
         binding: TerminalWebViewParserBinding,
@@ -771,7 +829,7 @@ class TerminalWebViewController internal constructor() {
         }
         val script = "window.twWrite&&window.twWrite(${JSONObject.quote(output)});"
         val submitted = runCatching {
-            target.view.evaluateJavascript(script) {
+            (target.view as WebView).evaluateJavascript(script) {
                 val drainAgain = synchronized(lock) {
                     if (ownership.view(target.binding) !== target.view ||
                         !isReady ||
@@ -810,19 +868,19 @@ class TerminalWebViewController internal constructor() {
     )
 
     private data class ReadyWebView(
-        val view: WebView,
+        val view: Any,
         val binding: TerminalWebViewParserBinding,
         val scripts: List<String>,
         val outputGeneration: Long?,
     )
 
     private data class BoundWebView(
-        val view: WebView,
+        val view: Any,
         val binding: TerminalWebViewParserBinding,
     )
 
     private data class TerminalDrainTarget(
-        val view: WebView,
+        val view: Any,
         val binding: TerminalWebViewParserBinding,
         val outputGeneration: Long,
     )
