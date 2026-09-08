@@ -35,7 +35,6 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadSta
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateTerminalInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ManualResyncResult
-import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2NetworkHintResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommand
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommandsReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
@@ -746,6 +745,15 @@ internal fun <T> planRelayV2TerminalCloseLineage(
         RelayV2TerminalClosePlanStep(owner, ownsRemoteClose(owner))
     }
 }
+
+/**
+ * Process-wide guard for the single network-hint collector. The imperative
+ * composition.onNetworkAvailable/onNetworkLost hints must survive ViewModel disposal (the
+ * composition lives on the process scope for service-only keep-alive); without a process-scoped
+ * collector, a Service-only process after the UI ViewModel is cleared stops receiving immediate
+ * reconnect acceleration/deceleration and falls back to the bounded silence/backoff ladder.
+ */
+private val relayV2ProcessNetworkHintCollectorStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
 class V2ViewModel(
     private val container: AppContainer,
@@ -4595,6 +4603,7 @@ class V2ViewModel(
             )
         }
         resumeRelayV2PendingCreations(composition)
+        startProcessRelayV2NetworkHintCollection()
         viewModelScope.launch {
             composition.state.collect { runtime ->
                 val connectionFailure =
@@ -4800,29 +4809,42 @@ class V2ViewModel(
             }
         }
         viewModelScope.launch {
+            // UI-scope collector owns only the networkAvailable health projection. The imperative
+            // reconnect hints are driven process-wide by startProcessRelayV2NetworkHintCollection
+            // so they keep reaching the service-living composition after this ViewModel is cleared.
             container.networkMonitor.state.collect { network ->
-                val available = network.available
-                val changed = available != _uiState.value.networkAvailable
-                val networkChanged = available && network.networkHandle != activeNetworkHandle
                 activeNetworkHandle = network.networkHandle
-                _uiState.update { it.copy(networkAvailable = available) }
+                _uiState.update { it.copy(networkAvailable = network.available) }
                 refreshDecoratedHealth()
-                val current = synchronized(relayV2UiFenceLock) {
-                    if (relayV2Composition !== composition ||
-                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
-                    ) null else composition
-                } ?: return@collect
-                if (available) {
-                    if ((changed || networkChanged) && _uiState.value.preferences.autoConnect) {
-                        val hint = current.onNetworkAvailable()
-                        if (hint == RelayV2NetworkHintResult.RECONNECTING) {
-                            _uiState.update { it.copy(isConnecting = true) }
-                        }
-                    }
-                } else if (changed) {
-                    current.onNetworkLost()
-                }
             }
+        }
+    }
+
+    /**
+     * Launches (once per process) a network collector on [RelayV2ConnectionRegistry]'s
+     * process-lifetime scope that forwards network changes to whichever v2 composition is
+     * installed. The composition hints are idempotent and already fence on closed / terminal
+     * failure / reconnectEnabled, so driving them from the process scope is safe and makes
+     * service-only keep-alive accelerate reconnect on network recovery (and decelerate on loss)
+     * even after every UI ViewModel has been cleared.
+     */
+    private fun startProcessRelayV2NetworkHintCollection() {
+        if (!relayV2ProcessNetworkHintCollectorStarted.compareAndSet(false, true)) return
+        RelayV2ConnectionRegistry.scope.launch {
+            var lastAvailable = false
+            combine(
+                RelayV2ConnectionRegistry.composition,
+                container.networkMonitor.state,
+            ) { composition, network -> composition to network }
+                .collect { (composition, network) ->
+                    if (composition == null) return@collect
+                    if (network.available) {
+                        if (!lastAvailable) composition.onNetworkAvailable()
+                    } else {
+                        composition.onNetworkLost()
+                    }
+                    lastAvailable = network.available
+                }
         }
     }
 
