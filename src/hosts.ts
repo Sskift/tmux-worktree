@@ -2,13 +2,17 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -19,6 +23,7 @@ import {
   type HostConfig,
 } from "./config";
 import { RPC_V2_CAPABILITIES } from "./rpcV2";
+import { processExists } from "./state";
 import { CliError } from "./tmux";
 
 const CONFIG_LOCK_PATH = `${CONFIG_PATH}.lock`;
@@ -70,6 +75,7 @@ export interface ConfigFileLock {
 interface ConfigLockOwnerRecord {
   owner: string;
   createdAt: number;
+  pid?: number;
 }
 
 function isObject(value: unknown): value is JsonObject {
@@ -91,7 +97,14 @@ function readConfigLockOwner(lockPath: string): ConfigLockOwnerRecord | undefine
     if (!isObject(parsed) || typeof parsed.owner !== "string" || typeof parsed.createdAt !== "number") {
       return undefined;
     }
-    return { owner: parsed.owner, createdAt: parsed.createdAt };
+    // Legacy records lack pid; the stale check keeps the historical age gate
+    // for them so crash leftovers self-heal as before this lock hardening.
+    if (parsed.pid !== undefined && !Number.isSafeInteger(parsed.pid)) return undefined;
+    return {
+      owner: parsed.owner,
+      createdAt: parsed.createdAt,
+      pid: typeof parsed.pid === "number" ? parsed.pid : undefined,
+    };
   } catch {
     return undefined;
   }
@@ -99,12 +112,53 @@ function readConfigLockOwner(lockPath: string): ConfigLockOwnerRecord | undefine
 
 function configLockIsStale(lockPath: string): boolean {
   const owner = readConfigLockOwner(lockPath);
-  if (owner) return Date.now() - owner.createdAt > CONFIG_LOCK_STALE_MS;
+  if (owner) {
+    if (Date.now() - owner.createdAt <= CONFIG_LOCK_STALE_MS) return false;
+    // New records gate reclaim on the holder pid being dead; legacy pid-less
+    // records (all released versions) retain the age-only self-heal so a
+    // SIGKILL leftover config lock does not wedge every future config writer.
+    if (owner.pid === undefined) return true;
+    return !processExists(owner.pid);
+  }
   try {
     return Date.now() - statSync(lockPath).mtimeMs > CONFIG_LOCK_STALE_MS;
   } catch {
     return false;
   }
+}
+
+function fsyncDirectory(path: string): void {
+  let fd = -1;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } finally {
+    if (fd >= 0) closeSync(fd);
+  }
+}
+
+/**
+ * Quarantine-rename a stale config lock and re-confirm staleness under the new
+ * name before deleting it, mirroring the terminal-control store lock so two
+ * waiters can never both force-remove a live holder's lock.
+ */
+function discardStaleConfigLock(lockPath: string): void {
+  const quarantine = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(lockPath, quarantine);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!configLockIsStale(quarantine)) {
+    try {
+      renameSync(quarantine, lockPath);
+    } catch {
+      throw new CliError("配置写锁在陈旧恢复期间发生变化");
+    }
+    return;
+  }
+  rmSync(quarantine, { recursive: true, force: true });
 }
 
 export function acquireConfigFileLock(lockPath = CONFIG_LOCK_PATH): ConfigFileLock {
@@ -117,7 +171,7 @@ export function acquireConfigFileLock(lockPath = CONFIG_LOCK_PATH): ConfigFileLo
       try {
         writeFileSync(
           lockOwnerPath(lockPath),
-          `${JSON.stringify({ owner, createdAt: Date.now() } satisfies ConfigLockOwnerRecord)}\n`,
+          `${JSON.stringify({ owner, pid: process.pid, createdAt: Date.now() } satisfies ConfigLockOwnerRecord)}\n`,
           { encoding: "utf8", mode: 0o600, flag: "wx" },
         );
       } catch (error) {
@@ -128,7 +182,7 @@ export function acquireConfigFileLock(lockPath = CONFIG_LOCK_PATH): ConfigFileLo
     } catch (error) {
       if (!existsSync(lockPath)) throw error;
       if (configLockIsStale(lockPath)) {
-        rmSync(lockPath, { recursive: true, force: true });
+        discardStaleConfigLock(lockPath);
         continue;
       }
       if (Date.now() >= deadline) {
@@ -218,12 +272,27 @@ function unknownHostFields(value: JsonObject | undefined): JsonObject {
 }
 
 function writeRawConfig(config: JsonObject): void {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+  const directory = dirname(CONFIG_PATH);
+  mkdirSync(directory, { recursive: true });
   const temp = `${CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  let fd = -1;
   try {
-    writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    fd = openSync(temp, "wx", 0o600);
+    const contents = Buffer.from(`${JSON.stringify(config, null, 2)}\n`, "utf8");
+    let offset = 0;
+    while (offset < contents.byteLength) {
+      offset += writeSync(fd, contents, offset, contents.byteLength - offset, offset);
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
     renameSync(temp, CONFIG_PATH);
+    chmodSync(CONFIG_PATH, 0o600);
+    fsyncDirectory(directory);
   } finally {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch {}
+    }
     rmSync(temp, { force: true });
   }
 }

@@ -1,11 +1,15 @@
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -84,6 +88,23 @@ export interface RecordManagedSessionDeps {
 interface ManagedStateLockOwnerRecord {
   owner: string;
   createdAt: number;
+  pid?: number;
+}
+
+/**
+ * Liveness evidence for a same-UID lock holder. Mirrors the gate used by the
+ * feishu/terminal-control/host-state locks: a reachable process (EPERM under a
+ * different uid included) is treated as alive so an age-only check can never
+ * steal a lock from a slow live writer.
+ */
+export function processExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 export function twHomeDir(home = homedir()): string {
@@ -379,16 +400,37 @@ export function loadManagedStateForMutation(path = managedStatePath()): ManagedS
 }
 
 export function saveManagedState(state: ManagedState, path = managedStatePath()): void {
-  mkdirSync(dirname(path), { recursive: true });
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let fd = -1;
   try {
-    writeFileSync(temp, JSON.stringify(normalizeManagedState(state), null, 2) + "\n", {
-      flag: "wx",
-      mode: 0o600,
-    });
+    fd = openSync(temp, "wx", 0o600);
+    const contents = Buffer.from(JSON.stringify(normalizeManagedState(state), null, 2) + "\n", "utf8");
+    let offset = 0;
+    while (offset < contents.byteLength) {
+      offset += writeSync(fd, contents, offset, contents.byteLength - offset, offset);
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
     renameSync(temp, path);
+    fsyncDirectory(directory);
   } finally {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch {}
+    }
     rmSync(temp, { force: true });
+  }
+}
+
+function fsyncDirectory(path: string): void {
+  let fd = -1;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } finally {
+    if (fd >= 0) closeSync(fd);
   }
 }
 
@@ -419,7 +461,12 @@ function readManagedStateLockOwner(lockPath: string): ManagedStateLockOwnerRecor
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const record = parsed as Record<string, unknown>;
     if (typeof record.owner !== "string" || typeof record.createdAt !== "number") return undefined;
-    return { owner: record.owner, createdAt: record.createdAt };
+    if (record.pid !== undefined && !Number.isSafeInteger(record.pid)) return undefined;
+    return {
+      owner: record.owner,
+      createdAt: record.createdAt,
+      pid: typeof record.pid === "number" ? record.pid : undefined,
+    };
   } catch {
     return undefined;
   }
@@ -427,12 +474,45 @@ function readManagedStateLockOwner(lockPath: string): ManagedStateLockOwnerRecor
 
 function managedStateLockIsStale(lockPath: string): boolean {
   const owner = readManagedStateLockOwner(lockPath);
-  if (owner) return Date.now() - owner.createdAt > MANAGED_STATE_LOCK_STALE_MS;
+  if (owner) {
+    if (Date.now() - owner.createdAt <= MANAGED_STATE_LOCK_STALE_MS) return false;
+    // New-format records carry the holder pid: a live pid (including a reused
+    // one) blocks reclaim. Legacy records written by every released version
+    // lack pid; they keep the historical createdAt age gate so a SIGKILL or
+    // power-loss leftover lock still self-heals after 60s rather than wedging
+    // all later writers until the lock dir is removed by hand.
+    if (owner.pid === undefined) return true;
+    return !processExists(owner.pid);
+  }
   try {
     return Date.now() - statSync(lockPath).mtimeMs > MANAGED_STATE_LOCK_STALE_MS;
   } catch {
     return false;
   }
+}
+
+/**
+ * Quarantine-rename a stale lock and re-confirm staleness under the new name
+ * before deleting it. A live holder that re-creates its owner record forces a
+ * rename-back and a retryable failure instead of two writers sharing the lock.
+ */
+function discardStaleManagedStateLock(lockPath: string): void {
+  const quarantine = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(lockPath, quarantine);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!managedStateLockIsStale(quarantine)) {
+    try {
+      renameSync(quarantine, lockPath);
+    } catch {
+      throw new Error("managed state lock changed while stale recovery was being claimed");
+    }
+    return;
+  }
+  rmSync(quarantine, { recursive: true, force: true });
 }
 
 export function acquireManagedStateLock(lockPath = `${managedStatePath()}.lock`): ManagedStateLock {
@@ -445,7 +525,7 @@ export function acquireManagedStateLock(lockPath = `${managedStatePath()}.lock`)
       try {
         writeFileSync(
           managedStateLockOwnerPath(lockPath),
-          `${JSON.stringify({ owner, createdAt: Date.now() } satisfies ManagedStateLockOwnerRecord)}\n`,
+          `${JSON.stringify({ owner, pid: process.pid, createdAt: Date.now() } satisfies ManagedStateLockOwnerRecord)}\n`,
           { encoding: "utf8", flag: "wx", mode: 0o600 },
         );
       } catch (error) {
@@ -456,7 +536,7 @@ export function acquireManagedStateLock(lockPath = `${managedStatePath()}.lock`)
     } catch (error) {
       if (!existsSync(lockPath)) throw error;
       if (managedStateLockIsStale(lockPath)) {
-        rmSync(lockPath, { recursive: true, force: true });
+        discardStaleManagedStateLock(lockPath);
         continue;
       }
       if (Date.now() >= deadline) {

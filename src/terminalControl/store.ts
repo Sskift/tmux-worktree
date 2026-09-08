@@ -16,6 +16,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { createConnection } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type {
@@ -446,6 +447,87 @@ function processExists(pid: number): boolean {
 }
 
 /**
+ * The server lock directory is always created as `${socketPath}.server.lock`,
+ * including under the quarantine rename (`${socketPath}.server.lock.stale-…`),
+ * so the live daemon's socket path is recoverable from the lock path alone.
+ * Returns undefined for the state lock / relay-upgrade lock.
+ */
+function serverSocketPathForLock(lockPath: string): string | undefined {
+  const marker = ".server.lock";
+  const index = lockPath.lastIndexOf(marker);
+  if (index <= 0) return undefined;
+  return lockPath.slice(0, index);
+}
+
+/**
+ * discardStaleLock re-runs the stale check under the quarantine name
+ * (`${lockPath}.stale-<pid>-<uuid>`). Strip that suffix before deriving the
+ * associated daemon socket, otherwise the re-confirmation falls back to the
+ * pid gate and — when the dead daemon's pid was reused — renames the lock back
+ * forever, looping the acquirer past its deadline.
+ */
+function canonicalLockPathForStaleCheck(lockPath: string): string {
+  const marker = ".stale-";
+  const index = lockPath.lastIndexOf(marker);
+  if (index > 0) return lockPath.slice(0, index);
+  return lockPath;
+}
+
+/**
+ * Authoritative daemon socket for a store lock, when one is derivable.
+ *
+ * - The server lock (held for the daemon's whole lifetime) derives its socket
+ *   path from the lock path itself.
+ * - The default state lock (`${terminalControlStatePath()}.lock`, held per
+ *   operation — including across a ~45s cold-resume agent-message) belongs to
+ *   the same daemon, whose canonical socket is terminalControlSocketPath().
+ *   The probe is restricted to that default path: a custom
+ *   TW_TERMINAL_CONTROL_STATE (ephemeral/test harnesses) may pair with a
+ *   different socket, so those locks keep the pid gate.
+ * - The relay-upgrade lock and any other path have no derivable socket.
+ */
+function daemonSocketPathForLock(lockPath: string): string | undefined {
+  const canonical = canonicalLockPathForStaleCheck(lockPath);
+  const serverSocket = serverSocketPathForLock(canonical);
+  if (serverSocket !== undefined) return serverSocket;
+  if (canonical === `${terminalControlStatePath()}.lock`) {
+    return terminalControlSocketPath();
+  }
+  return undefined;
+}
+
+type SocketLiveness = "live" | "dead" | "uncertain";
+
+/**
+ * Probe a daemon socket: `dead` means the OS confirmed nothing is listening
+ * (ECONNREFUSED/ENOENT) and the lock is reclaimable; `live` means a daemon
+ * answered; `uncertain` (a 250ms timeout or any other error) must be treated as
+ * alive so a wedged-but-running daemon is never forcibly unlocked, which would
+ * let two authorities race the whole-state read/modify/write.
+ */
+function probeServerSocket(socketPath: string): Promise<SocketLiveness> {
+  return new Promise((resolve) => {
+    const socket = createConnection(socketPath);
+    let settled = false;
+    const done = (result: SocketLiveness): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+    const timer = setTimeout(() => done("uncertain"), 250);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      done("live");
+    });
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      done(error.code === "ECONNREFUSED" || error.code === "ENOENT" ? "dead" : "uncertain");
+    });
+  });
+}
+
+/**
  * Returns the live same-user process recorded by a store lock without ever
  * following a replacement owner-file symlink. This is deliberately narrower
  * than exposing the lock record: callers may use it only as process-liveness
@@ -497,17 +579,51 @@ export function terminalControlStoreLockOwnerProcessId(path: string): number | u
   }
 }
 
-function lockIsStale(path: string): boolean {
+async function lockIsStale(path: string): Promise<boolean> {
   const owner = readLockOwner(path);
-  if (owner) return Date.now() - owner.createdAt > LOCK_STALE_MS && !processExists(owner.pid);
+  const ageExpired = Date.now() - (owner?.createdAt ?? 0) > LOCK_STALE_MS;
+  if (owner) {
+    if (!ageExpired) return false;
+    // The server lock is held for the daemon's whole lifetime and the default
+    // state lock is held per operation — across a ~45s cold-resume
+    // agent-message — by that same daemon. After a SIGKILL (cleanup never
+    // runs) either lock can linger while its recorded pid is reused by an
+    // unrelated same-uid process, which keeps a pid-only liveness check
+    // claiming the owner is alive forever. The authoritative liveness evidence
+    // is the daemon socket: only a confirmed-dead socket lets the lock be
+    // reclaimed, while an answering daemon or a 250ms timeout keeps it (a
+    // reclaim against a live daemon would let two authorities race the
+    // whole-state read/modify/write). During initializeContinuity the new
+    // daemon holds the server lock but is not listening yet, so a live probe
+    // can only be a different process, which will itself fail at the server
+    // lock's "already running" check. Locks whose daemon socket cannot be
+    // derived (custom state path / relay upgrade) keep the pid gate.
+    const socketPath = daemonSocketPathForLock(path);
+    if (socketPath !== undefined) {
+      const liveness = await probeServerSocket(socketPath);
+      return liveness === "dead";
+    }
+    return !processExists(owner.pid);
+  }
+  // No owner record (never fully created or an orphan): the mtime age gate is
+  // the only signal, but still never reclaim a lock whose daemon is answering
+  // or merely uncertain.
+  let mtimeStale = false;
   try {
-    return Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS;
+    mtimeStale = Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS;
   } catch {
     return false;
   }
+  if (!mtimeStale) return false;
+  const socketPath = daemonSocketPathForLock(path);
+  if (socketPath !== undefined) {
+    const liveness = await probeServerSocket(socketPath);
+    return liveness === "dead";
+  }
+  return true;
 }
 
-function discardStaleLock(path: string): void {
+async function discardStaleLock(path: string): Promise<void> {
   const quarantine = `${path}.stale-${process.pid}-${randomUUID()}`;
   try {
     renameSync(path, quarantine);
@@ -515,7 +631,7 @@ function discardStaleLock(path: string): void {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (!lockIsStale(quarantine)) {
+  if (!(await lockIsStale(quarantine))) {
     try {
       renameSync(quarantine, path);
     } catch {
@@ -559,16 +675,16 @@ export async function acquireTerminalControlStoreLock(
       return lock;
     } catch (error) {
       if (!existsSync(lockPath)) throw error;
-      if (lockIsStale(lockPath)) {
-        discardStaleLock(lockPath);
-        continue;
-      }
       if (Date.now() >= deadline) {
         throw new TerminalControlProtocolError(
           "RESOURCE_EXHAUSTED",
           `timed out waiting for terminal-control state lock: ${lockPath}`,
           true,
         );
+      }
+      if (await lockIsStale(lockPath)) {
+        await discardStaleLock(lockPath);
+        continue;
       }
       await delay(25);
     }
