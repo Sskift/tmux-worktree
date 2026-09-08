@@ -24,6 +24,26 @@ const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
 // as a dead child. Timeout cleanup below still closes stdin and fails closed.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+// Network-borne steady-state operations (host credential refresh, enrollment
+// creation against the broker WSS, connector start, host bootstrap) make the
+// same cross-network round trips a fresh durable cut does: the startup
+// deadline above already admits a 30s SSH/GSSAPI probe budget. Give those
+// operations a matching bounded budget instead of treating a slow-but-healthy
+// child as a protocol violation. Status/stop stay on the short budget.
+const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Once a response read exceeds its deadline the request itself is failed, but
+// a healthy child that is simply slow is not killed out of hand: close stdin
+// and give it the same bounded clean-close drain the disposal path uses. Only
+// a child that cannot exit within that independent budget is killed, matching
+// cleanup_timed_out_start and keeping the supervisor from restarting a child
+// that still owns a live native credential claim.
+const OPERATION_TIMEOUT_CLOSE_BUDGET: Duration = CLEAN_CLOSE_TIMEOUT;
+// A complete, request-id-correlated frame arriving just after the operation
+// deadline is still the correct response. Give the reader a bounded grace
+// window to drain it before declaring the request timed out. recv_until
+// returns an already-buffered frame immediately, so this only bounds the extra
+// wait on a genuinely stalled child.
+const RESPONSE_READ_GRACE: Duration = Duration::from_millis(500);
 // The Node Host owns a bounded five-second WSS drain before it can close the
 // native credential cell and remove its exact admission claim. Keep the
 // supervisor deadline strictly outside that owner deadline so ordinary
@@ -1530,6 +1550,29 @@ struct ManagerInner {
     lifecycle: LifecycleBarrier,
     supervisor_stop: AtomicBool,
     operation_timeout: Duration,
+    network_operation_timeout: Duration,
+}
+
+fn operation_uses_network_budget(operation: ManagementOperation) -> bool {
+    matches!(
+        operation,
+        ManagementOperation::BootstrapHost
+            | ManagementOperation::RefreshHost
+            | ManagementOperation::StartConnector
+            | ManagementOperation::CreateEnrollment
+    )
+}
+
+fn operation_timeout_for(
+    base: Duration,
+    network: Duration,
+    operation: ManagementOperation,
+) -> Duration {
+    if operation_uses_network_budget(operation) {
+        network
+    } else {
+        base
+    }
 }
 
 struct InFlightGuard<'a>(&'a AtomicBool);
@@ -1544,7 +1587,6 @@ impl ManagementChildManager {
     pub(crate) fn start(app: &tauri::AppHandle) -> Result<Self, ManagementStartError> {
         Self::start_selected(app, ManagementChildSelection::DefaultProduction)
     }
-
     pub(crate) fn start_selected(
         app: &tauri::AppHandle,
         selection: ManagementChildSelection,
@@ -1560,6 +1602,7 @@ impl ManagementChildManager {
             env!("CARGO_PKG_VERSION"),
             STARTUP_TIMEOUT,
             OPERATION_TIMEOUT,
+            NETWORK_OPERATION_TIMEOUT,
         )
     }
 
@@ -1585,6 +1628,7 @@ impl ManagementChildManager {
             "1.2.3",
             Duration::from_secs(2),
             Duration::from_secs(2),
+            Duration::from_secs(30),
         )
     }
 
@@ -1595,6 +1639,7 @@ impl ManagementChildManager {
         expected_version: &str,
         startup_timeout: Duration,
         operation_timeout: Duration,
+        network_operation_timeout: Duration,
     ) -> Result<Self, ManagementStartError> {
         let deadline = Instant::now() + startup_timeout;
         let child = spawn_before_deadline(factory, artifact.clone(), deadline)?;
@@ -1626,6 +1671,7 @@ impl ManagementChildManager {
             lifecycle: LifecycleBarrier::ready(),
             supervisor_stop: AtomicBool::new(false),
             operation_timeout,
+            network_operation_timeout,
         });
         let weak = Arc::downgrade(&inner);
         let supervisor = match thread::Builder::new()
@@ -1714,9 +1760,15 @@ impl ManagementChildManager {
             ManagementCallError::ChannelClosed
         })?;
 
-        // This is the only operation deadline. It begins immediately before
-        // the sole stdin write attempt and is never reset.
-        let deadline = Instant::now() + self.inner.operation_timeout;
+        // This is the operation deadline. It begins immediately before the
+        // sole stdin write attempt and is never reset. Network-borne
+        // operations get the longer budget; status/stop stay short.
+        let deadline = Instant::now()
+            + operation_timeout_for(
+                self.inner.operation_timeout,
+                self.inner.network_operation_timeout,
+                operation,
+            );
         match self.inner.child.write_stdin_once(&frame, deadline) {
             ChildWrite::Written(written) if written == frame.len() => {}
             ChildWrite::Written(_) | ChildWrite::TimedOut | ChildWrite::Failed => {
@@ -1729,10 +1781,24 @@ impl ManagementChildManager {
             return Ok(channel_closed_outcome(request_id));
         }
 
-        let payload = match read_frame(self.inner.child.as_ref(), deadline) {
+        // The response read gets a short independent grace budget past the
+        // operation deadline: a complete frame that was already buffered (or
+        // arrives just over the line) is correlated by request id + operation
+        // in decode_response, so accepting it cannot misalign with another
+        // request — the in-flight fence admits only one request at a time.
+        let read_deadline = deadline + RESPONSE_READ_GRACE;
+        let payload = match read_frame(self.inner.child.as_ref(), read_deadline) {
             Ok(payload) => payload,
             Err(FrameFailure::Exited(exit)) => {
                 let kind = self.inner.classify_post_handshake_exit(exit);
+                return Ok(local_terminal_outcome(request_id, kind));
+            }
+            Err(FrameFailure::TimedOut) => {
+                // A missed response deadline is a transport timeout, not a
+                // protocol violation. Drain the child gracefully so a slow but
+                // healthy child exits cleanly and can be replaced; only a child
+                // that ignores the close budget is killed and latched.
+                let kind = self.inner.terminalize_after_timed_out_response();
                 return Ok(local_terminal_outcome(request_id, kind));
             }
             Err(_) => {
@@ -1741,13 +1807,13 @@ impl ManagementChildManager {
             }
         };
         let response = match decode_response(&payload, &request_id, operation) {
-            Ok(response) if Instant::now() < deadline => response,
-            _ => {
+            Ok(response) => response,
+            Err(()) => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
                 return Ok(channel_closed_outcome(request_id));
             }
         };
-        match self.inner.child.poll_after_response(deadline) {
+        match self.inner.child.poll_after_response(read_deadline) {
             ChildPoll::Output | ChildPoll::Failed => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
                 return Ok(channel_closed_outcome(request_id));
@@ -1819,6 +1885,52 @@ impl ManagerInner {
                 ManagementCleanupOutcome::Clean
             },
         )
+    }
+
+    /// Drain a child whose response simply never arrived in time. The caller
+    /// is the in-flight request and already holds the observation barrier, so
+    /// this never re-locks it. A slow-but-healthy child owns a live native
+    /// credential claim: close stdin and give it the same independent
+    /// clean-close budget the disposal path uses. Exit code 0/SUPERSEDED drains
+    /// cleanly and the child can be replaced without operator recovery; only a
+    /// child that ignores the close budget is killed and latched.
+    fn terminalize_after_timed_out_response(&self) -> LifecycleKind {
+        {
+            let mut state = self.lifecycle.state.lock().unwrap();
+            if state.kind == LifecycleKind::Ready {
+                state.kind = LifecycleKind::Poisoned;
+            }
+            if state.reaped {
+                return state.kind;
+            }
+            self.lifecycle.changed.notify_all();
+            while state.reaping && !state.reaped {
+                state = self.lifecycle.changed.wait(state).unwrap();
+            }
+            if state.reaped {
+                return state.kind;
+            }
+            state.reaping = true;
+        }
+        self.child.close_stdin();
+        let deadline = Instant::now() + OPERATION_TIMEOUT_CLOSE_BUDGET;
+        let cleanup = match self.child.wait_until(deadline) {
+            Some(exit) if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) => {
+                self.child.wait_and_reap();
+                ManagementCleanupOutcome::Clean
+            }
+            Some(_) | None => {
+                self.child.kill_if_live();
+                self.child.wait_and_reap();
+                ManagementCleanupOutcome::RecoveryRequired
+            }
+        };
+        let mut state = self.lifecycle.state.lock().unwrap();
+        state.reaping = false;
+        state.reaped = true;
+        state.cleanup = Some(cleanup);
+        self.lifecycle.changed.notify_all();
+        LifecycleKind::Poisoned
     }
 
     fn terminalize_with_cleanup(
@@ -2615,6 +2727,15 @@ mod tests {
         script: impl Into<String>,
         ids: Vec<[u8; 16]>,
     ) -> Result<ManagementChildManager, ManagementStartError> {
+        start_script_with_operation_timeout(script, ids, Duration::from_secs(2))
+    }
+
+    #[cfg(unix)]
+    fn start_script_with_operation_timeout(
+        script: impl Into<String>,
+        ids: Vec<[u8; 16]>,
+        operation_timeout: Duration,
+    ) -> Result<ManagementChildManager, ManagementStartError> {
         ManagementChildManager::start_with_factory(
             artifact(),
             Arc::new(ScriptFactory {
@@ -2623,7 +2744,8 @@ mod tests {
             Arc::new(FixedIds(Mutex::new(ids.into()))),
             "1.2.3",
             Duration::from_secs(2),
-            Duration::from_secs(2),
+            operation_timeout,
+            Duration::from_secs(30),
         )
     }
 
@@ -2729,6 +2851,7 @@ mod tests {
             expected_version,
             Duration::from_millis(100),
             Duration::from_millis(100),
+            Duration::from_millis(100),
         )
         .expect("start fake management child")
     }
@@ -2740,6 +2863,24 @@ mod tests {
         startup_timeout: Duration,
         operation_timeout: Duration,
     ) -> ManagementChildManager {
+        start_fake_with_network_timeout(
+            child,
+            ids,
+            expected_version,
+            startup_timeout,
+            operation_timeout,
+            operation_timeout,
+        )
+    }
+
+    fn start_fake_with_network_timeout(
+        child: Arc<FakeChild>,
+        ids: Vec<[u8; 16]>,
+        expected_version: &str,
+        startup_timeout: Duration,
+        operation_timeout: Duration,
+        network_operation_timeout: Duration,
+    ) -> ManagementChildManager {
         ManagementChildManager::start_with_factory(
             artifact(),
             FakeFactory::new(child, FakeSpawnAction::Ready),
@@ -2747,6 +2888,7 @@ mod tests {
             expected_version,
             startup_timeout,
             operation_timeout,
+            network_operation_timeout,
         )
         .expect("start fake management child")
     }
@@ -2972,6 +3114,7 @@ mod tests {
                 version,
                 Duration::from_millis(100),
                 Duration::from_millis(100),
+                Duration::from_millis(100),
             );
             assert_eq!(
                 result.err(),
@@ -3122,6 +3265,7 @@ mod tests {
             "1.2.3",
             Duration::from_millis(10),
             Duration::from_millis(100),
+            Duration::from_millis(100),
         );
 
         assert_eq!(result.err(), Some(ManagementStartError::RecoveryRequired));
@@ -3144,6 +3288,7 @@ mod tests {
                 Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
                 "1.2.3",
                 Duration::ZERO,
+                Duration::from_millis(100),
                 Duration::from_millis(100),
             );
             sent.send(result.err()).unwrap();
@@ -3169,6 +3314,7 @@ mod tests {
             FakeFactory::new(child.clone(), FakeSpawnAction::FailedAfterChild),
             Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
             "1.2.3",
+            Duration::from_millis(100),
             Duration::from_millis(100),
             Duration::from_millis(100),
         );
@@ -3413,6 +3559,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn late_buffered_correct_frame_is_accepted_within_read_grace() {
+        let fixture = fixture();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "status")
+            .unwrap();
+        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        // Queue only the ready frame; the response frame is pushed 60ms after
+        // the request, which is past the 10ms operation deadline but inside the
+        // bounded response-read grace. The frame is fully buffered and matches
+        // request id + operation, so it must be accepted rather than poisoning
+        // a slow-but-healthy child.
+        let child = FakeChild::ready_then(version, Vec::new());
+        let response: Vec<u8> = exchange["responseFrame"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let pusher = child.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            pusher.push_read(1, ChildRead::Bytes(response));
+        });
+        let manager = start_fake_with_network_timeout(
+            child.clone(),
+            vec![id_bytes(request_id)],
+            version,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let outcome = manager.request(ManagementOperation::Status).unwrap();
+        assert!(
+            outcome.ok,
+            "late buffered correct frame accepted: {outcome:?}"
+        );
+        assert_eq!(child.state.lock().unwrap().events, ["write"]);
+    }
+
+    #[test]
+    fn network_budget_lets_a_slow_connector_start_succeed_without_poisoning() {
+        let fixture = fixture();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "start_connector")
+            .unwrap();
+        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+        let id = [25u8; 16];
+        let expected_request_id = format!(
+            "{}{}",
+            management_protocol_v2::REQUEST_ID_PREFIX,
+            URL_SAFE_NO_PAD.encode(id)
+        );
+        let mut response: Value =
+            serde_json::from_str(exchange["responseFrame"].as_str().unwrap()).unwrap();
+        response["requestId"] = Value::String(expected_request_id);
+        response["result"]["hostCredential"]["expiresAtMs"] =
+            Value::Number(serde_json::Number::from(8_000_000_000_000_u64));
+        let mut frame = serde_json::to_vec(&response).unwrap();
+        frame.push(b'\n');
+
+        let child = FakeChild::ready_then(version, Vec::new());
+        let pusher = child.clone();
+        thread::spawn(move || {
+            // ~60ms RTT: far past the 10ms base budget but well within the
+            // 2s network budget granted to start_connector.
+            thread::sleep(Duration::from_millis(60));
+            pusher.push_read(1, ChildRead::Bytes(frame));
+        });
+        let manager = start_fake_with_network_timeout(
+            child.clone(),
+            vec![id],
+            version,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+        let outcome = manager
+            .request(ManagementOperation::StartConnector)
+            .expect("slow start_connector returns");
+        assert!(outcome.ok, "network-budget slow op succeeds: {outcome:?}");
+        assert_eq!(child.state.lock().unwrap().events, ["write"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn idle_exit_78_is_supervised_without_waiting_for_another_request() {
@@ -3518,7 +3754,7 @@ mod tests {
     }
 
     #[test]
-    fn blocking_response_read_uses_the_same_owner_deadline() {
+    fn blocking_response_read_drains_gracefully_instead_of_killing_the_child() {
         let child = FakeChild::ready_then("1.2.3", Vec::new());
         let manager = start_fake_with_timeouts(
             child.clone(),
@@ -3529,10 +3765,13 @@ mod tests {
         );
         let outcome = manager.request(ManagementOperation::Status).unwrap();
         assert_eq!(outcome.error.unwrap().code, "CHANNEL_CLOSED");
+        // A slow-but-healthy child is closed and drained, not SIGKILLed, so a
+        // replacement can take over without latching operator recovery.
         assert_eq!(
             child.state.lock().unwrap().events,
-            ["write", "kill-if-live", "wait-and-reap"]
+            ["write", "close-stdin", "wait-and-reap"]
         );
+        assert_eq!(manager.dispose(), ManagementCleanupOutcome::Clean);
     }
 
     #[cfg(unix)]
