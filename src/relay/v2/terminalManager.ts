@@ -1986,6 +1986,24 @@ export class RelayV2TerminalManager {
           stream.status = "detached";
           stream.detachedUntil = this.now() + this.limits.detachedLeaseMs;
           stream.lastUsedAt = this.now();
+          // No route is bound to consume this stream's output anymore. Park the
+          // read pump for the detached lease: a retained stream otherwise keeps
+          // tailing the exact-control daemon every ~25ms with no reader. Dozens
+          // of disconnected clients each running such a pump continuously hold
+          // the daemon's single store lock through tmux captures, starving the
+          // prepare/observe lock that every NEW terminal.open needs and wedging
+          // the terminal serializer for the host's life. The observation/ring
+          // stay intact for seamless resume; bindOpened re-arms the pump once
+          // the stream is live+bound again, and sweepInternal closes it at the
+          // end of the detached lease.
+          if (stream.backend && !stream.backendPaused) {
+            try {
+              await stream.backend.pause();
+              stream.backendPaused = true;
+            } catch {
+              stream.pauseFailed = true;
+            }
+          }
         }
       }
       await this.refreshBackpressure();
@@ -4614,6 +4632,19 @@ export class RelayV2TerminalManager {
       },
     }));
     await this.pump(stream);
+    // The stream is live and route-bound again: re-arm a read pump parked while
+    // detached (see unbind()). refreshBackpressure() only resumes a live+bound
+    // stream, but resume() explicitly un-parks the byte-plane pump so a seamless
+    // resume streams output immediately instead of waiting on a pressure flip.
+    if (stream.backend && stream.backendPaused && !this.hostPressure) {
+      try {
+        await stream.backend.resume();
+        stream.backendPaused = false;
+        stream.pauseFailed = false;
+      } catch {
+        stream.pauseFailed = true;
+      }
+    }
     await this.refreshBackpressure();
   }
 
@@ -5818,10 +5849,18 @@ export class RelayV2TerminalManager {
     const streamLowWater = Math.floor(this.limits.streamRingBytes * 3 / 4);
     for (const stream of this.streams.values()) {
       if (!stream.backend || stream.status === "closed" || stream.status === "lost") continue;
+      // A detached stream has no bound route to deliver output to. Its read
+      // pump was deliberately parked on detach (see unbind()); resuming it
+      // here would restart a per-stream tail loop that only floods the exact
+      // control daemon with no consumer. Backpressure may still pause a live
+      // stream, but only a live, route-bound stream is ever auto-resumed —
+      // bindOpened re-arms a resumed stream after it is live+bound.
+      const canDrain = stream.status === "live" && stream.binding !== undefined;
       const streamPressure = stream.backendPaused
         ? stream.ring.length > streamLowWater
         : stream.ring.length >= this.limits.streamRingBytes;
       const shouldPause = this.hostPressure || streamPressure;
+      if (!shouldPause && !canDrain) continue;
       if (shouldPause === stream.backendPaused) continue;
       if (shouldPause) {
         try {
