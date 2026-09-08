@@ -2929,6 +2929,62 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `concurrent Forget taps serialize and both observe the confirmed removal`() =
+        runBlocking {
+            val harness = Harness()
+            val active = (harness.repository.confirmEnrollment(
+                enrollmentDraft().confirm(deviceLabel = "Pixel"),
+            ) as RelayV2EnrollmentResult.Activated).profile
+            harness.events.clear()
+
+            // Gate the network so the first Forget is parked holding the activation lease after
+            // its durable handoff (journal = MAY_HAVE_COMMITTED). This is exactly the moment a
+            // second Forget tap arrives. Without a lease the two coroutines overlap: the second
+            // raced through prepare/handoff, and when the winner then committed it re-asserted a
+            // quarantine over the cleared profile or surfaced "journal disappeared".
+            harness.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.Confirmed(
+                    grantId = "grant-1",
+                    revokedAtMs = 6_000,
+                    alreadyRevoked = false,
+                )
+            val gate = harness.exchange.deferSelfRevoke()
+
+            val first = async(Dispatchers.Unconfined, CoroutineStart.DEFAULT) {
+                harness.repository.selfRevokeActiveProfile()
+            }
+            withTimeout(2_000) { gate.started.await() }
+
+            // Launched while the first is mid-flight behind the gate. It waits for the lease.
+            val second = async(Dispatchers.Unconfined, CoroutineStart.DEFAULT) {
+                harness.repository.selfRevokeActiveProfile()
+            }
+            // Give the second coroutine a chance to (wrongly) grab the lease; with the fix it must
+            // be blocked on the activation mutex rather than sending its own revoke.
+            yield()
+            assertEquals(1, harness.exchange.selfRevokeCalls)
+
+            gate.release.complete(Unit)
+            val firstResult = first.await()
+            val secondResult = second.await()
+
+            // Exactly one revoke hit the wire and both Forget taps converge to ProfileRemoved, so
+            // neither tap can re-assert a quarantine over the cleared enrollment UI.
+            assertEquals(1, harness.exchange.selfRevokeCalls)
+            assertEquals(RelayV2SelfRevokeResult.ProfileRemoved, firstResult)
+            assertEquals(RelayV2SelfRevokeResult.ProfileRemoved, secondResult)
+            assertEquals(null, harness.profiles.activeV2)
+            assertEquals(null, harness.profiles.readSelfRevokeJournal())
+            assertEquals(null, harness.credentials.read(active.credentialReference))
+
+            harness.restartRepository()
+            assertEquals(
+                RelayV2StartupAdmissionResult.NoActiveProfile,
+                harness.repository.admitStartup(),
+            )
+        }
+
+    @Test
     fun `trusted broker revoke close removes only the exact active profile without HTTP retry`() =
         runBlocking {
             val harness = Harness()
@@ -3651,6 +3707,13 @@ class RelayV2ProfileRepositoryTest {
                 alreadyRevoked = false,
             )
         var failSelfRevokeBeforeHandoff = false
+        private var deferredSelfRevoke: SuspensionGate? = null
+
+        fun deferSelfRevoke(): SuspensionGate = SuspensionGate().also {
+            check(deferredSelfRevoke == null) { "A deferred self-revoke gate is already armed" }
+            deferredSelfRevoke = it
+        }
+
         private var nowMs = 0L
         private val deferredRedeems = linkedMapOf<String, DeferredRedeem>()
         private var deferredRefresh: DeferredRefresh? = null
@@ -3740,6 +3803,10 @@ class RelayV2ProfileRepositoryTest {
             }
             onPreparedForNetworkHandoff()
             events += "revoke:handoff"
+            deferredSelfRevoke?.let { gate ->
+                gate.started.complete(Unit)
+                gate.release.await()
+            }
             return selfRevokeResult
         }
 
