@@ -2816,6 +2816,119 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `second Forget resends idempotent revoke for may-have-committed quarantine`() =
+        runBlocking {
+            suspend fun activate(harness: Harness): RelayV2Profile =
+                (harness.repository.confirmEnrollment(
+                    enrollmentDraft().confirm(deviceLabel = "Pixel"),
+                ) as RelayV2EnrollmentResult.Activated).profile
+
+            // Acknowledge loss leaves a MAY_HAVE_COMMITTED journal; cold start stays
+            // network-free and quarantined, but the server treats a repeated revoke as
+            // idempotent (alreadyRevoked -> 200 Confirmed), so the confirmed second Forget
+            // is the in-app exit without reinstalling.
+            val harness = Harness()
+            val active = activate(harness)
+            harness.events.clear()
+            harness.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                ),
+                harness.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(1, harness.exchange.selfRevokeCalls)
+            assertEquals(
+                RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                harness.profiles.readSelfRevokeJournal()?.phase,
+            )
+            harness.restartRepository()
+            val callsAfterRestart = harness.exchange.selfRevokeCalls
+            assertEquals(
+                RelayV2StartupAdmissionResult.SelfRevokeQuarantined(
+                    active,
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                ),
+                harness.repository.admitStartup(),
+            )
+            assertEquals(callsAfterRestart, harness.exchange.selfRevokeCalls)
+
+            // Server now answers the duplicate revoke as an already-revoked success.
+            harness.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.Confirmed(
+                    grantId = "grant-1",
+                    revokedAtMs = 5_000,
+                    alreadyRevoked = true,
+                )
+            assertEquals(
+                RelayV2SelfRevokeResult.ProfileRemoved,
+                harness.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(2, harness.exchange.selfRevokeCalls)
+            assertEquals(null, harness.profiles.activeV2)
+            assertEquals(null, harness.profiles.readSelfRevokeJournal())
+            assertEquals(null, harness.credentials.read(active.credentialReference))
+            harness.restartRepository()
+            assertEquals(
+                RelayV2StartupAdmissionResult.NoActiveProfile,
+                harness.repository.admitStartup(),
+            )
+
+            // Another ambiguous attempt keeps the quarantine fail-closed and retryable:
+            // the journal remains MAY_HAVE_COMMITTED for the next confirmed Forget.
+            val ambiguous = Harness()
+            val ambiguousProfile = activate(ambiguous)
+            ambiguous.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                ),
+                ambiguous.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(1, ambiguous.exchange.selfRevokeCalls)
+            ambiguous.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                ),
+                ambiguous.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(2, ambiguous.exchange.selfRevokeCalls)
+            assertEquals(ambiguousProfile, ambiguous.profiles.activeV2)
+            assertEquals(
+                RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                ambiguous.profiles.readSelfRevokeJournal()?.phase,
+            )
+
+            // REJECTED means the server answered 403 FORBIDDEN; no answer can clear it,
+            // so a second Forget must stay fail-closed and never resend anything.
+            val rejected = Harness()
+            val rejectedProfile = activate(rejected)
+            rejected.exchange.selfRevokeResult =
+                RelayV2SelfRevokeExchangeResult.Rejected(
+                    RelayV2SelfRevokeFailureCode.FORBIDDEN,
+                )
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.REJECTED),
+                rejected.repository.selfRevokeActiveProfile(),
+            )
+            val rejectedCalls = rejected.exchange.selfRevokeCalls
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.REJECTED),
+                rejected.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(rejectedCalls, rejected.exchange.selfRevokeCalls)
+            assertEquals(rejectedProfile, rejected.profiles.activeV2)
+            assertEquals(
+                RelayV2SelfRevokePhase.REJECTED,
+                rejected.profiles.readSelfRevokeJournal()?.phase,
+            )
+        }
+
+    @Test
     fun `trusted broker revoke close removes only the exact active profile without HTTP retry`() =
         runBlocking {
             val harness = Harness()

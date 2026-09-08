@@ -963,12 +963,22 @@ internal class RelayV2ProfileRepository(
         }
         check(journal.matches(profile)) { "Self-revoke journal profile changed" }
         when (journal.phase) {
-            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
-            RelayV2SelfRevokePhase.REJECTED,
-            -> return RelayV2SelfRevokeResult.Quarantined(journal.phase)
+            // REJECTED means the server was reached and answered 403 FORBIDDEN: the token can
+            // never authenticate again, so there is no server answer that could clear the
+            // quarantine. Stay fail-closed.
+            RelayV2SelfRevokePhase.REJECTED ->
+                return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.REJECTED)
             RelayV2SelfRevokePhase.CONFIRMED ->
                 return cleanupConfirmedSelfRevokeOrQuarantine(journal, profile, receipt = null)
-            RelayV2SelfRevokePhase.PREPARED -> Unit
+            // PREPARED sends revoke for the first time. MAY_HAVE_COMMITTED means the last
+            // request may never have left the device (handoff is durable before enqueue, and
+            // every failure/timeout/5xx maps to MayHaveCommitted); the server answers an
+            // idempotent already-revoked revoke with 200 Confirmed, so a confirmed second
+            // Forget re-request is the bounded, user-driven exit for an ambiguously stuck
+            // journal. Startup admission never calls this and stays network-free.
+            RelayV2SelfRevokePhase.PREPARED,
+            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+            -> Unit
         }
 
         val request = try {
@@ -979,19 +989,31 @@ internal class RelayV2ProfileRepository(
             )
         } catch (_: Throwable) {
             disconnectAfterSelfRevoke(profile)
-            return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
+            return RelayV2SelfRevokeResult.Quarantined(journal.phase)
         }
         val mayHaveCommitted = journal.copy(
             phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
         )
         val exchangeResult = try {
             selfRevokeExchange.revoke(request) {
-                val advanced = selfRevokeJournalStore.advanceSelfRevokeJournal(
-                    expected = journal,
-                    phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
-                )
-                check(advanced == mayHaveCommitted) {
-                    "Self-revoke handoff lost its exact durable journal"
+                // PREPARED advances to MAY_HAVE_COMMITTED before the request leaves the device.
+                // A MAY_HAVE_COMMITTED journal has already taken that durable handoff; the store
+                // forbids re-advancing it, so a retry only verifies the journal is still the
+                // exact ambiguous operation before trusting this attempt's outcome.
+                if (journal.phase == RelayV2SelfRevokePhase.PREPARED) {
+                    val advanced = selfRevokeJournalStore.advanceSelfRevokeJournal(
+                        expected = journal,
+                        phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                    )
+                    check(advanced == mayHaveCommitted) {
+                        "Self-revoke handoff lost its exact durable journal"
+                    }
+                } else {
+                    check(
+                        selfRevokeJournalStore.readSelfRevokeJournal() == mayHaveCommitted,
+                    ) {
+                        "Self-revoke retry lost its exact durable journal"
+                    }
                 }
             }
         } catch (cancelled: CancellationException) {
