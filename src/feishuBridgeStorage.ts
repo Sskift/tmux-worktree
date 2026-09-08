@@ -511,10 +511,33 @@ function loadFile<T>(path: string, empty: T, validate: (value: unknown) => value
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
-    throw new Error(`refusing invalid Feishu bridge state ${path}; original preserved: ${error instanceof Error ? error.message : String(error)}`);
+    return quarantineCorruptFile(path, empty, error);
   }
-  if (!validate(parsed)) throw new Error(`refusing malformed Feishu bridge state ${path}; original preserved`);
+  if (!validate(parsed)) {
+    return quarantineCorruptFile(path, empty, new Error("schema validation failed"));
+  }
   return parsed;
+}
+
+// A single corrupt state file must not hold the whole bridge (and the three
+// healthy sibling collections) hostage in a supervisor crash loop. Move the
+// bad file aside as evidence and start that one collection empty; the other
+// collections are unaffected. Runs under the storage lock (only called from
+// read()), so a concurrent writer cannot race the rename. If the quarantine
+// rename itself fails, stay fail-closed and surface the original error.
+function quarantineCorruptFile<T>(path: string, empty: T, cause: unknown): T {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  const quarantinePath = `${path}.corrupt-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(path, quarantinePath);
+  } catch (error) {
+    const renameReason = error instanceof Error ? error.message : String(error);
+    throw new Error(`refusing invalid Feishu bridge state ${path}; original preserved (quarantine failed: ${renameReason}): ${reason}`);
+  }
+  process.stderr.write(
+    `[feishu-bridge] quarantined corrupt state file ${path} -> ${quarantinePath} (${reason}); starting that collection empty\n`,
+  );
+  return empty;
 }
 
 function atomicWriteSerialized(path: string, contents: string): void {

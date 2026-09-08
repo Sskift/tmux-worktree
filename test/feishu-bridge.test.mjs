@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3186,6 +3186,62 @@ test("Feishu bridge startup fails when the event consumer cannot spawn", async (
   }
 });
 
+
+test("corrupt state file is quarantined per-file instead of failing the whole bridge", () => {
+  // Regression for the crash-loop where a single torn state file made
+  // store.read() throw and the bridge constructor throw on every supervisor
+  // restart. A bad file is renamed aside as evidence and that one collection
+  // starts empty; the healthy sibling collections stay intact.
+  const h = harness();
+  try {
+    const validBinding = {
+      version: 1,
+      id: "bind-healthy",
+      chatId: "oc-healthy",
+      chatName: "healthy group",
+      controlTargetId: "ct-healthy",
+      sessionName: "managed-healthy",
+      status: "active",
+      options: { mentionOnly: true, replyMode: "topic" },
+      allowedSenderIds: [],
+      createdAt: "2026-09-08T00:00:00.000Z",
+      createdBy: "ou-owner",
+    };
+    h.store.write({ bindings: [validBinding], eventIds: ["evt-seen"], turns: [], replies: [] });
+    // Torn turns file (truncated JSON parse failure).
+    writeFileSync(h.paths.turns, '{"version":1,"turns":[{"id":"broken"', "utf8");
+    // Malformed replies file (parses but fails validation).
+    writeFileSync(h.paths.replies, '{"version":1,"replies":[{"unexpected":"shape"}]}', "utf8");
+
+    const read1 = h.store.read();
+    assert.equal(read1.bindings.length, 1, "healthy bindings survive a corrupt sibling file");
+    assert.equal(read1.bindings[0].id, "bind-healthy");
+    assert.deepEqual(read1.eventIds, ["evt-seen"], "healthy dedup survives");
+    assert.deepEqual(read1.turns, [], "corrupt turns collection starts empty");
+    assert.deepEqual(read1.replies, [], "invalid replies collection starts empty");
+
+    const quarantined = readdirSync(h.paths.root)
+      .filter((name) => name.startsWith("feishu-") && name.includes(".corrupt-"));
+    assert.ok(
+      quarantined.some((name) => name.startsWith("feishu-turns.json.corrupt-")),
+      "corrupt turns file was renamed aside as evidence",
+    );
+    assert.ok(
+      quarantined.some((name) => name.startsWith("feishu-outbound-replies.json.corrupt-")),
+      "invalid replies file was renamed aside as evidence",
+    );
+
+    // A second read (fresh store) no longer throws and stays empty: the
+    // supervisor crash loop is broken.
+    const reRead = new FeishuBridgeStore(h.paths).read();
+    assert.equal(reRead.bindings.length, 1);
+    assert.deepEqual(reRead.turns, []);
+    assert.deepEqual(reRead.replies, []);
+  } finally {
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("Feishu bridge allows a profile restart only while it has no bindings", async () => {
   const empty = harness();
   const emptyServer = await FeishuBridgeServer.create({
@@ -3275,19 +3331,30 @@ test("legacy binding reply mode defaults to topic while unknown modes remain fai
 
     persisted.bindings[0].options.replyMode = "future-mode";
     writeFileSync(h.paths.bindings, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
-    assert.throws(() => h.store.read(), /malformed Feishu bridge state/);
-    assert.match(readFileSync(h.paths.bindings, "utf8"), /future-mode/);
+    // A schema-invalid file is quarantined (evidence preserved) and the
+    // collection starts empty, rather than crash-looping the whole bridge.
+    const quarantinedRead = h.store.read();
+    assert.deepEqual(quarantinedRead.bindings, []);
+    const quarantinedCopy = readdirSync(h.paths.root)
+      .filter((name) => name.startsWith("feishu-bindings.json.corrupt-"));
+    assert.equal(quarantinedCopy.length, 1);
+    assert.match(readFileSync(join(h.paths.root, quarantinedCopy[0]), "utf8"), /future-mode/);
   } finally {
     rmSync(h.root, { recursive: true, force: true });
   }
 });
 
-test("corrupt Feishu bridge storage is preserved and refused", () => {
+test("corrupt Feishu bridge storage is quarantined with evidence preserved", () => {
   const h = harness();
   try {
     writeFileSync(h.paths.bindings, '{"version":1,"bindings":[],"future":true}\n', { mode: 0o600 });
-    assert.throws(() => new FeishuBridgeStore(h.paths).read(), /malformed Feishu bridge state/);
-    assert.match(readFileSync(h.paths.bindings, "utf8"), /future/);
+    const read = new FeishuBridgeStore(h.paths).read();
+    assert.deepEqual(read.bindings, []);
+    assert.equal(existsSync(h.paths.bindings), false, "the corrupt file was moved aside");
+    const quarantinedCopy = readdirSync(h.paths.root)
+      .filter((name) => name.startsWith("feishu-bindings.json.corrupt-"));
+    assert.equal(quarantinedCopy.length, 1);
+    assert.match(readFileSync(join(h.paths.root, quarantinedCopy[0]), "utf8"), /future/);
   } finally {
     rmSync(h.root, { recursive: true, force: true });
   }
