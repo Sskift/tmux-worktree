@@ -27,13 +27,13 @@ use super::{
     tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
     user_bin_search_paths, validate_ssh_host_fields, worktree_has_uncommitted_changes,
     worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
-    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
-    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
-    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
-    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
-    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
-    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
-    REQUIRED_TW_RPC_CAPABILITIES,
+    AutomationRun, AutomationRunInFlight, AutomationStatus, AutomationTriggerType,
+    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
+    DashboardLayoutClassification, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
+    GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
+    LocalTwRpcRuntime, OrphanedWorktree, Project, RemoveMissingProjectArgs, RestoreArgs,
+    SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT,
+    GIT_FETCH_INTERVAL_SECONDS, REQUIRED_TW_RPC_CAPABILITIES,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -246,6 +246,7 @@ fn sample_automation() -> Automation {
         last_run_at: None,
         last_status: AutomationStatus::Idle,
         last_session: None,
+        run_in_flight: None,
         created_at: "2026-06-11T00:00:00Z".to_string(),
         updated_at: "2026-06-11T00:00:00Z".to_string(),
     }
@@ -737,6 +738,7 @@ fn automation_command_shell_quotes_non_empty_instruction() {
 
 #[test]
 fn overlap_skip_requires_running_or_queued_status_with_live_session() {
+    let now = 1_000_000u64;
     let running = Automation {
         overlap: AutomationOverlap::Skip,
         last_status: AutomationStatus::Running,
@@ -752,16 +754,54 @@ fn overlap_skip_requires_running_or_queued_status_with_live_session() {
         ..running.clone()
     };
 
-    assert!(should_skip_automation_overlap(&running, true));
-    assert!(should_skip_automation_overlap(&queued, true));
-    assert!(!should_skip_automation_overlap(&running, false));
-    assert!(!should_skip_automation_overlap(&failed, true));
+    assert!(should_skip_automation_overlap(&running, true, now));
+    assert!(should_skip_automation_overlap(&queued, true, now));
+    assert!(!should_skip_automation_overlap(&running, false, now));
+    assert!(!should_skip_automation_overlap(&failed, true, now));
     assert!(!should_skip_automation_overlap(
         &Automation {
             overlap: AutomationOverlap::Queue,
             ..running
         },
         true,
+        now,
+    ));
+
+    // A fresh in-flight claim dedups during the session-less create window,
+    // before last_status=Running/last_session are persisted.
+    let fresh_in_flight = Automation {
+        overlap: AutomationOverlap::Skip,
+        last_status: AutomationStatus::Idle,
+        last_session: None,
+        run_in_flight: Some(AutomationRunInFlight {
+            run_id: "run-claim".to_string(),
+            started_at_ms: now,
+        }),
+        ..sample_automation()
+    };
+    assert!(should_skip_automation_overlap(&fresh_in_flight, false, now));
+    // A stale claim (process died in the create window) must not latch the
+    // fence shut; with no live session this run proceeds.
+    let stale_in_flight = Automation {
+        run_in_flight: Some(AutomationRunInFlight {
+            run_id: "run-stale".to_string(),
+            started_at_ms: now - 11 * 60 * 1000,
+        }),
+        ..fresh_in_flight.clone()
+    };
+    assert!(!should_skip_automation_overlap(
+        &stale_in_flight,
+        false,
+        now
+    ));
+    // overlap=queue never dedups on an in-flight claim (it allows concurrency).
+    assert!(!should_skip_automation_overlap(
+        &Automation {
+            overlap: AutomationOverlap::Queue,
+            ..fresh_in_flight
+        },
+        false,
+        now,
     ));
 }
 
@@ -943,6 +983,171 @@ fn concurrent_trigger_and_save_keeps_both_automations() {
         .expect("seed present");
     assert_eq!(seed.last_status, AutomationStatus::Running);
     assert_eq!(seed.last_session.as_deref(), Some("seed-session"));
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn concurrent_skip_triggers_overlapping_create_window_dedup_to_single_session() {
+    // Regression for the R1/B1 review gap: two triggers of the same
+    // overlap=skip automation landing inside the same create window both pass
+    // the phase-1 dedup snapshot (last_status=Running/last_session is only
+    // written in phase 2) and each spawn its own worktree/agent. The fix writes
+    // a durable in-flight claim in phase 1 so the second trigger skips.
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-skip".to_string()),
+        name: Some("SkipRun".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do skip work".to_string()),
+        overlap: Some(AutomationOverlap::Skip),
+    })
+    .expect("seed automation");
+
+    let creator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Held once the first creator has entered, so it stays inside the create
+    // window until both triggers have passed phase 1.
+    let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+    let spawn_trigger = |creator_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                         gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+                         id: String| {
+        std::thread::spawn(move || {
+            trigger_automation_with_creator(id, move |_args| {
+                let count = creator_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let (mutex, condvar) = &*gate;
+                if count == 1 {
+                    // First creator: park until released, modelling the
+                    // multi-second worktree/agent create window.
+                    let mut released = mutex.lock().expect("gate lock");
+                    while !*released {
+                        released = condvar.wait(released).expect("gate wait");
+                    }
+                }
+                Ok(format!("skip-session-{count}"))
+            })
+        })
+    };
+
+    let t1 = spawn_trigger(
+        std::sync::Arc::clone(&creator_calls),
+        std::sync::Arc::clone(&gate),
+        seeded.id.clone(),
+    );
+
+    // Wait until the first trigger is parked inside its create window.
+    while creator_calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second trigger while the first is still creating: the in-flight claim
+    // must make this one skip WITHOUT invoking the creator at all.
+    let second = trigger_automation_with_creator(seeded.id.clone(), move |_args| {
+        panic!("creator must not be invoked for the deduped second trigger");
+    })
+    .expect("second trigger");
+
+    assert_eq!(
+        second.status,
+        AutomationStatus::Skipped,
+        "second concurrent trigger must be skipped by the in-flight claim"
+    );
+    assert_eq!(
+        creator_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one worktree/agent session may be created"
+    );
+
+    // Release the parked first creator, then await its phase 2.
+    {
+        let (mutex, condvar) = &*gate;
+        let mut released = mutex.lock().expect("gate lock");
+        *released = true;
+        condvar.notify_all();
+    }
+    let first = t1
+        .join()
+        .expect("first trigger thread panicked")
+        .expect("first trigger");
+    assert_eq!(first.status, AutomationStatus::Running);
+
+    // After phase 2 real Running state is persisted for the single run.
+    let automations = load_automations_from_disk().expect("load automations");
+    let record = automations
+        .iter()
+        .find(|automation| automation.id == seeded.id)
+        .expect("automation present");
+    assert_eq!(record.last_status, AutomationStatus::Running);
+
+    let runs = list_automation_runs(Some(seeded.id.clone())).expect("list runs");
+    let statuses: Vec<_> = runs.iter().map(|run| run.status).collect();
+    assert!(
+        statuses.contains(&AutomationStatus::Running)
+            && statuses.contains(&AutomationStatus::Skipped),
+        "expected one Running run and one Skipped run, got {statuses:?}"
+    );
+    assert_eq!(runs.len(), 2);
+
+    restore_automation_test_env(original_home, original_dashboard_home);
+}
+
+#[test]
+fn failed_create_clears_in_flight_claim_and_marks_failed() {
+    // The in-flight claim must be rolled back when create() fails, rather than
+    // lingering until the stale TTL.
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    set_automation_test_home(&home);
+
+    let seeded = save_automation(SaveAutomationInput {
+        id: Some("auto-fail".to_string()),
+        name: Some("FailRun".to_string()),
+        enabled: Some(true),
+        trigger_type: Some(AutomationTriggerType::Manual),
+        schedule: Some(None),
+        timezone: Some(None),
+        project: Some(None),
+        path: Some(Some(home.to_string_lossy().to_string())),
+        ai_cmd: Some("claude".to_string()),
+        instruction: Some("do failing work".to_string()),
+        overlap: Some(AutomationOverlap::Skip),
+    })
+    .expect("seed automation");
+
+    let run = trigger_automation_with_creator(seeded.id.clone(), |_args| {
+        Err("worktree creation exploded".to_string())
+    })
+    .expect("trigger returns an Err run");
+    assert_eq!(run.status, AutomationStatus::Failed);
+
+    let automations = load_automations_from_disk().expect("load automations");
+    let record = automations
+        .iter()
+        .find(|automation| automation.id == seeded.id)
+        .expect("automation present");
+    assert_eq!(record.last_status, AutomationStatus::Failed);
+    assert!(
+        record.run_in_flight.is_none(),
+        "failed create must clear the in-flight claim"
+    );
 
     restore_automation_test_env(original_home, original_dashboard_home);
 }

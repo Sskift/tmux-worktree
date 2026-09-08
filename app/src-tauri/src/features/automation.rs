@@ -32,6 +32,18 @@ pub(crate) enum AutomationStatus {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct AutomationRunInFlight {
+    /// Correlates the marker with the trigger run that claimed it; only that
+    /// run clears it in phase 2.
+    pub(crate) run_id: String,
+    /// Unix-millis timestamp the claim was written. Used to expire a marker
+    /// left behind if the process dies between phase 1 and phase 2, so the
+    /// skip fence never latches shut forever.
+    pub(crate) started_at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Automation {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -47,6 +59,15 @@ pub(crate) struct Automation {
     pub(crate) last_run_at: Option<String>,
     pub(crate) last_status: AutomationStatus,
     pub(crate) last_session: Option<String>,
+    /// Durable "a skip-overlap run is currently being created" claim, written
+    /// in phase 1 (before the slow worktree/agent spawn) so a second trigger
+    /// overlapping the create window dedups immediately instead of also
+    /// spawning a session. Cleared/replaced by real status in phase 2. Only
+    /// set for `overlap=skip`; `overlap=queue` intentionally never sets it.
+    /// Optional + defaults to absent for forward/backward compatibility with
+    /// records written by older Dashboard builds and the Node CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_in_flight: Option<AutomationRunInFlight>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -85,6 +106,40 @@ pub(crate) struct UpsertAutomationResult {
 }
 
 pub(crate) const AUTOMATION_RUN_LIMIT: usize = 200;
+
+/// A claimed (in-flight) skip run older than this is treated as stale: the
+/// process that wrote it almost certainly died before it could clear the
+/// marker in phase 2. Worktree/agent creation runs seconds-to-tens-of-seconds,
+/// so this comfortably exceeds any real create window while bounding how long
+/// a crash can keep a skip automation from re-firing.
+const IN_FLIGHT_STALE_MS: u64 = 10 * 60 * 1000;
+
+/// True when a persisted in-flight claim is still fresh (i.e. a run for this
+/// automation is inside its create window right now).
+fn automation_in_flight_fresh(automation: &Automation, now_ms: u64) -> bool {
+    match automation.run_in_flight.as_ref() {
+        Some(claim) => now_ms.saturating_sub(claim.started_at_ms) < IN_FLIGHT_STALE_MS,
+        None => false,
+    }
+}
+
+/// Phase-2 teardown: a run that wrote its own in-flight claim in phase 1 clears
+/// it here. The clear is gated on the persisted claim still carrying THIS run's
+/// id, so a slow run that returns after another run has legitimately overwritten
+/// a stale claim never wipes the newer run's live claim.
+fn clear_own_in_flight_claim(automation: &mut Automation, run_id: &str, claimed: bool) {
+    if !claimed {
+        return;
+    }
+    if automation
+        .run_in_flight
+        .as_ref()
+        .map(|claim| claim.run_id == run_id)
+        .unwrap_or(true)
+    {
+        automation.run_in_flight = None;
+    }
+}
 
 fn automations_path() -> std::path::PathBuf {
     app_home_dir_or_tmp().join(".tw-dashboard-automations.json")
@@ -198,20 +253,35 @@ pub(crate) fn automation_command_with_instruction(ai_cmd: &str, instruction: &st
 pub(crate) fn should_skip_automation_overlap(
     automation: &Automation,
     session_exists: bool,
+    now_ms: u64,
 ) -> bool {
-    automation.overlap == AutomationOverlap::Skip
-        && matches!(
-            automation.last_status,
-            AutomationStatus::Queued | AutomationStatus::Running
-        )
-        && automation.last_session.is_some()
+    if automation.overlap != AutomationOverlap::Skip {
+        return false;
+    }
+    // A fresh in-flight claim means another trigger for this same automation is
+    // already inside its (session-less) create window. Dedup immediately even
+    // though last_session/last_status=Running have not been persisted yet — this
+    // closes the cross-create-window double-spawn gap. Stale claims (process
+    // died mid-create) are ignored so the fence never latches shut.
+    if automation_in_flight_fresh(automation, now_ms) {
+        return true;
+    }
+    matches!(
+        automation.last_status,
+        AutomationStatus::Queued | AutomationStatus::Running
+    ) && automation.last_session.is_some()
         && session_exists
 }
 
 struct TriggerStart {
     automation_id: String,
     now: String,
+    run_id: String,
     create_args: CreateArgs,
+    /// True when this trigger wrote a fresh in-flight claim in phase 1; only
+    /// then may phase 2 clear it (a run that was skipped on a pre-existing
+    /// claim must not clear the other run's claim).
+    claims_in_flight: bool,
 }
 
 pub(crate) fn trigger_automation_with_creator<F>(
@@ -233,20 +303,21 @@ where
         let _runs_lock =
             acquire_dashboard_file_lock(automation_runs_lock_path(), "automation run state")?;
 
-        let automations = load_automations_from_disk()?;
-        let automation = automations
+        let mut automations = load_automations_from_disk()?;
+        let target_index = automations
             .iter()
-            .find(|automation| automation.id == id)
-            .cloned()
+            .position(|automation| automation.id == id)
             .ok_or_else(|| format!("automation not found: {id}"))?;
+        let automation = automations[target_index].clone();
         let now = now_rfc3339();
+        let now_ms = unix_millis();
         let session_exists = automation
             .last_session
             .as_ref()
             .map(|session| tmux_session_exists(session.clone()).unwrap_or(false))
             .unwrap_or(false);
 
-        if should_skip_automation_overlap(&automation, session_exists) {
+        if should_skip_automation_overlap(&automation, session_exists, now_ms) {
             let run = AutomationRun {
                 id: new_prefixed_id("run"),
                 automation_id: automation.id.clone(),
@@ -262,11 +333,28 @@ where
             return Ok(run);
         }
 
+        // This run will proceed to create(). For overlap=skip, persist a
+        // durable in-flight claim *before* leaving the lock so a second trigger
+        // overlapping the (session-less) create window dedups in its own phase
+        // 1 instead of also spawning a worktree/agent. overlap=queue allows
+        // concurrency by design and never claims. The claim is paired with a
+        // phase-2 clear; a crash in between is bounded by IN_FLIGHT_STALE_MS.
+        let run_id = new_prefixed_id("run");
+        let claims_in_flight = automation.overlap == AutomationOverlap::Skip;
+        if claims_in_flight {
+            automations[target_index].run_in_flight = Some(AutomationRunInFlight {
+                run_id: run_id.clone(),
+                started_at_ms: now_ms,
+            });
+            save_automations_to_disk(&automations)?;
+        }
+
         let ai_cmd =
             automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
         TriggerStart {
             automation_id: automation.id,
             now,
+            run_id,
             create_args: CreateArgs {
                 project: automation.project.and_then(trimmed_non_empty_string),
                 path: automation.path.and_then(trimmed_non_empty_string),
@@ -275,6 +363,7 @@ where
                 branch: None,
                 host_id: None,
             },
+            claims_in_flight,
         }
     };
 
@@ -295,6 +384,7 @@ where
     let mut runs = load_automation_runs_from_disk()?;
     let now = start.now;
     let automation_id = start.automation_id;
+    let run_id = start.run_id;
     let target_index = automations
         .iter()
         .position(|automation| automation.id == automation_id);
@@ -305,10 +395,11 @@ where
                 automations[index].last_run_at = Some(now.clone());
                 automations[index].last_status = AutomationStatus::Running;
                 automations[index].last_session = Some(session.clone());
+                clear_own_in_flight_claim(&mut automations[index], &run_id, start.claims_in_flight);
                 save_automations_to_disk(&automations)?;
             }
             AutomationRun {
-                id: new_prefixed_id("run"),
+                id: run_id,
                 automation_id,
                 started_at: now,
                 finished_at: None,
@@ -321,10 +412,13 @@ where
             if let Some(index) = target_index {
                 automations[index].last_run_at = Some(now.clone());
                 automations[index].last_status = AutomationStatus::Failed;
+                // Paired rollback: create failed, so drop the in-flight claim
+                // instead of letting it linger until the stale TTL.
+                clear_own_in_flight_claim(&mut automations[index], &run_id, start.claims_in_flight);
                 save_automations_to_disk(&automations)?;
             }
             AutomationRun {
-                id: new_prefixed_id("run"),
+                id: run_id,
                 automation_id,
                 started_at: now.clone(),
                 finished_at: Some(now),
@@ -444,6 +538,12 @@ pub(crate) fn upsert_automation_from_input(
         last_session: existing
             .as_ref()
             .and_then(|automation| automation.last_session.clone()),
+        // Preserve a live in-flight claim across an edit so saving config
+        // during a run's create window cannot wipe the dedup fence. Phase 2
+        // of the claiming run clears it; new records start with none.
+        run_in_flight: existing
+            .as_ref()
+            .and_then(|automation| automation.run_in_flight.clone()),
         created_at,
         updated_at: now.to_string(),
     };
