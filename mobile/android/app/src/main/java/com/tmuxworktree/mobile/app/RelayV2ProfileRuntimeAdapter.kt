@@ -332,10 +332,11 @@ internal fun selfRevokeQuarantineAdmission(
 ): RelayStartupAdmission = RelayStartupAdmission(
     state = RelayStartupAdmissionState.RELAY_V2_SELF_REVOKE_QUARANTINED,
     message = when (phase) {
-        RelayV2SelfRevokePhase.PREPARED ->
-            "Self-revoke is prepared; confirm Forget again to continue."
-        RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED ->
-            "Self-revoke may have committed; the profile remains quarantined."
+        RelayV2SelfRevokePhase.PREPARED,
+        RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+        ->
+            "Self-revoke may not have reached the server; confirm Forget again to " +
+                "complete it. If the network is unreachable the profile stays quarantined."
         RelayV2SelfRevokePhase.REJECTED ->
             "Self-revoke was rejected; the profile remains quarantined."
         RelayV2SelfRevokePhase.CONFIRMED ->

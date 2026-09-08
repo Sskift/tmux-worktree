@@ -949,10 +949,34 @@ internal class RelayV2ProfileRepository(
         }
     }
 
-    suspend fun selfRevokeActiveProfile(): RelayV2SelfRevokeResult {
-        val profile = profileStore.activeRelayV2Profile()
-            ?: error("No active Relay v2 profile is available for self-revoke")
-        val journal = selfRevokeJournalStore.readSelfRevokeJournal() ?: run {
+    suspend fun selfRevokeActiveProfile(): RelayV2SelfRevokeResult =
+        activationOperationMutex.withLock { selfRevokeActiveProfileUnderLease() }
+
+    private suspend fun selfRevokeActiveProfileUnderLease(): RelayV2SelfRevokeResult {
+        // The activation lease serializes Forget with admission/enrollment/recovery, so two quick
+        // Forget taps cannot both prepare or hand off a journal: the second waits, then reads the
+        // winner's finished state below and converges.
+        val storedJournal = selfRevokeJournalStore.readSelfRevokeJournal()
+        val storedProfile = profileStore.activeRelayV2Profile()
+        // A confirmed Forget clears both the journal and the active profile in one commit. A
+        // second Forget waited on the activation lease, so by the time it reads here the winner
+        // has often finished: both durable records are gone (or a leftover CONFIRMED journal
+        // sits over a removed profile). That is an already-completed Forget, not a fresh request
+        // or an error — converge to ProfileRemoved so it never prepares a journal over a gone
+        // profile, never hits the "journal disappeared" check, and never re-asserts a quarantine
+        // over the cleared UI. A non-CONFIRMED journal over a removed profile is impossible
+        // (only a confirmed commit removes the profile), so that stays fail-closed.
+        if (storedProfile == null) {
+            return if (storedJournal == null ||
+                storedJournal.phase == RelayV2SelfRevokePhase.CONFIRMED
+            ) {
+                RelayV2SelfRevokeResult.ProfileRemoved
+            } else {
+                error("Self-revoke journal $storedJournal lost its active profile")
+            }
+        }
+        val profile = storedProfile
+        val journal = storedJournal ?: run {
             requireSelfRevokeCredential(profile, expectedJournal = null)
             selfRevokeJournalStore.prepareSelfRevokeJournal(
                 expectedActiveProfile = profile,
@@ -963,12 +987,22 @@ internal class RelayV2ProfileRepository(
         }
         check(journal.matches(profile)) { "Self-revoke journal profile changed" }
         when (journal.phase) {
-            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
-            RelayV2SelfRevokePhase.REJECTED,
-            -> return RelayV2SelfRevokeResult.Quarantined(journal.phase)
+            // REJECTED means the server was reached and answered 403 FORBIDDEN: the token can
+            // never authenticate again, so there is no server answer that could clear the
+            // quarantine. Stay fail-closed.
+            RelayV2SelfRevokePhase.REJECTED ->
+                return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.REJECTED)
             RelayV2SelfRevokePhase.CONFIRMED ->
                 return cleanupConfirmedSelfRevokeOrQuarantine(journal, profile, receipt = null)
-            RelayV2SelfRevokePhase.PREPARED -> Unit
+            // PREPARED sends revoke for the first time. MAY_HAVE_COMMITTED means the last
+            // request may never have left the device (handoff is durable before enqueue, and
+            // every failure/timeout/5xx maps to MayHaveCommitted); the server answers an
+            // idempotent already-revoked revoke with 200 Confirmed, so a confirmed second
+            // Forget re-request is the bounded, user-driven exit for an ambiguously stuck
+            // journal. Startup admission never calls this and stays network-free.
+            RelayV2SelfRevokePhase.PREPARED,
+            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+            -> Unit
         }
 
         val request = try {
@@ -979,37 +1013,54 @@ internal class RelayV2ProfileRepository(
             )
         } catch (_: Throwable) {
             disconnectAfterSelfRevoke(profile)
-            return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
+            return RelayV2SelfRevokeResult.Quarantined(journal.phase)
         }
         val mayHaveCommitted = journal.copy(
             phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
         )
         val exchangeResult = try {
             selfRevokeExchange.revoke(request) {
-                val advanced = selfRevokeJournalStore.advanceSelfRevokeJournal(
-                    expected = journal,
-                    phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
-                )
-                check(advanced == mayHaveCommitted) {
-                    "Self-revoke handoff lost its exact durable journal"
+                // PREPARED advances to MAY_HAVE_COMMITTED before the request leaves the device.
+                // A MAY_HAVE_COMMITTED journal has already taken that durable handoff; the store
+                // forbids re-advancing it, so a retry only verifies the journal is still the
+                // exact ambiguous operation before trusting this attempt's outcome.
+                if (journal.phase == RelayV2SelfRevokePhase.PREPARED) {
+                    val advanced = selfRevokeJournalStore.advanceSelfRevokeJournal(
+                        expected = journal,
+                        phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                    )
+                    check(advanced == mayHaveCommitted) {
+                        "Self-revoke handoff lost its exact durable journal"
+                    }
+                } else {
+                    check(
+                        selfRevokeJournalStore.readSelfRevokeJournal() == mayHaveCommitted,
+                    ) {
+                        "Self-revoke retry lost its exact durable journal"
+                    }
                 }
             }
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
-                currentSelfRevokeJournal(journal)
-                runCatching { disconnectAfterSelfRevoke(profile) }
-                    .exceptionOrNull()
-                    ?.let(cancelled::addSuppressed)
+                currentSelfRevokeJournal(journal)?.let {
+                    runCatching { disconnectAfterSelfRevoke(profile) }
+                        .exceptionOrNull()
+                        ?.let(cancelled::addSuppressed)
+                }
             }
             throw cancelled
         } catch (_: Throwable) {
             val current = withContext(NonCancellable) { currentSelfRevokeJournal(journal) }
+                ?: run {
+                    runCatching { disconnectAfterSelfRevoke(profile) }
+                    return RelayV2SelfRevokeResult.ProfileRemoved
+                }
             disconnectAfterSelfRevoke(profile)
             return RelayV2SelfRevokeResult.Quarantined(current.phase)
         }
         val durableHandoff = withContext(NonCancellable) {
             currentSelfRevokeJournal(journal)
-        }
+        } ?: return RelayV2SelfRevokeResult.ProfileRemoved
         if (durableHandoff != mayHaveCommitted) {
             disconnectAfterSelfRevoke(profile)
             return RelayV2SelfRevokeResult.Quarantined(durableHandoff.phase)
@@ -1196,16 +1247,31 @@ internal class RelayV2ProfileRepository(
         check(committed) { "Confirmed self-revoke profile removal lost exact authority" }
     }
 
+    /**
+     * Re-reads the journal after a network/await boundary to keep this attempt exact. Returns null
+     * when a concurrent Forget has already finished the removal (active profile gone, and either
+     * no journal or a leftover CONFIRMED journal) so the straggler converges to ProfileRemoved
+     * instead of asserting a quarantine over the cleared state. A journal that still belongs to a
+     * different active profile is a genuine invariant violation and stays fail-closed.
+     */
     private suspend fun currentSelfRevokeJournal(
         expectedOperation: RelayV2SelfRevokeJournal,
-    ): RelayV2SelfRevokeJournal {
-        val current = requireNotNull(selfRevokeJournalStore.readSelfRevokeJournal()) {
+    ): RelayV2SelfRevokeJournal? {
+        val current = selfRevokeJournalStore.readSelfRevokeJournal()
+        val active = profileStore.activeRelayV2Profile()
+        if (active == null) {
+            if (current == null ||
+                current.phase == RelayV2SelfRevokePhase.CONFIRMED
+            ) return null
+            error("Self-revoke journal $current lost its active profile")
+        }
+        val journal = requireNotNull(current) {
             "Relay v2 self-revoke journal disappeared"
         }
-        check(current.sameOperationAs(expectedOperation)) {
+        check(journal.sameOperationAs(expectedOperation) && journal.matches(active)) {
             "Relay v2 self-revoke journal changed operation"
         }
-        return current
+        return journal
     }
 
     private fun RelayV2SelfRevokeJournal.sameOperationAs(
