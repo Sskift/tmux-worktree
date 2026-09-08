@@ -3848,9 +3848,20 @@ export class RelayV2TerminalManager {
           );
           break;
         } catch (error) {
-          if (!canonicalResolverCutIsRefreshing(error)
+          if (!canonicalResolverCutIsRefreshing(error)) throw error;
+          // The canonical resolver cut is rebuilding (a signal-triggered full
+          // discovery pass — slow SSH scopes can take ~30-45s). The fixed
+          // 50x100ms refresh budget (~5s) expires well inside that window and
+          // inside this open's 8s serializer deadline. Bound the wait by the
+          // open deadline (the count is only an anti-livelock ceiling), and
+          // classify an exhausted wait as the existing request-scoped open
+          // deadline (BUSY/terminal_open_timeout, retried by the client) rather
+          // than persisting a non-retryable CAPABILITY_UNAVAILABLE — the cut is
+          // transiently absent, not permanently unavailable.
+          const remainingMs = deadline.expiresAtMs - Date.now();
+          if (remainingMs <= CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS
             || refreshAttempts >= CANONICAL_RESOLVER_REFRESH_RETRY_ATTEMPTS) {
-            throw error;
+            throw this.openDeadlineError("target resolver refresh");
           }
           refreshAttempts += 1;
           await this.runOpenStep(
