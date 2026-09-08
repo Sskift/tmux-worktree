@@ -4812,7 +4812,16 @@ class V2ViewModel(
                     }
                     true
                 }
-                if (current) syncAgentNotificationConfig(composition)
+                if (current) {
+                    syncAgentNotificationConfig(composition)
+                    // The ONLINE-edge arm below fires on the composition-state collector, but a
+                    // session cut arrives later on this independent productProjection collector
+                    // (host registration + discovery after a slow restart). Re-evaluate here once
+                    // the cut is installed so a PAUSED terminal whose cut lagged the ONLINE edge
+                    // is still auto-armed instead of waiting for a tap. armPaused is idempotent:
+                    // it returns once the disposition leaves PAUSED or a claim is held.
+                    armPausedRelayV2TerminalRecoveryOnOnlineEdge(composition)
+                }
             }
         }
         viewModelScope.launch {
