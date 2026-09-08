@@ -2918,6 +2918,13 @@ class V2ViewModel(
                 budget = candidate.resetRecoveryBudget,
                 nowMillis = monotonicClock(),
             ) ?: return
+            // Charge this attempt to the candidate's sliding window now, before the bounded wait or
+            // detach runs. The budget is normally persisted via the reopening openTerminal intent,
+            // but a 30s ONLINE+cut timeout or a detach exception pauses without ever minting a new
+            // attachment; without writing it back here, a storm of ONLINE edges could re-admit the
+            // same PAUSED attachment past the 3/30s storm budget. Mirrors the observer.reset path
+            // (`issued.resetRecoveryBudget = admission.budget`).
+            candidate.resetRecoveryBudget = admission.budget
 
             // A withdrawn (route-only) sentinel must re-claim the recovery slot, exactly like the
             // late detached-open response path; a still-installed owner keeps the slot it holds.
