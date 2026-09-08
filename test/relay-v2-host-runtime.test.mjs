@@ -780,10 +780,12 @@ test("a hung terminal.open expires before Android and cannot block same-route Ag
   );
 
   const opened = correlatedTerminalFixture("terminal-opened", open);
-  await assert.rejects(
-    h.runtime.sendTerminalFrame(timedOutAuthorityRoute, opened),
-    /stale route binding/,
-  );
+  // The hard deadline rotated the H3 token; a late completion targets a stale
+  // binding. It is dropped silently (route-level teardown) rather than thrown —
+  // a throw would cross the terminal manager serializer as a plain Error and
+  // be misclassified as a host-wide fatal. The non-delivery assertions below
+  // prove the late frame never reaches the client.
+  await h.runtime.sendTerminalFrame(timedOutAuthorityRoute, opened);
   const sentBeforeLateCompletion = h.state.sent.length;
   finishOpen();
   await settle(8);
@@ -909,9 +911,14 @@ test("unbind fences queued work and late authority callbacks from every replacem
   assert.equal(h.state.calls.unsubscribe.includes("host-route-1"), true);
   assert.equal(h.state.calls.unbind.length >= 1, true);
   const oldAuthorityRoute = h.state.calls.unbind[0].route;
-  await assert.rejects(
-    h.runtime.sendTerminalFrame(oldAuthorityRoute, fixture("terminal-input-ack")),
-    /stale route binding/,
+  // The old binding was revoked by the replacement connection; a late callback
+  // on it is route-level teardown and is dropped without throwing (a throw
+  // would be a plain Error across the manager serializer and fence all H3).
+  await h.runtime.sendTerminalFrame(oldAuthorityRoute, fixture("terminal-input-ack"));
+  assert.equal(
+    h.state.sent.some(({ frame }) => frame.type === "terminal.input_ack"),
+    false,
+    "late callbacks on the revoked binding must never be delivered",
   );
 });
 
@@ -1522,9 +1529,14 @@ test("H3 callbacks use copied exact tokens and each frozen terminal frame schema
     const late = fixture("terminal-output");
     late.streamId = opened.streamId;
     late.payload.generation = opened.payload.generation;
-    await assert.rejects(
-      h.runtime.sendTerminalFrame({ ...authorityRoute }, late),
-      /stale route binding/,
+    // After reset_required the H3 token was rotated; the late output targets a
+    // revoked binding and is silently dropped (no host-wide fatal), never sent.
+    const sentBeforeLate = h.state.sent.length;
+    await h.runtime.sendTerminalFrame({ ...authorityRoute }, late);
+    assert.equal(
+      h.state.sent.length,
+      sentBeforeLate,
+      "late output after a token-rotating reset must not be delivered",
     );
   });
 
@@ -1543,17 +1555,15 @@ test("H3 callbacks use copied exact tokens and each frozen terminal frame schema
     const output = fixture("terminal-output");
     output.streamId = opened.streamId;
     output.payload.generation = opened.payload.generation;
-    await assert.rejects(
-      h.runtime.sendTerminalFrame({
-        ...authorityRoute,
-        runtimeBindingToken: "forged-runtime-binding-token",
-      }, output),
-      /stale route binding/,
-    );
-    await assert.rejects(
-      h.runtime.sendTerminalFrame({ ...authorityRoute, routeFence: "forged-fence" }, output),
-      /stale route binding/,
-    );
+    // Forged/unknown bindings resolve to no route: the frame is dropped and
+    // must never be delivered to any client.
+    const beforeForged = h.state.sent.length;
+    await h.runtime.sendTerminalFrame({
+      ...authorityRoute,
+      runtimeBindingToken: "forged-runtime-binding-token",
+    }, output);
+    await h.runtime.sendTerminalFrame({ ...authorityRoute, routeFence: "forged-fence" }, output);
+    assert.equal(h.state.sent.length, beforeForged, "forged route frames must never be sent");
     await assert.rejects(
       h.runtime.sendTerminalFrame({ ...authorityRoute }, {
         ...output,
@@ -1596,6 +1606,42 @@ test("H3 callbacks use copied exact tokens and each frozen terminal frame schema
     );
     assert.equal(h.state.sent.filter(({ frame }) => frame.requestId === close.requestId).length, 1);
   });
+});
+
+test("C039: a saturated terminal callback closes only that route and never throws to the manager", async () => {
+  // One outbound frame slot. trySend always accepts but never settles a
+  // receipt, so the welcome frame permanently holds the only slot.
+  let authorityRoute;
+  const h = createHarness({
+    testLimits: { maxOutboundFramesPerRoute: 1 },
+    trySend: () => true,
+    terminal: async (method, request) => {
+      if (method === "open") authorityRoute = request.route;
+    },
+  });
+  const routeBinding = await ready(h);
+  const request = fixture("terminal-open-new");
+  request.expectedHostEpoch = HOST_EPOCH;
+  send(h.runtime, routeBinding, request);
+  await settle(3);
+
+  const opened = correlatedTerminalFixture("terminal-opened", request);
+  // Pre-fix this threw a plain Error ("exceeded bounded route capacity") that
+  // crossed the terminal manager serializer and fenced the host's whole H3
+  // lane for a single slow consumer. Now it must resolve (no throw); the
+  // saturated route is closed 1013 slow_consumer and only that route is gone.
+  await h.runtime.sendTerminalFrame({ ...authorityRoute }, opened);
+
+  const close = h.state.closes.at(-1);
+  assert.ok(close, "the saturated route must be closed");
+  assert.equal(close.code, 1013);
+  assert.equal(close.reason, "slow_consumer");
+  // The unservable terminal.opened response must never have been enqueued.
+  assert.equal(
+    h.state.sent.some(({ frame }) => frame.type === "terminal.opened"
+      && frame.requestId === request.requestId),
+    false,
+  );
 });
 
 test("actual H3 correlated reset revokes the old token before late stream output", async () => {
@@ -1704,12 +1750,12 @@ test("actual H3 async reset revokes its token before every late stream callback"
       const late = fixture(name);
       late.streamId = opened.streamId;
       late.payload.generation = opened.payload.generation;
-      await assert.rejects(
-        h.runtime.sendTerminalFrame({ ...oldBinding }, late),
-        /stale route binding/,
-      );
+      // The reset rotated the H3 token; these late callbacks target a revoked
+      // binding and are dropped silently (route teardown) instead of throwing
+      // a fatal-grade plain Error across the manager serializer.
+      await h.runtime.sendTerminalFrame({ ...oldBinding }, late);
     }
-    assert.equal(h.state.sent.length, beforeLateCallbacks);
+    assert.equal(h.state.sent.length, beforeLateCallbacks, "no late frame may be delivered");
     assert.equal(backend.opens[0].handle.closeCalls, 1);
     assert.deepEqual(h.state.closes, []);
   } finally {

@@ -55,6 +55,12 @@ export const RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS =
 
 const MAX_ACTIVE_CHANNELS = 256;
 const DAEMON_UPGRADE_TIMEOUT_MS = 5_000;
+// A prepared record whose open never reaches admission/consume (client
+// disconnected, open deadline fired) would otherwise live forever and pin a
+// compound channel until the 256-channel cap wedged all terminal.open. The
+// daemon-side claim rolls itself back after its own lease TTL (~30s); use a
+// looser bound so the safety net never races the daemon's own rollback.
+const PREPARED_RECORD_TTL_MS = 60_000;
 const JSON_LIMITS = Object.freeze({
   maxDepth: 20,
   maxDirectKeys: 64,
@@ -105,6 +111,7 @@ interface HostRecord {
   state: "prepared" | "admitted" | "consumed" | "observing" | "closed";
   lease: TerminalControlLease | null;
   observation: RelayV2ExactCompoundObservationBindingV1 | null;
+  ttlTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface RelayV2ExactCompoundObservationBindingV1 {
@@ -1455,7 +1462,9 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
         state: "prepared",
         lease: null,
         observation: null,
+        ttlTimer: null,
       });
+      this.armPreparedTtl(token);
       return evidence;
     } catch (error) {
       await channel.close().catch(() => undefined);
@@ -1476,6 +1485,10 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
       throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound preparation is stale");
     }
     record.state = "admitted";
+    // The claim is now fenced into the durable open lineage; its lifecycle is
+    // owned by admit/consume/release, so the abandoned-prepare safety net must
+    // no longer fire.
+    this.clearPreparedTtl(record);
   }
 
   async consumePreparedLeaseForBinding(
@@ -1504,6 +1517,7 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
       }
       record.state = "consumed";
       record.lease = admitted;
+      this.clearPreparedTtl(record);
       return Object.freeze({ ...admitted, owner: Object.freeze({ ...admitted.owner }) });
     } catch (error) {
       this.records.delete(token);
@@ -1588,6 +1602,7 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
       }
       record.state = "observing";
       record.observation = observed;
+      this.clearPreparedTtl(record);
       return Object.freeze({ ...observed });
     } catch (error) {
       return this.retireFailedObservation(token, record, error);
@@ -1787,8 +1802,34 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
     this.admissionClosed = true;
   }
 
+  private armPreparedTtl(token: string): void {
+    const record = this.records.get(token);
+    if (record === undefined) return;
+    record.ttlTimer = setTimeout(() => {
+      const current = this.records.get(token);
+      // Safety net only: a prepared record nobody advanced (the open was
+      // abandoned by a disconnect or a deadline) must not pin a channel until
+      // the 256-channel cap wedges all future opens. Once a record is admitted
+      // it is fenced into a durable lineage claim and owned by that open's
+      // lifecycle; the timer is cleared on admission/consume.
+      if (current !== record || current.state !== "prepared") {
+        return;
+      }
+      void this.retire(token, current, true).catch(() => undefined);
+    }, PREPARED_RECORD_TTL_MS);
+    record.ttlTimer.unref?.();
+  }
+
+  private clearPreparedTtl(record: HostRecord): void {
+    if (record.ttlTimer !== null) {
+      clearTimeout(record.ttlTimer);
+      record.ttlTimer = null;
+    }
+  }
+
   private async retire(token: string, record: HostRecord, rollback: boolean): Promise<void> {
     if (record.state === "closed") return;
+    this.clearPreparedTtl(record);
     this.records.delete(token);
     const canRollback = rollback && (record.state === "prepared" || record.state === "admitted");
     record.state = "closed";

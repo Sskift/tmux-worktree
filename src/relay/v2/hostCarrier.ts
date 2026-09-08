@@ -2301,6 +2301,12 @@ export class RelayV2HostCarrierActor {
     message: string,
     retryable: boolean,
   ): void {
+    // A rejected route never becomes (or has already been removed from) the
+    // live routes map, so its identity slot is dead. Reclaim it so retry storms
+    // and normal open/close churn cannot fill seenRouteIds to the hard limit
+    // and permanently BUSY every later route.open on this connector. The
+    // route_identity_reused guard only cares about identities with a live route.
+    connector.seenRouteIds.delete(stringField(request, "routeId"));
     this.enqueueControl(connector, {
       carrierVersion: 1,
       type: "route.rejected",
@@ -2389,6 +2395,10 @@ export class RelayV2HostCarrierActor {
     route.phase = "closing";
     this.cancelCommandWindowRotation(route);
     connector.routes.delete(route.binding.routeId);
+    // The route is fully unbound; reclaim its identity so normal open/close
+    // churn does not monotonically consume seenRouteIds toward the hard limit
+    // (mirrors the broker side dropping its routeIds when a route closes).
+    connector.seenRouteIds.delete(route.binding.routeId);
     const detached = this.detachQueuedDataForRoute(connector, route);
     this.removeControlItems(connector, (item) => item.route === route);
     const reason = stringField(payload, "reason") as RelayV2HostRouteUnbindReason;

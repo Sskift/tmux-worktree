@@ -767,6 +767,65 @@ test("open waits for the post-create canonical resolver cut instead of persistin
   assert.ok(opened(h.sent, request.requestId));
 });
 
+test("D032: a resolver cut still rebuilding through the refresh budget is BUSY terminal_open_timeout, never a persisted CAPABILITY_UNAVAILABLE", async (t) => {
+  // Fake clocks: advance past the old fixed 50x100ms (~5s) refresh budget but
+  // stay inside the 8s open deadline. No real wall time is consumed.
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  try {
+    const resolver = new FakeResolver();
+    const cutRefreshing = Object.assign(
+      new Error("canonical target resolver has no current complete discovery cut"),
+      { code: "CAPABILITY_UNAVAILABLE" },
+    );
+    for (let index = 0; index < 200; index += 1) {
+      resolver.resolveResults.push(cutRefreshing);
+    }
+    const h = harness({ resolver, openOperationTimeoutMs: 8_000 });
+    const request = goldenOpen({ requestId: "d032-refresh-window" });
+    const open = h.manager.open(request);
+    for (let elapsed = 0; elapsed < 6_000; elapsed += 100) {
+      t.mock.timers.tick(100);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    // Pre-fix the fixed-count budget rethrew the raw CAPABILITY_UNAVAILABLE
+    // (non-retryable), making Android park on a manual Reconnect. Now the
+    // exhausted cut-rebuild wait is classified as the open deadline (BUSY,
+    // terminal_open_timeout, request-scoped and retried by the client).
+    await assert.rejects(open, (error) => {
+      assert.ok(error instanceof terminal.RelayV2TerminalManagerError);
+      assert.equal(error.code, "BUSY");
+      assert.deepEqual({ ...error.details }, { reason: "terminal_open_timeout" });
+      return true;
+    });
+    assert.ok(
+      h.resolver.calls.length > 50,
+      `expected polling to run past the old fixed 50-attempt budget, got ${h.resolver.calls.length}`,
+    );
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("D032: an open whose cut refreshes inside the deadline recovers and opens", async () => {
+  const resolver = new FakeResolver();
+  const cutRefreshing = Object.assign(
+    new Error("canonical target resolver has no current complete discovery cut"),
+    { code: "CAPABILITY_UNAVAILABLE" },
+  );
+  // Cut is rebuilding for ~6 refresh waits (~600ms), then republished.
+  for (let index = 0; index < 6; index += 1) {
+    resolver.resolveResults.push(cutRefreshing);
+  }
+  const h = harness({ resolver, openOperationTimeoutMs: 8_000 });
+  const request = goldenOpen({ requestId: "d032-refresh-recovers" });
+
+  await h.manager.open(request);
+  assert.ok(opened(h.sent, request.requestId), "the open completes once the cut republished");
+  assert.equal(h.backend.opens.length, 1);
+});
+
 test("hung durable preparation reaches the open deadline without blocking another terminal stream", async () => {
   const preparation = deferred();
   const h = harness({ openOperationTimeoutMs: 30 });
@@ -1888,6 +1947,85 @@ test("RESET yields its own producer lease before exact target replacement", asyn
   assert.equal(resolver.calls.length, 2);
   assert.equal(h.backend.opens.length, 2);
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+});
+
+test("C037: uncertain producer release on RESET yields request-scoped BUSY, never host-wide fatal", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-c037-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const resolver = new FakeResolver();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: resolver,
+      now: () => 1_000_000,
+    });
+    const h = harness({
+      resolver,
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+    });
+    const fatalErrors = [];
+    const recovery = terminal.captureRelayV2TerminalManagerRecoveryBinding(h.manager, lineage);
+    assert.ok(recovery);
+    assert.equal(recovery.installFatalSink((error) => fatalErrors.push(error)), true);
+
+    const sourceRequest = goldenOpen({
+      requestId: "c037-source",
+      streamId: "c037-stream",
+      openId: "c037-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(sourceRequest);
+    const source = opened(h.sent, sourceRequest.requestId);
+    // Establish a live producer lease so unbind/detach leaves a retiringLease.
+    await h.manager.input({
+      ...streamContext(source),
+      inputSeq: "1",
+      data: Buffer.from("c037-hold-producer-lease"),
+    });
+
+    // Detach (route teardown). The release answer is lost -> retiringLease hangs.
+    h.authority.releaseResults.push(new Error("release answer lost in flight"));
+    await h.manager.unbind(AUTH, ROUTE_ONE);
+    assert.equal(fatalErrors.length, 0, "detach uncertain release must never be fatal");
+
+    const resetRequest = goldenOpen({
+      requestId: "c037-reset",
+      streamId: sourceRequest.streamId,
+      openId: "c037-reset-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+
+    // Reconcile also cannot confirm (control plane still down / continuity
+    // unknown): the RESET must fail as request-scoped BUSY, not INTERNAL.
+    h.authority.continuityResults.push(new Error("continuity probe lost"));
+    await assert.rejects(h.manager.open(resetRequest), managerError("BUSY"));
+    assert.equal(fatalErrors.length, 0, "uncertain RESET release must not fence the host H3 lane");
+    assert.ok(
+      fatalErrors.every((error) => error.code !== "INTERNAL"),
+      "no INTERNAL authority failure may reach the fatal sink",
+    );
+    // The old lease was asked to release exactly once (by detach); the reset
+    // attempt must not have fired a duplicate release before reconcile.
+    assert.equal(h.authority.releaseCalls.length, 1);
+
+    // Retry once the control plane converges: continuity reports the lease is
+    // gone (false), reconcile clears retiringLease, and the RESET succeeds.
+    h.authority.continuityResults.push(false);
+    await h.manager.open({ ...resetRequest, requestId: "c037-reset-retry" });
+    const recovered = opened(h.sent, "c037-reset-retry");
+    assert.equal(recovered.payload.disposition, "reset");
+    assert.equal(fatalErrors.length, 0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("durable RESET refreshes only the exact controller epoch after terminal-control restart", async () => {

@@ -40,6 +40,13 @@ const COMMAND_WINDOW_REVISION_KEY = "command-windows";
 const COMMAND_KEY_PREFIX = "cmd:v1:";
 const WINDOW_KEY_PREFIX = "cmdwin:v1:";
 const MAX_H1_READINESS_GENERATION = 18_446_744_073_709_551_615n;
+// claimAccepted polls commit-uncertain outcomes indefinitely (they converge),
+// but a deterministic persistence failure (ENOSPC/EIO/capacity) must not spin
+// forever: the accepted record stays durable and the next execute/query (or
+// restart recovery) re-claims idempotently once storage recovers. Bound the
+// generic retry lane so a persistent fault surfaces instead of livelocking the
+// serializer and pinning the runner promise.
+const CLAIM_ACCEPTED_MAX_RETRY_ATTEMPTS = 3000;
 
 export type RelayV2CommandOperation =
   | "create_worktree"
@@ -2737,6 +2744,7 @@ export class RelayV2HostCommandPlane {
     claimed: false;
     record: StoredCommand;
   }> {
+    let retryAttempts = 0;
     while (true) {
       try {
         const commit = await this.store.transaction((transaction) => {
@@ -2773,6 +2781,17 @@ export class RelayV2HostCommandPlane {
         }
         if (observed.recordType !== "command" || observed.state !== "accepted") {
           return { claimed: false, record: observed };
+        }
+        // Deterministic persistence faults (capacity budget exceeded, ENOSPC,
+        // EIO) are not commit-uncertain: the accepted->running claim did not
+        // cross any side-effect boundary, so retrying the write forever only
+        // livelocks the serializer and pins the runner. Surface the error;
+        // the durable accepted record is re-claimed idempotently by the next
+        // execute/query ensureRunner or by restart recovery once storage heals.
+        if (isHostStateCapacityError(error)) throw error;
+        if (!isHostStateCommitUncertain(error)) {
+          retryAttempts += 1;
+          if (retryAttempts >= CLAIM_ACCEPTED_MAX_RETRY_ATTEMPTS) throw error;
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 10));
       }

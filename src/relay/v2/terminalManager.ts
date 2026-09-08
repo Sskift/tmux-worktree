@@ -3262,11 +3262,37 @@ export class RelayV2TerminalManager {
       // and lazily reacquire control on its next input.
       const released = await this.releaseProducerLease(previous);
       if (released.status === "uncertain") {
-        previous.controlInDoubt = released.error;
-        throw new RelayV2TerminalManagerError(
-          "INTERNAL",
-          "terminal reset could not confirm previous producer release",
-        );
+        // The release answer was lost (control plane restarted, socket broke).
+        // The bounded reconcile that the input/resize paths already rely on can
+        // often retire the hanging lease on the spot; fence its own fault so a
+        // defensive throw never re-escalates to the host-wide fatal sink.
+        try {
+          await this.reconcileRetiringLease(previous);
+        } catch {
+          // reconcileRetiringLease swallows its faults; this only guards a
+          // future throw from propagating out as an authority failure.
+        }
+        if (previous.retiringLease !== undefined) {
+          // Still unconfirmed: the exact target may still hold the old producer
+          // lease, so this RESET must not prepare/register a new single-writer
+          // claim. This is a transient, request-scoped condition — the next
+          // RESET retries release + bounded reconcile — not an INTERNAL host
+          // fault. Release this attempt's still-unprepared durable claim (the
+          // exact target has not been prepared yet) and surface BUSY so the
+          // caller backs off and retries, instead of fencing the whole H3 lane.
+          await this.lineage.releaseUnpreparedOpenClaim({
+            key: recordKey,
+            fingerprint: requestFingerprint,
+            hostInstanceId: this.hostInstanceId,
+            claimToken: claimAuthority.claimToken,
+            fence: claimAuthority.fence,
+          });
+          throw new RelayV2TerminalManagerError(
+            "BUSY",
+            "terminal reset is waiting for the previous producer release to confirm",
+          );
+        }
+        // Reconcile confirmed the release; fall through to prepare.
       }
     }
     const resolution = await this.prepareCanonicalTarget(
@@ -3822,9 +3848,20 @@ export class RelayV2TerminalManager {
           );
           break;
         } catch (error) {
-          if (!canonicalResolverCutIsRefreshing(error)
+          if (!canonicalResolverCutIsRefreshing(error)) throw error;
+          // The canonical resolver cut is rebuilding (a signal-triggered full
+          // discovery pass — slow SSH scopes can take ~30-45s). The fixed
+          // 50x100ms refresh budget (~5s) expires well inside that window and
+          // inside this open's 8s serializer deadline. Bound the wait by the
+          // open deadline (the count is only an anti-livelock ceiling), and
+          // classify an exhausted wait as the existing request-scoped open
+          // deadline (BUSY/terminal_open_timeout, retried by the client) rather
+          // than persisting a non-retryable CAPABILITY_UNAVAILABLE — the cut is
+          // transiently absent, not permanently unavailable.
+          const remainingMs = deadline.expiresAtMs - Date.now();
+          if (remainingMs <= CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS
             || refreshAttempts >= CANONICAL_RESOLVER_REFRESH_RETRY_ATTEMPTS) {
-            throw error;
+            throw this.openDeadlineError("target resolver refresh");
           }
           refreshAttempts += 1;
           await this.runOpenStep(

@@ -1730,3 +1730,111 @@ test("closeObservedTarget rolls back a pending claim before the deferred observa
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function ttlHarness() {
+  const stats = { opened: 0, closed: 0, rollbacks: 0 };
+  const makeChannel = () => ({
+    async request(frame) {
+      if (frame.type === "rollback") {
+        stats.rollbacks += 1;
+        return { protocolVersion: 1, ok: true, result: { rolledBack: true } };
+      }
+      return {
+        protocolVersion: 1,
+        ok: true,
+        result: {
+          exactControlIdentity: {
+            schemaVersion: 1,
+            controlTargetId: "control-target-ttl",
+            controlEpoch: "control-epoch-ttl",
+            targetIncarnationProof: "twct2.ttl-proof",
+          },
+        },
+      };
+    },
+    async close() {
+      stats.closed += 1;
+    },
+  });
+  const remote = new compound.RelayV2RemoteExactTerminalControlCompoundAdapterV1({
+    owner: OWNER,
+    channels: {
+      async open() {
+        stats.opened += 1;
+        return makeChannel();
+      },
+    },
+  });
+  const ttlInput = (index) => ({
+    schemaVersion: 1,
+    hostId: "host-ttl",
+    scopeId: "scope-ttl",
+    sessionId: `session-ttl-${index}`,
+    pane: 0,
+    processTarget: { ...PROCESS_TARGET },
+    backendInstanceKey: backendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+      processTarget: PROCESS_TARGET,
+      incarnation: INCARNATION,
+    }),
+    managedTarget: { name: "managed-ttl", kind: "worktree", incarnation: INCARNATION },
+  });
+  return { remote, stats, ttlInput };
+}
+
+const flushMicrotasks = async (turns = 20) => {
+  for (let index = 0; index < turns; index += 1) {
+    await Promise.resolve();
+  }
+};
+
+test("C052: abandoned prepared compound records expire and roll back instead of wedging admission", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const { remote, stats, ttlInput } = ttlHarness();
+  try {
+    // 256 abandoned prepares (never admitted) used to pin a channel each and
+    // wedge every future resolveExactTarget at the 256-channel cap.
+    const evidence = [];
+    for (let index = 0; index < 256; index += 1) {
+      evidence.push(await remote.resolveExactTarget(ttlInput(index)));
+    }
+    assert.equal(stats.opened, 256);
+    assert.equal(stats.closed, 0, "abandoned prepared records leak until the TTL");
+
+    await assert.rejects(
+      remote.resolveExactTarget(ttlInput(256)),
+      (error) => error?.code === "RESOURCE_EXHAUSTED" && error.retryable === true,
+    );
+
+    // Advance past the prepared-record TTL. The safety net retires every
+    // record (best-effort rollback + channel close), freeing admission.
+    t.mock.timers.tick(60_000);
+    await flushMicrotasks();
+    assert.equal(stats.closed, 256, "every leaked channel is closed by the TTL sweep");
+    assert.equal(stats.rollbacks, 256, "each expired prepared claim sends a rollback");
+
+    // The 257th resolve now succeeds instead of being permanently wedged.
+    const recovered = await remote.resolveExactTarget(ttlInput(257));
+    assert.match(recovered.exactControlToken, /^twrc2\./);
+  } finally {
+    t.mock.timers.reset();
+    await remote.close().catch(() => undefined);
+  }
+});
+
+test("C052: admission clears the prepared-record TTL so a late sweep cannot roll back an admitted claim", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const { remote, stats, ttlInput } = ttlHarness();
+  try {
+    const input = ttlInput(900);
+    const evidence = await remote.resolveExactTarget(input);
+    remote.fenceExactTargetForAdmission(input, evidence);
+    // Well past the TTL window: the admitted record must not be touched.
+    t.mock.timers.tick(120_000);
+    await flushMicrotasks();
+    assert.equal(stats.closed, 0, "an admitted record is immune to the prepared TTL");
+    assert.equal(stats.rollbacks, 0, "no late rollback may target an admitted claim");
+  } finally {
+    t.mock.timers.reset();
+    await remote.close().catch(() => undefined);
+  }
+});

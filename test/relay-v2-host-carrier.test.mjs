@@ -1999,3 +1999,92 @@ test("control, queued data, and socket-buffered bytes share one carrier hard lim
   assert.equal(decoded(active.transport.sent).at(-1).type, "host.reauthenticate");
   assert.ok(active.transport.bufferedAmount() <= 1_600);
 });
+
+test("D027: retryable bind-rejection storms reclaim route identities so the identity ceiling never wedges opens", () => {
+  // Identity ceiling far below the production 4096 to drive the condition in a
+  // tight loop; the live-route ceiling stays high so only identities gate.
+  let acceptBinds = false;
+  const h = createHarness({
+    queueLimits: { maxRoutes: 128, maxRouteIdentitiesPerConnector: 8 },
+    // Every bind is rejected retryably, the way the route registry reports a
+    // transient full/duplicate binding during a reconnect storm.
+    onRouteBound: () => {
+      if (acceptBinds) return undefined;
+      return {
+        accepted: false,
+        code: "BUSY",
+        message: "route registry is full",
+        retryable: true,
+      };
+    },
+  });
+  const active = connect(h);
+  const connectorId = register(active.connection, active.hello);
+
+  // More rejected opens than the identity ceiling. Pre-fix each rejection
+  // permanently retained its routeId and the ceiling permanently BUSY'd every
+  // later open for the connector's lifetime.
+  for (let index = 0; index < 16; index += 1) {
+    active.connection.receive(wire(routeOpen(connectorId, {
+      routeId: `storm-route-${index}`,
+      routeFence: `storm-fence-${index}`,
+      connectionId: `storm-conn-${index}`,
+      requestId: `storm-open-${index}`,
+    })));
+    const response = decoded(active.transport.sent).at(-1);
+    assert.equal(response.type, "route.rejected");
+    assert.equal(response.error.code, "BUSY");
+    assert.equal(response.error.retryable, true);
+  }
+
+  // Once the sink accepts again, a brand-new routeId must open rather than be
+  // refused by the (now reclaimed) identity ceiling.
+  acceptBinds = true;
+  active.connection.receive(wire(routeOpen(connectorId, {
+    routeId: "after-storm-route",
+    routeFence: "after-storm-fence",
+    connectionId: "after-storm-conn",
+    requestId: "after-storm-open",
+  })));
+  const after = decoded(active.transport.sent).at(-1);
+  assert.equal(after.type, "route.opened", "identity slots must be reclaimed after rejections");
+});
+
+test("D027: normal bind then unbind reclaims the route identity for a later route", () => {
+  const h = createHarness({
+    queueLimits: { maxRoutes: 128, maxRouteIdentitiesPerConnector: 1 },
+  });
+  const active = connect(h);
+  const connectorId = register(active.connection, active.hello);
+
+  active.connection.receive(wire(routeOpen(connectorId, {
+    routeId: "churn-route-one",
+    routeFence: "churn-fence-one",
+    connectionId: "churn-conn-one",
+    requestId: "churn-open-one",
+  })));
+  const opened = decoded(active.transport.sent).at(-1);
+  assert.equal(opened.type, "route.opened");
+  const binding = h.bound.at(-1);
+
+  // Unbind (normal close). Pre-fix the identity was retained in seenRouteIds.
+  active.connection.receive(wire({
+    carrierVersion: 1,
+    type: "route.unbind",
+    connectorId,
+    routeId: binding.routeId,
+    routeFence: binding.routeFence,
+    payload: { reason: "client_closed", lastClientToHostSeq: "0" },
+  }));
+  assert.equal(decoded(active.transport.sent).at(-1).type, "route.unbound");
+
+  // With a ceiling of 1 a retained identity would force a BUSY; reclamation
+  // lets the fresh route open.
+  active.connection.receive(wire(routeOpen(connectorId, {
+    routeId: "churn-route-two",
+    routeFence: "churn-fence-two",
+    connectionId: "churn-conn-two",
+    requestId: "churn-open-two",
+  })));
+  assert.equal(decoded(active.transport.sent).at(-1).type, "route.opened");
+});
