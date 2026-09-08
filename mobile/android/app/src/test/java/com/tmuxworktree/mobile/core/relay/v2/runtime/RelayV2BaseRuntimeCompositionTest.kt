@@ -71,6 +71,8 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2ResultSessionKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasExpectation
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasResult
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeFailureKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -2189,6 +2191,136 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertEquals(1, failed.factory.requests.size)
             } finally {
                 failed.close()
+            }
+        }
+
+    @Test
+    fun `transient rollover network failure backs off and retries then recovers online`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            lateinit var harness: Harness
+            val rollover = RelayV2CredentialRolloverPort { expected ->
+                when (rolloverCalls.incrementAndGet()) {
+                    1 -> throw RelayV2CredentialExchangeException(
+                        RelayV2CredentialExchangeFailureKind.NETWORK,
+                    )
+                    else -> {
+                        // Durable credential CAS commits with the refresh, exactly as the
+                        // production repository does before the successor transport opens.
+                        harness.advanceCredentialVersion(2)
+                        RelayV2CredentialRolloverResult.Refreshed(
+                            expected.copy(credentialVersion = 2),
+                        )
+                    }
+                }
+            }
+            harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // Cold reconnect claims an expired-credential rollover; the first refresh hits a
+                // network failure. It must stay non-terminal and arm one bounded retry instead.
+                assertTrue(
+                    "rollover was not claimed by cold reconnect",
+                    retry.awaitCount(1),
+                )
+                delay(50)
+                assertNull(
+                    "transient rollover failure must not latch terminalFailure",
+                    harness.composition.state.value.failure,
+                )
+                assertEquals(1, rolloverCalls.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    harness.composition.state.value.phase,
+                )
+
+                retry.release(0)
+                // The retried rollover succeeds; the successor transport must come up ONLINE.
+                val successor = harness.awaitTransport()
+                successor.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                successor.sendFixture("relay-welcome")
+                val hello = successor.awaitSentFrame()
+                val welcome = fixture("host-welcome-caught-up")
+                welcome["requestId"] = hello.stringValue("requestId")
+                successor.sendFrame(welcome)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                assertEquals(2, rolloverCalls.get())
+                assertNull(harness.composition.state.value.failure)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `auth rollover failure stays terminal and does not retry`() = runBlocking {
+        val rolloverCalls = AtomicInteger()
+        val retry = ControlledRetryDelay()
+        val rollover = RelayV2CredentialRolloverPort {
+            rolloverCalls.incrementAndGet()
+            throw RelayV2CredentialExchangeException(
+                RelayV2CredentialExchangeFailureKind.AUTH,
+            )
+        }
+        val harness = Harness(
+            autoConnect = true,
+            credentialRollover = rollover,
+            retryDelayBlock = retry::awaitDelay,
+        )
+        try {
+            harness.connectOnline()
+            harness.transport().sendFixture("auth-expiring")
+            val state = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+            delay(50)
+            assertEquals("AUTH failure must not retry rollover", 1, rolloverCalls.get())
+            assertFalse("AUTH failure must not arm backoff", retry.awaitCount(1, timeoutMs = 200))
+            assertEquals(
+                RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                    RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE,
+                ),
+                state.failure,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `rollover retries are bounded and escalate to terminal after the ladder is exhausted`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            val rollover = RelayV2CredentialRolloverPort {
+                rolloverCalls.incrementAndGet()
+                RelayV2CredentialRolloverResult.Retryable()
+            }
+            val harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // Arm each bounded backoff as it arrives (initial attempt + 5 retries), then the
+                // exhausted ladder must escalate to the terminal rollover failure.
+                repeat(5) { index ->
+                    assertTrue("rollover backoff ${index + 1} never armed", retry.awaitCount(index + 1))
+                    retry.release(index)
+                }
+                val state = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+                assertEquals("initial attempt + 5 retries", 6, rolloverCalls.get())
+                assertEquals(
+                    RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                        RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE,
+                    ),
+                    state.failure,
+                )
+            } finally {
+                harness.close()
             }
         }
 
