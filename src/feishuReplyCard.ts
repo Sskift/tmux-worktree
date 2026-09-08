@@ -6,6 +6,7 @@ export type FeishuReplyCard = Record<string, unknown>;
 
 export type FeishuBindingLifecycleCardKind =
   | "linked"
+  | "control-needs-confirm"
   | "manual-unlink"
   | "session-deleted"
   | "target-ended"
@@ -266,6 +267,13 @@ function lifecyclePresentation(kind: FeishuBindingLifecycleCardKind): {
         template: "grey",
         tag: "已解绑",
       };
+    case "control-needs-confirm":
+      return {
+        title: "TW 群聊连接待重新确认",
+        summary: "机器人控制权需在 Dashboard 重新确认",
+        template: "red",
+        tag: "待确认",
+      };
     case "session-deleted":
     case "target-ended":
     case "target-replaced":
@@ -286,6 +294,11 @@ function lifecycleReason(
   action: string;
 } {
   switch (kind) {
+    case "control-needs-confirm":
+      return {
+        reason: "机器人桥接进程重启或终端租约续约失败，期间群消息未转发到 TW 会话。",
+        action: "请在本机 Dashboard 的飞书绑定面板点击修复/恢复，之后群消息会继续转发。",
+      };
     case "manual-unlink":
       return {
         reason: removalOrigin === "dashboard"

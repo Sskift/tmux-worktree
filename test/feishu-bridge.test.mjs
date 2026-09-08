@@ -209,8 +209,10 @@ class FakeControlClient {
     this.agentResultTruncated = false;
     this.agentResultErrors = [];
     this.agentStatusErrors = [];
+    this.tailErrors = [];
     this.failRelease = false;
     this.failRenew = false;
+    this.renewErrors = [];
     this.tailFence = undefined;
     this.tailOwnerKind = undefined;
     this.tailChunkBytes = undefined;
@@ -227,6 +229,7 @@ class FakeControlClient {
     this.beforeRetainedStale = undefined;
     this.beforeInput = undefined;
     this.beforeCommit = undefined;
+    this.beforeRenew = undefined;
     this.failInputAfterCommit = false;
     this.ownershipStatusCalls = 0;
     this.failOwnershipStatusAt = undefined;
@@ -418,7 +421,13 @@ class FakeControlClient {
 
   async renewLease(lease, ttlMs) {
     this.record("lease.renew", { lease: structuredClone(lease), ...(ttlMs === undefined ? {} : { ttlMs }) });
+    if (this.beforeRenew) await this.beforeRenew({ lease: structuredClone(lease) });
+    // The authority validates the carried lease when it processes the request
+    // (after any queueing/lock wait), so a lease rotated while this RPC was in
+    // flight is rejected here — mirroring validateLease on the daemon.
     this.assertLease(lease, true);
+    const queuedError = this.renewErrors.shift();
+    if (queuedError) throw queuedError;
     if (this.failRenew) {
       const error = new Error("lease renewal entered recovery");
       error.code = "RECOVERY_REQUIRED";
@@ -575,6 +584,8 @@ class FakeControlClient {
       error.code = "STALE_OUTPUT_CURSOR";
       throw error;
     }
+    const tailError = this.tailErrors.shift();
+    if (tailError) throw tailError;
     const source = Buffer.from(this.output, "utf8");
     const maxBytes = Math.min(input.maxBytes, this.tailChunkBytes ?? input.maxBytes);
     const data = source.subarray(input.cursor, input.cursor + maxBytes);
@@ -1612,6 +1623,109 @@ test("a delayed turn reply never blocks lease renewal or permits concurrent unli
   }
 });
 
+test("a group message arriving while the final reply card delivers is not steered", async () => {
+  const h = harness();
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markAnswerStarted = () => {};
+  const answerStarted = new Promise((resolve) => { markAnswerStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "the final answer");
+    h.lark.beforeReply = async ({ messageId }) => {
+      if (messageId === "om-one") {
+        markAnswerStarted();
+        await replyBarrier;
+      }
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await answerStarted;
+    assert.equal(h.bridge.snapshot().activeTurns[0].status, "replying");
+
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+
+    const steerInputs = h.control.inputs.filter(({ operationId }) =>
+      String(operationId).startsWith("feishu-steer-"));
+    assert.equal(steerInputs.length, 0, "a replying turn must not accept steering injection");
+    assert.equal(h.control.inputs.length, 1, "the follow-up message must not be injected");
+    const followup = h.lark.replies.find((reply) => reply.messageId === "om-two");
+    assert.ok(followup, "the follow-up sender must get a retry notice card");
+    assert.match(followup.text, /最终回复卡正在投递/);
+
+    releaseReply();
+    await pollPromise;
+    assert.equal(currentTurn(h).status, "completed");
+    assert.equal(h.control.inputs.length, 1, "no delayed injection after the reply lands");
+  } finally {
+    releaseReply();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a failed transient inform card logs and still leaves the message uninjected", async () => {
+  const h = harness();
+  const logs = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => {
+    logs.push(String(chunk));
+    return true;
+  };
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markAnswerStarted = () => {};
+  const answerStarted = new Promise((resolve) => { markAnswerStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "answer");
+    h.lark.beforeReply = async ({ messageId }) => {
+      if (messageId === "om-one") {
+        markAnswerStarted();
+        await replyBarrier;
+      }
+      if (messageId === "om-two") throw new Error("lark-cli reply timed out");
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await answerStarted;
+    // The turn is replying; the follow-up hits the replying gate and its inform
+    // card fails to send.
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+    await flushBestEffortEffects();
+
+    assert.equal(h.control.inputs.length, 1, "the message must not be injected");
+    const followup = h.lark.replies.find((reply) => reply.messageId === "om-two");
+    assert.ok(followup, "the inform card was attempted");
+    assert.ok(
+      logs.some((line) => line.includes("inform reply card failed") && line.includes("om-two")),
+      "the failed inform is logged instead of being swallowed silently",
+    );
+    assert.equal(
+      h.store.read().replies.some((reply) => reply.sourceMessageId === "om-two"),
+      false,
+      "the transient inform is not made durable",
+    );
+    releaseReply();
+    await pollPromise;
+  } finally {
+    process.stderr.write = originalWrite;
+    releaseReply();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an external non-force handoff waits for inherited Agent completion", async () => {
   const h = harness();
   try {
@@ -1634,6 +1748,50 @@ test("an external non-force handoff waits for inherited Agent completion", async
 
     await h.control.withdrawHandoff(binding.controlTargetId, pending.ownership.handoffId, localOwner);
     await h.bridge.reconcileHandoffs();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an inherited task that stops during a draining handoff settles and lets the handoff commit", async () => {
+  let now = Date.parse("2026-09-08T02:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+
+    const localOwner = { kind: "dashboard", instanceId: "dashboard:external:pty-one" };
+    await h.control.beginHandoff(binding.controlTargetId, localOwner);
+    await h.bridge.reconcileHandoffs();
+    assert.equal(h.control.target.state, "DRAINING");
+
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "stop-candidate");
+    now += 1_001;
+    await h.bridge.pollTurns();
+
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "activity.agent-result").length,
+      1,
+      "the inherited task final result must be captured even while DRAINING",
+    );
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /The exact structured final answer\./);
+
+    await h.bridge.reconcileHandoffs();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "handoff.commit").length,
+      1,
+      "a settled watch must let the pending handoff commit",
+    );
+    assert.equal(h.control.target.state, "HELD");
+    assert.equal(h.control.target.owner.kind, "dashboard");
+    assert.equal(h.bridge.snapshot().bindings[0].status, "paused");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1930,6 +2088,118 @@ test("a slow reaction API never blocks canonical lease renewal", async () => {
   }
 });
 
+test("a slow agent-message injection does not block the lease renewal RPC", async () => {
+  const h = harness();
+  let releaseInput = () => {};
+  const inputBarrier = new Promise((resolve) => { releaseInput = resolve; });
+  let markInputStarted = () => {};
+  const inputStarted = new Promise((resolve) => { markInputStarted = resolve; });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    h.control.beforeInput = async () => {
+      markInputStarted();
+      await inputBarrier;
+    };
+
+    const inputPromise = h.bridge.handleEvent(event());
+    await inputStarted;
+
+    const renewCountBefore = h.control.requests
+      .filter(({ type }) => type === "lease.renew").length;
+    let renewDone = false;
+    const renewPromise = h.bridge.renewLeases().then(() => { renewDone = true; });
+
+    // While the agent-message RPC is still blocked, the renewal must reach the
+    // control client on its own lane (it does not wait for the mutation lane).
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("renewal was blocked behind the slow agent-message injection")),
+        500,
+      );
+      const check = () => {
+        const reached = h.control.requests.filter(({ type }) => type === "lease.renew").length
+          > renewCountBefore;
+        if (reached) { clearTimeout(timer); resolve(); }
+        else setImmediate(check);
+      };
+      check();
+    });
+
+    releaseInput();
+    await Promise.all([inputPromise, renewPromise]);
+    assert.equal(renewDone, true);
+  } finally {
+    releaseInput();
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a renewal RPC answered after the lease was rotated must not fence the new lease", async () => {
+  const h = harness();
+  let releaseRenew = () => {};
+  const renewBarrier = new Promise((resolve) => { releaseRenew = resolve; });
+  let renewBarrierArmed = true;
+  try {
+    const created = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    const bindingId = created.id;
+    const firstFence = h.control.target.fence;
+    assert.equal(h.control.target.state, "HELD");
+
+    // Issue a renewal and hold its RPC in flight on the renew lane.
+    h.control.beforeRenew = async () => {
+      if (renewBarrierArmed) await renewBarrier;
+    };
+    const renewInFlight = h.bridge.renewLeases();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "the renewal RPC must be in flight",
+    );
+
+    // While that RPC is still in flight, force-pause (releases the old lease,
+    // fence rotates) and resume (acquires a fresh lease with a new fence); the
+    // binding returns to active.
+    await h.bridge.pauseBinding(bindingId, true);
+    await h.bridge.resumeBinding(bindingId);
+    const resumedState = h.store.read();
+    const resumedBinding = resumedState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(resumedBinding.status, "active");
+    assert.notEqual(h.control.target.fence, firstFence, "resume must acquire a new-generation lease");
+
+    // Now release the stuck renewal. The authority rejects the old-generation
+    // lease (fence mismatch → PERMISSION_DENIED). That verdict belongs to the
+    // released lease, so the freshly resumed binding must stay active.
+    renewBarrierArmed = false;
+    releaseRenew();
+    await renewInFlight;
+
+    const finalState = h.store.read();
+    const finalBinding = finalState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(finalBinding.status, "active", "a stale-generation renewal verdict must not mark the binding stale");
+    assert.equal(finalBinding.staleReason, undefined);
+    // The renewal sweep keeps the current lease map entry in place.
+    const renewCalls = h.control.requests.filter(({ type }) => type === "lease.renew");
+    assert.equal(renewCalls.length, 1);
+
+    // The current lease still renews cleanly on the next sweep (no poisoned state).
+    await h.bridge.renewLeases();
+    const afterState = h.store.read();
+    const afterBinding = afterState.bindings.find((candidate) => candidate.id === bindingId);
+    assert.equal(afterBinding.status, "active");
+  } finally {
+    renewBarrierArmed = false;
+    releaseRenew();
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("agent-message output correlation, not a pre-input inspect cursor, starts the Feishu turn", async () => {
   const h = harness();
   try {
@@ -2169,6 +2439,106 @@ test("lease renewal failure settles an inherited task watch as recovery-required
   }
 });
 
+test("a retryable lease renewal failure keeps the binding active and a later tick recovers", async () => {
+  for (const failure of [
+    new CanonicalTerminalControlError(
+      "RESOURCE_EXHAUSTED",
+      "renewal contended the terminal-control store lock",
+      true,
+    ),
+    Object.assign(new Error("terminal-control request timed out"), { code: "ETIMEDOUT" }),
+  ]) {
+    const h = harness();
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      await h.bridge.handleEvent(event());
+      h.control.renewErrors.push(failure);
+
+      await h.bridge.renewLeases();
+
+      let state = h.store.read();
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.equal(state.turns.at(-1).status, "awaiting", failure.code);
+      assert.equal(
+        h.control.requests.filter(({ type }) => type === "lease.renew").length,
+        1,
+        failure.code,
+      );
+
+      await h.bridge.renewLeases();
+      state = h.store.read();
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.equal(state.turns.at(-1).status, "awaiting", failure.code);
+      assert.equal(
+        h.control.requests.filter(({ type }) => type === "lease.renew").length,
+        2,
+        failure.code,
+      );
+    } finally {
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a deterministic renewal failure still fences the active binding and turn", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.renewErrors.push(new CanonicalTerminalControlError(
+      "PERMISSION_DENIED",
+      "lease was fenced by a controlled local recovery",
+    ));
+
+    await h.bridge.renewLeases();
+
+    const state = h.store.read();
+    assert.equal(state.bindings[0].status, "stale");
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("renewal transport failures spanning the lease TTL fence the binding", async () => {
+  let now = Date.parse("2026-09-08T00:00:00.000Z");
+  const h = harness({ now: () => now });
+  const timeout = Object.assign(new Error("terminal-control request timed out"), { code: "ETIMEDOUT" });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_000;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_000;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_001;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("exact target deletion removes an active binding and announces the deletion once", async () => {
   const h = harness();
   const ended = harness();
@@ -2337,7 +2707,14 @@ test("a recovery-required stale binding still detects a certainly deleted sessio
     await h.bridge.reconcileBindingTargets();
     await flushBestEffortEffects();
     assert.equal(h.bridge.snapshot().bindings.length, 0);
-    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+    const deletionCard = h.lark.groupCards
+      .map((sent) => sent.card)
+      .find((card) => /已被删除/.test(cardText(card)));
+    assert.ok(deletionCard, "the deleted-session lifecycle card must still reach the group");
+    const confirmCard = h.lark.groupCards
+      .map((sent) => sent.card)
+      .find((card) => /待重新确认|重新确认/.test(cardText(card)));
+    assert.ok(confirmCard, "the silent stale transition first posted a repair notice");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2843,6 +3220,50 @@ test("a fully persisted prepared reply resumes with the same idempotency key aft
   }
 });
 
+test("a persisted Typing reaction handle is deleted after restart without adding CrossMark", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await flushBestEffortEffects();
+    assert.deepEqual(
+      h.lark.reactionCreates.map(({ emojiType }) => emojiType),
+      ["Typing"],
+    );
+    const persisted = h.store.read().turns.at(-1);
+    assert.equal(persisted.processingReactionId, "reaction-1", "the Typing handle is persisted");
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-crash",
+      botOpenId: "ou-bot",
+    });
+    h.lark.reactionDeletes.length = 0;
+    h.lark.reactionCreates.length = 0;
+    restarted.initializeAfterRestart();
+    await flushBestEffortEffects();
+
+    assert.deepEqual(
+      h.lark.reactionDeletes,
+      [{ messageId: "om-one", reactionId: "reaction-1" }],
+      "the orphaned Typing reaction is removed using its persisted handle",
+    );
+    assert.deepEqual(
+      h.lark.reactionCreates.map(({ emojiType }) => emojiType),
+      [],
+      "restart never stacks a CrossMark on a reaction whose creation window is unknown",
+    );
+    await restarted.close();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("late controller epoch or output generation never posts a marked reply", async () => {
   for (const scenario of [
     { name: "epoch", mutate: (control) => { control.target.controlEpoch = "epoch-late"; } },
@@ -2888,6 +3309,63 @@ test("tail response fence and ownerKind are checked before marked output can rep
       await h.bridge.close();
       rmSync(h.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("a transient tailOutput transport failure keeps the turn awaiting and a later poll replies", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "reply after a transient tail failure");
+    h.control.tailErrors.push(Object.assign(
+      new Error("terminal-control request timed out"),
+      { code: "ETIMEDOUT" },
+    ));
+
+    await h.bridge.pollTurns();
+
+    let state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "awaiting");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 0);
+
+    await h.bridge.pollTurns();
+
+    state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "completed");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].text, "reply after a transient tail failure");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a deterministic tailOutput authority error still fences the binding", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.tailErrors.push(new CanonicalTerminalControlError(
+      "PERMISSION_DENIED",
+      "tail lease was fenced",
+    ));
+
+    await h.bridge.pollTurns();
+
+    assert.equal(h.lark.replies.length, 0);
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 
@@ -3031,6 +3509,62 @@ test("explicit takeover cancellation drains before normal handoff and return rev
     assert.equal(h.control.target.fence, "3");
     assert.equal(h.store.read().bindings[0].status, "active");
     assert.equal(h.store.read().bindings[0].activityWatch.status, "armed");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a bridge restart tells an idle binding's group to re-confirm control", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-restart",
+      botOpenId: "ou-bot",
+    });
+    restarted.initializeAfterRestart();
+    await flushBestEffortEffects();
+
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+    const notice = h.lark.groupCards.find((sent) => sent.chatId === "oc-one");
+    assert.ok(notice, "an idle binding must not go silent after a restart");
+    assert.match(cardText(notice.card), /重新确认/);
+    await restarted.close();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an idle binding fenced by a deterministic renewal failure posts one repair notice", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.renewErrors.push(new CanonicalTerminalControlError(
+      "RECOVERY_REQUIRED",
+      "lease expired while the machine was asleep",
+    ));
+
+    await h.bridge.renewLeases();
+    await flushBestEffortEffects();
+
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    const notices = h.lark.groupCards.filter((sent) =>
+      /重新确认/.test(cardText(sent.card)));
+    assert.equal(notices.length, 1, "the repair notice is sent exactly once");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -3290,6 +3824,89 @@ test("corrupt Feishu bridge storage is preserved and refused", () => {
     assert.match(readFileSync(h.paths.bindings, "utf8"), /future/);
   } finally {
     rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("in-memory turns/replies/eventIds are trimmed to the persisted window and finalized turns release output", async () => {
+  const root = mkdtempSync(join("/tmp", "tw-fb-mem-"));
+  const paths = feishuBridgePaths(root);
+  const control = new FakeControlClient();
+  const lark = new FakeLark();
+  const realStore = new FeishuBridgeStore(paths);
+  const store = {
+    paths,
+    lastState: undefined,
+    read() { return realStore.read(); },
+    write(state) {
+      this.lastState = state;
+      realStore.write(state);
+    },
+  };
+  const bridge = new FeishuBridge({
+    control,
+    lark,
+    store,
+    instanceId: "daemon-mem",
+    botOpenId: "ou-bot",
+  });
+  const totalTurns = 300;
+  try {
+    await bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    for (let index = 0; index < totalTurns; index += 1) {
+      await bridge.handleEvent(event({ event_id: `evt-${index}`, message_id: `om-${index}` }));
+      const turn = store.lastState.turns.at(-1);
+      const markers = feishuTurnMarkers(turn.markerNonce);
+      control.output += `${markers.open}answer ${index}${markers.close}`;
+      await bridge.pollTurns();
+    }
+
+    // The in-memory arrays now track the on-disk bounded window instead of
+    // growing for the daemon's whole lifetime.
+    assert.ok(
+      store.lastState.turns.length <= 256,
+      `in-memory turns capped, got ${store.lastState.turns.length}`,
+    );
+    assert.ok(
+      store.lastState.replies.length <= 256,
+      `in-memory replies capped, got ${store.lastState.replies.length}`,
+    );
+    assert.ok(store.lastState.eventIds.length <= 4096);
+    assert.ok(
+      store.lastState.turns.every((turn) =>
+        turn.status === "completed" ? turn.output === "" : true),
+      "finalized turns release their captured output buffer",
+    );
+    // Recent turns are still present and retrievable.
+    const recent = store.lastState.turns.find((turn) => turn.messageId === `om-${totalTurns - 1}`);
+    assert.ok(recent, "the newest completed turn stays in the trimmed window");
+    const old = store.lastState.turns.find((turn) => turn.messageId === "om-0");
+    assert.equal(old, undefined, "turns older than the window are evicted from memory");
+
+    // A live (awaiting) turn must never be evicted, even when more than the
+    // window's worth of finalized turns accumulates in memory afterward.
+    await bridge.handleEvent(event({ event_id: "evt-live", message_id: "om-live" }));
+    const liveTurn = store.lastState.turns.at(-1);
+    assert.equal(liveTurn.status, "awaiting");
+    for (let index = 0; index < 300; index += 1) {
+      store.lastState.turns.push({
+        ...liveTurn,
+        id: `turn-other-${index}`,
+        messageId: `om-other-${index}`,
+        status: "completed",
+        output: "y".repeat(512),
+      });
+    }
+    // A steer event persists, which runs the in-memory trim.
+    await bridge.handleEvent(event({ event_id: "evt-steer", message_id: "om-steer" }));
+    const liveRetained = store.lastState.turns.find((turn) => turn.id === liveTurn.id);
+    assert.ok(liveRetained, "an awaiting turn is never trimmed regardless of history size");
+    assert.equal(liveRetained.status, "awaiting");
+    assert.ok(store.lastState.turns.length <= 257, "only the live turn may exceed the cap");
+  } finally {
+    await bridge.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

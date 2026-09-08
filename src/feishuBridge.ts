@@ -14,6 +14,9 @@ import {
 } from "./canonicalTerminalControlClient.js";
 import {
   FeishuBridgeStore,
+  FEISHU_EVENT_DEDUP_LIMIT,
+  FEISHU_TURN_HISTORY_LIMIT,
+  FEISHU_REPLY_HISTORY_LIMIT,
   type FeishuActivityWatch,
   type FeishuBinding,
   type FeishuHandoffRecord,
@@ -34,6 +37,11 @@ import {
 } from "./feishuReplyCard.js";
 
 const TURN_IDLE_TIMEOUT_MS = 10 * 60_000;
+// Lease renewals run on a 20s timer against a 60s server-side TTL. A run of
+// transport-class renewal failures spanning that TTL means the server lease
+// has certainly expired (or authority reconciled it), so the binding fences
+// itself instead of retrying forever.
+const LEASE_RENEW_TRANSIENT_GRACE_MS = 60_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
 const MAX_TURN_OUTPUT_BYTES = 128 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
@@ -177,6 +185,24 @@ function hasCode(error: unknown, code: string): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === code;
 }
 
+// Rebuild an array to at most `limit` non-live entries plus every "live"
+// entry (by key, kept regardless of age). Original relative order is
+// preserved so "most recent" tail and reverse-find semantics are unchanged.
+function tailKeepingKeys<T>(
+  items: T[],
+  limit: number,
+  liveKeys: Set<string>,
+  keyOf: (item: T) => string,
+): T[] {
+  const nonLive: T[] = [];
+  for (const item of items) {
+    if (!liveKeys.has(keyOf(item))) nonLive.push(item);
+  }
+  const keptNonLive = nonLive.slice(-limit);
+  const keptKeys = new Set(keptNonLive.map(keyOf));
+  return items.filter((item) => liveKeys.has(keyOf(item)) || keptKeys.has(keyOf(item)));
+}
+
 class RenderedSnapshotCorrelationError extends Error {
   constructor() {
     super("terminal rendered snapshot correlation changed while polling a Feishu turn");
@@ -196,7 +222,26 @@ const FATAL_RENDERED_SNAPSHOT_CODES = new Set([
   "OPERATION_IN_DOUBT",
 ]);
 
-function retryableRenderedSnapshotObservation(error: unknown): boolean {
+// Socket/transport codes the canonical client may surface as a raw Node error
+// (rather than a normalized CanonicalTerminalControlError) when the daemon is
+// briefly unreachable. They say nothing about lease validity, so read-only
+// observations and renewals retry instead of fencing the binding.
+const RETRYABLE_TRANSPORT_ERROR_CODES = new Set([
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EAI_AGAIN",
+]);
+
+// A read-only observation (output tail, rendered snapshot, agent status)
+// mutates nothing: success advances a cursor/output buffer, failure leaves
+// durable state untouched. A transient transport/lock stall therefore just
+// waits for the next fenced poll; only a deterministic authority/correlation
+// code is fatal.
+function retryableReadOnlyObservation(error: unknown): boolean {
   if (error instanceof RenderedSnapshotCorrelationError) return false;
   if (!(error instanceof Error)) return false;
   const candidate = error as { code?: unknown; retryable?: unknown };
@@ -205,9 +250,10 @@ function retryableRenderedSnapshotObservation(error: unknown): boolean {
   }
   if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return true;
   if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable === true;
-  // Socket timeouts/resets may not be normalized by the canonical client. The
-  // snapshot is read-only, so an ordinary transport Error can wait for the
-  // next fenced authority check instead of invalidating the binding now.
+  if (RETRYABLE_TRANSPORT_ERROR_CODES.has(candidate.code)) return true;
+  // Socket timeouts/resets may not be normalized by the canonical client.
+  // The observation is read-only, so an ordinary transport Error can wait
+  // for the next fenced authority check instead of fencing the binding now.
   return !(error instanceof CanonicalTerminalControlError);
 }
 
@@ -220,6 +266,7 @@ export class FeishuBridge {
   private botOpenId?: string;
   private botMentionIds?: Set<string>;
   private readonly leases = new Map<string, CanonicalTerminalLease>();
+  private readonly renewTransientFailures = new Map<string, number>();
   private readonly pendingProcessingReactions = new Map<string, PendingProcessingReaction>();
   private readonly activityPollAfter = new Map<string, number>();
   private readonly recoveryNoticeTurnIds = new Set<string>();
@@ -233,6 +280,7 @@ export class FeishuBridge {
   private lifecycleMutation = Promise.resolve();
   private activityCompletionMutation = Promise.resolve();
   private outboundMutation = Promise.resolve();
+  private renewMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -277,11 +325,13 @@ export class FeishuBridge {
 
   initializeAfterRestart(): void {
     let changed = false;
+    const staleIdleBindings: FeishuBinding[] = [];
     for (const binding of this.state.bindings) {
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
         changed = true;
+        staleIdleBindings.push(binding);
       }
       if (binding.activityWatch?.status === "sending") {
         binding.activityWatch.status = "uncertain";
@@ -311,6 +361,34 @@ export class FeishuBridge {
         reply.completedAt = nowIso(this.now);
         reply.error = "legacy prepared reply omitted the durable payload required for recovery";
         changed = true;
+      }
+    }
+    // Bindings with a recovery-required turn/watch get their own recovery card;
+    // idle bindings (no active work) would otherwise go silent, so tell the
+    // group the control connection must be re-confirmed in Dashboard.
+    for (const binding of staleIdleBindings) {
+      const hasRecoveryTurn = this.state.turns.some((turn) =>
+        turn.bindingId === binding.id && turn.status === "recovery-required");
+      const watch = binding.activityWatch;
+      const hasRecoveryWatch = watch
+        && (watch.status === "uncertain" || watch.status === "recovery-required");
+      if (!hasRecoveryTurn && !hasRecoveryWatch) {
+        this.queueBindingLifecycle(binding, "control-needs-confirm");
+      }
+    }
+    // Reborn Typing reactions: a handle persisted before the crash must be
+    // deleted. Restart never adds CrossMark — without a live process the add
+    // Typing acknowledgement window is unknown, and the design rule is never
+    // to stack CrossMark on a Typing reaction we cannot identify and remove.
+    for (const turn of this.state.turns) {
+      if (!turn.processingReactionId) continue;
+      this.pendingProcessingReactions.set(turn.messageId, {
+        state: "created",
+        reactionId: turn.processingReactionId,
+      });
+      if (turn.status === "recovery-required" || turn.status === "cancelled"
+        || turn.status === "completed" || turn.status === "timed-out") {
+        this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
       }
     }
     if (changed) this.persist();
@@ -857,6 +935,23 @@ export class FeishuBridge {
         return;
       }
 
+      const activeTurn = this.activeTurn(binding.id);
+      if (activeTurn?.status === "replying") {
+        // The final reply card is being delivered; the turn is already
+        // finalized and no longer polled. Steering here would inject the
+        // message into a closed turn while promising a follow-up that would
+        // never come, so ask the user to resend after delivery, exactly like
+        // the activity-watch "sending" gate.
+        this.rememberEvent(event.event_id);
+        await this.safeInform(
+          binding,
+          event.message_id,
+          "最终回复卡正在投递，本条消息未注入终端；请在回复送达后重试。",
+          `turn-replying-${event.event_id}`,
+        );
+        return;
+      }
+
       await this.requireRenderedSnapshotCapability();
       const target = await this.control.ownershipStatus(binding.controlTargetId);
       if (this.isFeishuDrainingView(binding, lease, target)) {
@@ -871,7 +966,6 @@ export class FeishuBridge {
         return;
       }
       this.assertLeaseView(binding, lease, target);
-      const activeTurn = this.activeTurn(binding.id);
       if (activeTurn) {
         await this.steerActiveTurn(
           binding,
@@ -970,50 +1064,139 @@ export class FeishuBridge {
   }
 
   renewLeases(): Promise<void> {
-    return this.serial(async () => {
-      let changed = false;
-      const failedTurnMessageIds: string[] = [];
-      for (const [bindingId, lease] of [...this.leases]) {
-        const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
-        if (!binding || binding.status !== "active") continue;
-        try {
-          const result = await this.control.renewLease(lease);
-          const renewed = this.requireGrantedLease(
-            result,
-            lease.controlTargetId,
-            lease.owner,
-            ["HELD", "DRAINING"],
+    // Renewal runs on its own lane so a slow agent-message injection holding
+    // the mutation lane never delays an RPC. The active-lease snapshot is
+    // collected synchronously at the start of the effect (no await before it,
+    // so it is atomic on the event loop); each outcome then hops back onto the
+    // serial lane, the only lane that mutates this.leases/state/persist.
+    const effect = async () => {
+      const pending = [...this.leases]
+        .map(([bindingId, lease]) => ({ bindingId, lease: structuredClone(lease) }))
+        .filter(({ bindingId }) => {
+          const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+          return binding?.status === "active";
+        });
+      for (const { bindingId, lease } of pending) {
+        await this.renewOneLease(bindingId, lease);
+      }
+    };
+    const queued = this.renewMutation.then(effect, effect);
+    this.renewMutation = queued.then(
+      () => undefined,
+      (error) => {
+        process.stderr.write(`[feishu-bridge] lease renewal sweep failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    );
+    return queued;
+  }
+
+  private async renewOneLease(bindingId: string, lease: CanonicalTerminalLease): Promise<void> {
+    let result;
+    let rpcError: unknown;
+    try {
+      result = await this.control.renewLease(lease);
+    } catch (error) {
+      rpcError = error;
+    }
+    // Apply the outcome back on the serial lane, the only lane that touches
+    // this.leases, state, and persist.
+    await this.serial(async () => {
+      const currentLease = this.leases.get(bindingId);
+      const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+      if (!currentLease || !binding || binding.status !== "active") return;
+      // Generation check: the RPC was issued for the lease carried in `lease`
+      // (a synchronously-collected snapshot). While that RPC was in flight on
+      // the renew lane, the serial lane may have released and re-acquired
+      // (pause/resume, remove/rebind, force-takeover/return) — rotating the
+      // leaseId/fence/controlEpoch. An answer for a released lease must never
+      // fence a freshly acquired, healthy lease: drop the stale verdict. The
+      // next 20s sweep renews the current lease. Renewal itself only bumps the
+      // lease revision, never fence/leaseId/controlEpoch, so same-generation
+      // renewals still match. The renewed-vs-current comparison below stays as
+      // defense in depth.
+      if (
+        lease.controlEpoch !== currentLease.controlEpoch
+        || lease.leaseId !== currentLease.leaseId
+        || lease.fence !== currentLease.fence
+      ) {
+        this.renewTransientFailures.delete(bindingId);
+        return;
+      }
+      if (rpcError !== undefined) {
+        if (this.isRetryableLeaseRenewalFailure(rpcError)) {
+          const firstFailedAt = this.renewTransientFailures.get(bindingId) ?? this.now();
+          this.renewTransientFailures.set(bindingId, firstFailedAt);
+          process.stderr.write(
+            `[feishu-bridge] lease renewal transport failure for ${bindingId} (retrying): ${rpcError instanceof Error ? rpcError.message : String(rpcError)}\n`,
           );
-          if (renewed.controlEpoch !== lease.controlEpoch
-            || renewed.leaseId !== lease.leaseId
-            || renewed.fence !== lease.fence) {
-            throw new Error("canonical lease renewal changed terminal ownership identity");
-          }
-          this.leases.set(bindingId, renewed);
-        } catch (error) {
-          this.leases.delete(bindingId);
-          this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
-          const turn = this.activeTurn(bindingId);
-          const watch = this.activeActivityWatch(binding);
-          if (turn) {
-            turn.status = "recovery-required";
-            turn.completedAt = nowIso(this.now);
-            turn.error = "terminal ownership lease renewal failed";
-            failedTurnMessageIds.push(turn.messageId);
-          }
-          if (watch) {
-            watch.status = "recovery-required";
-            watch.completedAt = nowIso(this.now);
-            watch.error = "terminal ownership lease renewal failed";
-            this.activityPollAfter.delete(watch.id);
-          }
-          changed = true;
+          if (this.now() - firstFailedAt < LEASE_RENEW_TRANSIENT_GRACE_MS) return;
         }
+        this.renewTransientFailures.delete(bindingId);
+        this.leases.delete(bindingId);
+        this.markBindingStale(binding, rpcError instanceof Error ? rpcError.message : String(rpcError));
+        const turn = this.activeTurn(bindingId);
+        const watch = this.activeActivityWatch(binding);
+        if (turn) {
+          turn.status = "recovery-required";
+          turn.completedAt = nowIso(this.now);
+          turn.error = "terminal ownership lease renewal failed";
+          this.queueProcessingReactionSettlement(turn.messageId, "failure");
+        }
+        if (watch) {
+          watch.status = "recovery-required";
+          watch.completedAt = nowIso(this.now);
+          watch.error = "terminal ownership lease renewal failed";
+          this.activityPollAfter.delete(watch.id);
+        }
+        if (!turn && !watch) {
+          // An idle binding fences silently and would otherwise swallow later
+          // group messages without a hint; tell the group to repair.
+          this.queueBindingLifecycle(binding, "control-needs-confirm");
+        }
+        this.persist();
+        return;
       }
-      if (changed) this.persist();
-      for (const messageId of failedTurnMessageIds) {
-        this.queueProcessingReactionSettlement(messageId, "failure");
+      let renewed: CanonicalTerminalLease;
+      try {
+        renewed = this.requireGrantedLease(
+          result!,
+          lease.controlTargetId,
+          lease.owner,
+          ["HELD", "DRAINING"],
+        );
+        if (renewed.controlEpoch !== currentLease.controlEpoch
+          || renewed.leaseId !== currentLease.leaseId
+          || renewed.fence !== currentLease.fence) {
+          const identity = new Error("canonical lease renewal changed terminal ownership identity");
+          Object.assign(identity, { code: "RECOVERY_REQUIRED" });
+          throw identity;
+        }
+      } catch (error) {
+        this.renewTransientFailures.delete(bindingId);
+        this.leases.delete(bindingId);
+        this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
+        const turn = this.activeTurn(bindingId);
+        const watch = this.activeActivityWatch(binding);
+        if (turn) {
+          turn.status = "recovery-required";
+          turn.completedAt = nowIso(this.now);
+          turn.error = "terminal ownership lease renewal failed";
+          this.queueProcessingReactionSettlement(turn.messageId, "failure");
+        }
+        if (watch) {
+          watch.status = "recovery-required";
+          watch.completedAt = nowIso(this.now);
+          watch.error = "terminal ownership lease renewal failed";
+          this.activityPollAfter.delete(watch.id);
+        }
+        if (!turn && !watch) {
+          this.queueBindingLifecycle(binding, "control-needs-confirm");
+        }
+        this.persist();
+        return;
       }
+      this.leases.set(bindingId, renewed);
+      this.renewTransientFailures.delete(bindingId);
     });
   }
 
@@ -1120,6 +1303,7 @@ export class FeishuBridge {
       this.reactionMutation,
       this.lifecycleMutation,
       this.activityCompletionMutation,
+      this.renewMutation,
       this.drainOutboundEffects(),
     ]);
   }
@@ -1151,28 +1335,37 @@ export class FeishuBridge {
           maxBytes: OUTPUT_TAIL_BYTES,
         });
       } catch (error) {
-        if (!hasCode(error, "STALE_OUTPUT_CURSOR")) throw error;
-        const latest = await this.control.ownershipStatus(turn.controlTargetId);
-        this.assertTurnAuthority(turn, lease, latest);
-        const retainedCursor = Math.max(
-          0,
-          latest.outputCursor - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
-        );
-        if (retainedCursor <= turn.cursor) throw error;
-        // A fast command can emit more than the bounded correlation window
-        // between Bridge polls. The current authority view proves the same
-        // Feishu lease/generation, so resume at the minimum guaranteed
-        // retained cursor and rebuild only the read-only marker parser. Input
-        // is never replayed, and generation/fence staleness still fails closed.
-        turn.cursor = retainedCursor;
-        turn.output = "";
-        delete turn.outputRemainderBase64;
-        delete turn.markerSeenAt;
-        const observedAt = this.now();
-        turn.lastOutputAt = new Date(observedAt).toISOString();
-        turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
-        this.persist();
-        return;
+        if (hasCode(error, "STALE_OUTPUT_CURSOR")) {
+          const latest = await this.control.ownershipStatus(turn.controlTargetId);
+          this.assertTurnAuthority(turn, lease, latest);
+          const retainedCursor = Math.max(
+            0,
+            latest.outputCursor - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+          );
+          if (retainedCursor <= turn.cursor) throw error;
+          // A fast command can emit more than the bounded correlation window
+          // between Bridge polls. The current authority view proves the same
+          // Feishu lease/generation, so resume at the minimum guaranteed
+          // retained cursor and rebuild only the read-only marker parser. Input
+          // is never replayed, and generation/fence staleness still fails closed.
+          turn.cursor = retainedCursor;
+          turn.output = "";
+          delete turn.outputRemainderBase64;
+          delete turn.markerSeenAt;
+          const observedAt = this.now();
+          turn.lastOutputAt = new Date(observedAt).toISOString();
+          turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
+          this.persist();
+          return;
+        }
+        // tailOutput is read-only (a failure persists no cursor/output change),
+        // so a transient transport/lock stall just waits for the next poll.
+        // Scope note: only the tail call itself is retried here. Ownership
+        // fence violations come from assertTurnAuthority above (also a bare
+        // Error) and must stay fatal, so they intentionally do not reach this
+        // branch.
+        if (retryableReadOnlyObservation(error)) return;
+        throw error;
       }
       if (chunk.controlEpoch !== turn.controlEpoch
         || chunk.controlTargetId !== turn.controlTargetId
@@ -1262,7 +1455,7 @@ export class FeishuBridge {
         turn.markerNonce,
       );
     } catch (error) {
-      if (retryableRenderedSnapshotObservation(error)) return;
+      if (retryableReadOnlyObservation(error)) return;
       turn.status = "recovery-required";
       turn.completedAt = nowIso(this.now);
       turn.error = error instanceof Error ? error.message : String(error);
@@ -1356,8 +1549,13 @@ export class FeishuBridge {
     let result: CanonicalAgentResultResult;
     try {
       const before = await this.control.ownershipStatus(binding.controlTargetId);
-      if (this.isFeishuDrainingView(binding, lease, before)) return;
-      this.assertLeaseView(binding, lease, before);
+      // A lease-less handoff to a controlled local owner leaves the target
+      // DRAINING for the feishu owner; the canonical layer still allows the
+      // read-only agent-result capture in that state, so the watch reaches a
+      // certain disposition (and the handoff can then commit) instead of
+      // parking at stop-candidate forever. Output generation and the exact
+      // structured source are still enforced below.
+      this.assertActivitySettlementView(binding, lease, before);
       if (before.outputGeneration !== watch.outputGeneration) {
         throw new CanonicalTerminalControlError(
           "STALE_OUTPUT_CURSOR",
@@ -1437,11 +1635,11 @@ export class FeishuBridge {
   ): Promise<void> {
     try {
       const before = await this.control.ownershipStatus(binding.controlTargetId);
-      if (this.isFeishuDrainingView(binding, lease, before)) {
-        await this.deferActivityCompletion(binding.id, watch.id);
-        return;
-      }
-      this.assertLeaseView(binding, lease, before);
+      // The completion card does not require terminal ownership: its text was
+      // fenced when the result was captured and the idempotency key is fixed.
+      // Sending it during a DRAINING lease-less handoff settles the watch so
+      // reconcileBindingHandoff can commit, rather than deferring forever.
+      this.assertActivitySettlementView(binding, lease, before);
       if (before.outputGeneration !== watch.outputGeneration) {
         throw new CanonicalTerminalControlError(
           "STALE_OUTPUT_CURSOR",
@@ -1730,6 +1928,42 @@ export class FeishuBridge {
         "Feishu binding no longer owns the exact terminal target",
       );
     }
+  }
+
+  // Settling an inherited local task (capturing its final result and sending
+  // the group card) is allowed while a lease-less handoff to a controlled
+  // local owner is already DRAINING: the canonical layer allows
+  // agent-status/agent-result/commit in DRAINING for the feishu owner, and
+  // sending a card needs no lease. Mirrors assertTurnAuthority's settling
+  // states. Returns false instead of throwing so callers can choose the
+  // DRAINING-safe path; anything else keeps the strict HELD assertion.
+  private feishuSettlementViewAllowsDraining(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    target: CanonicalTerminalOwnership,
+  ): boolean {
+    return target.controlTargetId === binding.controlTargetId
+      && lease.controlTargetId === binding.controlTargetId
+      && target.controlEpoch === lease.controlEpoch
+      && target.fence === lease.fence
+      && target.ownerKind === "feishu"
+      && lease.owner.kind === "feishu"
+      && target.state === "DRAINING"
+      && (target.nextOwnerKind === "dashboard" || target.nextOwnerKind === "local-cli")
+      && !!target.handoffId;
+  }
+
+  // Strict ownership check for activity completion. HELD requires the normal
+  // lease view; a DRAINING feishu-owned target (lease-less handoff to a
+  // controlled local owner) is accepted only for settling the final result —
+  // the output-generation and structured-source checks still fail closed.
+  private assertActivitySettlementView(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    target: CanonicalTerminalOwnership,
+  ): void {
+    if (this.feishuSettlementViewAllowsDraining(binding, lease, target)) return;
+    this.assertLeaseView(binding, lease, target);
   }
 
   private assertTurnAuthority(
@@ -2104,6 +2338,21 @@ export class FeishuBridge {
     return false;
   }
 
+  // Renewal hits only control RPCs. A lock-timeout (RESOURCE_EXHAUSTED), an
+  // INTERNAL stall, a retryable CONTROLLER_UNAVAILABLE, or an un-normalized
+  // socket transport error leaves the server lease untouched (its TTL is 60s);
+  // the next 20s tick retries. Deterministic fence codes or a lease identity
+  // change mean the lease is gone and stay fail-closed immediately.
+  private isRetryableLeaseRenewalFailure(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const candidate = error as { code?: unknown; retryable?: unknown };
+    if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return true;
+    if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable === true;
+    if (RETRYABLE_TRANSPORT_ERROR_CODES.has(candidate.code)) return true;
+    if (typeof candidate.code === "string") return false;
+    return !(error instanceof CanonicalTerminalControlError);
+  }
+
   private rememberEvent(eventId: string, persist = true): void {
     if (!this.state.eventIds.includes(eventId)) this.state.eventIds.push(eventId);
     if (persist) this.persist();
@@ -2370,7 +2619,15 @@ export class FeishuBridge {
         `tw-${digest(idempotencySeed).slice(0, 40)}`,
         binding.options.replyMode,
       );
-    } catch {}
+    } catch (error) {
+      // This notice is deliberately transient (a resend-after-retry hint); it
+      // must not become a durable reply that could arrive after the window
+      // closed. But a totally silent failure hid a dropped message, so at least
+      // record it alongside the other best-effort Feishu delivery paths.
+      process.stderr.write(
+        `[feishu-bridge] inform reply card failed for ${messageId} (${idempotencySeed}): ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
   }
 
   private queueProcessingReactionStart(messageId: string): void {
@@ -2390,6 +2647,16 @@ export class FeishuBridge {
       this.pendingProcessingReactions.set(messageId, {
         state: "created",
         reactionId: result.reactionId,
+      });
+      // Persist the known Typing handle on the owning turn so a crash/restart
+      // can still delete it. It stays best-effort; a crash in the
+      // acknowledgement window leaves an unrecoverable (but cosmetic) Typing.
+      await this.serial(async () => {
+        const turn = this.state.turns.find((candidate) => candidate.messageId === messageId);
+        if (turn?.processingReactionId !== result.reactionId) {
+          if (turn) turn.processingReactionId = result.reactionId;
+          this.persist();
+        }
       });
     } catch (error) {
       process.stderr.write(`[feishu-bridge] add Typing reaction failed: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -2665,7 +2932,49 @@ export class FeishuBridge {
   private persist(): void {
     this.ensureRecoveryNoticeAttempts();
     this.store.write(this.state);
+    this.trimInMemoryHistory();
     this.queuePreparedOutboundAttempts();
+  }
+
+  // The store slices each collection to a bounded window when writing to disk,
+  // but the in-memory state arrays otherwise grow for the daemon's lifetime
+  // (a completed turn still holds up to 128KB of captured output). Rebuild each
+  // array from the same live predicate used by activeTurn()/pollTurns — a live
+  // turn (prepared/awaiting/replying) or prepared reply is never dropped no
+  // matter how old it is — plus the most recent non-live entries, then release
+  // the output buffers of retained non-live turns. eventIds carry no live
+  // semantics and dedup survives via the on-disk window and Lark idempotency.
+  private trimInMemoryHistory(): void {
+    const liveTurnIds = new Set(this.state.turns
+      .filter((turn) =>
+        turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying")
+      .map((turn) => turn.id));
+    this.state.turns = tailKeepingKeys(
+      this.state.turns,
+      FEISHU_TURN_HISTORY_LIMIT,
+      liveTurnIds,
+      (turn) => turn.id,
+    );
+    for (const turn of this.state.turns) {
+      if (liveTurnIds.has(turn.id)) continue;
+      // A finalized turn's captured output is never parsed again.
+      if (turn.output) turn.output = "";
+      delete turn.outputRemainderBase64;
+    }
+
+    const preparedReplyIds = new Set(this.state.replies
+      .filter((reply) => reply.status === "prepared")
+      .map((reply) => reply.id));
+    this.state.replies = tailKeepingKeys(
+      this.state.replies,
+      FEISHU_REPLY_HISTORY_LIMIT,
+      preparedReplyIds,
+      (reply) => reply.id,
+    );
+
+    if (this.state.eventIds.length > FEISHU_EVENT_DEDUP_LIMIT) {
+      this.state.eventIds = this.state.eventIds.slice(-FEISHU_EVENT_DEDUP_LIMIT);
+    }
   }
 
   private serial<T>(operation: () => Promise<T>): Promise<T> {
