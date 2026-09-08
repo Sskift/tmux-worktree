@@ -215,6 +215,51 @@ test("stale managed-state lock owner cannot remove the replacement lock", () => 
   assert.equal(existsSync(lockPath), false, "current owner releases its own state lock");
 });
 
+test("legacy pid-less managed-state lock record keeps the age self-heal", async () => {
+  // Every released version wrote owner.json as {owner, createdAt} with no pid.
+  // A crash leftover (SIGKILL/power loss) in that format must still be
+  // reclaimed once it passes the 60s age gate; treating it as never-stale
+  // wedges every later writer until the lock dir is removed by hand.
+  const root = mkdtempSync(join(tmpdir(), "tw-state-lock-legacy-"));
+  const lockPath = join(root, "state.json.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  mkdirSync(lockPath, { mode: 0o700 });
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({ owner: `12345-legacy-record`, createdAt: 0 })}\n`,
+    { mode: 0o600 },
+  );
+  const lock = acquireManagedStateLock(lockPath);
+  assert.ok(lock.owner, "aged legacy pid-less lock must be reclaimed");
+  releaseManagedStateLock(lock);
+  assert.equal(existsSync(lockPath), false, "reclaimer releases its own lock");
+});
+
+test("legacy pid-less managed-state lock record is not reclaimed while fresh", async () => {
+  // The age gate still applies to legacy records: a fresh pid-less record
+  // must not be stolen from a holder that could still be live.
+  const root = mkdtempSync(join(tmpdir(), "tw-state-lock-legacy-fresh-"));
+  const lockPath = join(root, "state.json.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  mkdirSync(lockPath, { mode: 0o700 });
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({ owner: `12345-fresh-legacy`, createdAt: Date.now() })}\n`,
+    { mode: 0o600 },
+  );
+  let outcome;
+  try {
+    acquireManagedStateLock(lockPath);
+    outcome = { ok: true };
+  } catch (error) {
+    outcome = { ok: false, message: String((error && error.message) || error) };
+  }
+  assert.equal(outcome.ok, false, "fresh legacy lock must not be stolen");
+  assert.match(outcome.message, /timed out waiting for managed state lock/);
+  assert.equal(existsSync(ownerPath), true, "fresh legacy owner record left intact");
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("managed-state lock is never stolen from a live slow holder", async () => {
   const root = mkdtempSync(join(tmpdir(), "tw-state-lock-live-holder-"));
   const lockPath = join(root, "state.json.lock");

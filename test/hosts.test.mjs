@@ -139,6 +139,47 @@ test("stale config lock owner cannot remove the replacement lock", () => {
   assert.equal(existsSync(lockPath), false, "current owner releases its own lock");
 });
 
+test("legacy pid-less config lock record keeps the age self-heal", () => {
+  // Released versions wrote owner.json as {owner, createdAt} only. A crash
+  // leftover in that format must still be reclaimed past the 60s age gate
+  // instead of wedging every future config writer forever.
+  const root = tmpDir("tw-host-lock-legacy-");
+  const lockPath = join(root, "config.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  mkdirSync(lockPath, { mode: 0o700 });
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({ owner: "12345-legacy-record", createdAt: 0 })}\n`,
+    { mode: 0o600 },
+  );
+  const lock = acquireConfigFileLock(lockPath);
+  assert.ok(lock.owner, "aged legacy pid-less lock must be reclaimed");
+  releaseConfigFileLock(lock);
+  assert.equal(existsSync(lockPath), false, "reclaimer releases its own lock");
+});
+
+test("legacy pid-less config lock record is not reclaimed while fresh", () => {
+  const root = tmpDir("tw-host-lock-legacy-fresh-");
+  const lockPath = join(root, "config.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  mkdirSync(lockPath, { mode: 0o700 });
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({ owner: "12345-fresh-legacy", createdAt: Date.now() })}\n`,
+    { mode: 0o600 },
+  );
+  let outcome;
+  try {
+    acquireConfigFileLock(lockPath);
+    outcome = { ok: true };
+  } catch (error) {
+    outcome = { ok: false, message: String((error && error.message) || error) };
+  }
+  assert.equal(outcome.ok, false, "fresh legacy lock must not be stolen");
+  assert.match(outcome.message, /等待配置写锁超时|timed out.*config/i);
+  assert.equal(existsSync(ownerPath), true, "fresh legacy owner record left intact");
+});
+
 test("config lock is never stolen from a live slow holder", async () => {
   const root = tmpDir("tw-host-lock-live-holder-");
   const lockPath = join(root, "config.lock");

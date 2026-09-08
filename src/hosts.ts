@@ -97,8 +97,8 @@ function readConfigLockOwner(lockPath: string): ConfigLockOwnerRecord | undefine
     if (!isObject(parsed) || typeof parsed.owner !== "string" || typeof parsed.createdAt !== "number") {
       return undefined;
     }
-    // Legacy owner records lack pid; they fall through to the mtime gate and
-    // are never reclaimed on age alone while a holder might still be live.
+    // Legacy records lack pid; the stale check keeps the historical age gate
+    // for them so crash leftovers self-heal as before this lock hardening.
     if (parsed.pid !== undefined && !Number.isSafeInteger(parsed.pid)) return undefined;
     return {
       owner: parsed.owner,
@@ -113,8 +113,12 @@ function readConfigLockOwner(lockPath: string): ConfigLockOwnerRecord | undefine
 function configLockIsStale(lockPath: string): boolean {
   const owner = readConfigLockOwner(lockPath);
   if (owner) {
-    if (owner.pid === undefined) return false;
-    return Date.now() - owner.createdAt > CONFIG_LOCK_STALE_MS && !processExists(owner.pid);
+    if (Date.now() - owner.createdAt <= CONFIG_LOCK_STALE_MS) return false;
+    // New records gate reclaim on the holder pid being dead; legacy pid-less
+    // records (all released versions) retain the age-only self-heal so a
+    // SIGKILL leftover config lock does not wedge every future config writer.
+    if (owner.pid === undefined) return true;
+    return !processExists(owner.pid);
   }
   try {
     return Date.now() - statSync(lockPath).mtimeMs > CONFIG_LOCK_STALE_MS;

@@ -461,10 +461,6 @@ function readManagedStateLockOwner(lockPath: string): ManagedStateLockOwnerRecor
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const record = parsed as Record<string, unknown>;
     if (typeof record.owner !== "string" || typeof record.createdAt !== "number") return undefined;
-    // pid is optional for forward/backward compatibility: a legacy owner
-    // record written without it falls through to the mtime-age recovery gate,
-    // and must never be treated as reclaimable on age alone when the holder
-    // could still be live.
     if (record.pid !== undefined && !Number.isSafeInteger(record.pid)) return undefined;
     return {
       owner: record.owner,
@@ -479,8 +475,14 @@ function readManagedStateLockOwner(lockPath: string): ManagedStateLockOwnerRecor
 function managedStateLockIsStale(lockPath: string): boolean {
   const owner = readManagedStateLockOwner(lockPath);
   if (owner) {
-    if (owner.pid === undefined) return false;
-    return Date.now() - owner.createdAt > MANAGED_STATE_LOCK_STALE_MS && !processExists(owner.pid);
+    if (Date.now() - owner.createdAt <= MANAGED_STATE_LOCK_STALE_MS) return false;
+    // New-format records carry the holder pid: a live pid (including a reused
+    // one) blocks reclaim. Legacy records written by every released version
+    // lack pid; they keep the historical createdAt age gate so a SIGKILL or
+    // power-loss leftover lock still self-heals after 60s rather than wedging
+    // all later writers until the lock dir is removed by hand.
+    if (owner.pid === undefined) return true;
+    return !processExists(owner.pid);
   }
   try {
     return Date.now() - statSync(lockPath).mtimeMs > MANAGED_STATE_LOCK_STALE_MS;
