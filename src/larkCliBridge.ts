@@ -351,19 +351,31 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   }
 
   subscribe(onEvent: (event: FeishuInboundEvent) => Promise<void>): FeishuEventSubscription {
+    // No --quiet: lark-cli emits a `[event] ready event_key=<key>` marker on
+    // stderr once the subscription is actually established (per the lark-event
+    // skill contract). --quiet suppresses that marker (and drop warnings),
+    // leaving us with only the child 'spawn' event — which fires the moment
+    // the process launches, before the bus/handshake/auth setup, so a setup
+    // failure (exit 1-4) would race with a fake "ready" reading.
     const child = spawn(
       "lark-cli",
-      this.commandArgs(["event", "consume", "im.message.receive_v1", "--as", "bot", "--quiet"]),
+      this.commandArgs(["event", "consume", "im.message.receive_v1", "--as", "bot"]),
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     let stdout = "";
     let stderr = "";
+    let readyLineBuffer = "";
     let chain = Promise.resolve();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       if (Buffer.byteLength(stdout, "utf8") > MAX_LARK_OUTPUT_BYTES) {
+        // Backpressure fuse for a pathological single line (normal events are
+        // KB-sized NDJSON and drained per line below, so this only trips on
+        // malformed output). Record why before the supervisor only sees an
+        // exit code; the restart path resubscribes immediately.
+        process.stderr.write("[feishu-bridge] event consumer stdout exceeded 1MiB without a line boundary; restarting the subscription\n");
         child.kill("SIGTERM");
         return;
       }
@@ -382,19 +394,66 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
         });
       }
     });
+    let readyResolved = false;
+    let readyResolve!: () => void;
+    let readyReject!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+    const markReady = () => {
+      if (readyResolved) return;
+      readyResolved = true;
+      readyResolve();
+    };
+    const failReady = (error: Error) => {
+      if (readyResolved) return;
+      readyResolved = true;
+      readyReject(error);
+    };
+
     child.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-8192);
-    });
-    const ready = new Promise<void>((resolve, reject) => {
-      child.once("spawn", () => resolve());
-      child.once("error", reject);
+      if (readyResolved) return;
+      // Scan stderr line-by-line for the ready marker until the subscription
+      // is established; after that markers never reappear.
+      readyLineBuffer += chunk;
+      let newline: number;
+      while ((newline = readyLineBuffer.indexOf("\n")) >= 0) {
+        const line = readyLineBuffer.slice(0, newline).trim();
+        readyLineBuffer = readyLineBuffer.slice(newline + 1);
+        if (line.startsWith("[event] ready")) {
+          markReady();
+          break;
+        }
+      }
     });
     const done = new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
+      child.once("error", (error) => {
+        // Spawn failure (e.g. ENOENT): the child never launched. Surface the
+        // deterministic cause so the caller can distinguish it from a setup
+        // failure of a child that did spawn.
+        failReady(error);
+        reject(error);
+      });
       child.once("exit", (code, signal) => {
         void chain.finally(() => {
-          if (code === 0 || signal === "SIGTERM" || signal === "SIGINT") resolve();
-          else reject(new Error(`lark-cli event consumer exited ${code ?? signal}: ${stderr.trim()}`));
+          const graceful = code === 0 || signal === "SIGTERM" || signal === "SIGINT";
+          if (graceful) {
+            // Exit before the ready marker (e.g. SIGTERM during startup) must
+            // not leave `ready` pending; reject so the awaiting caller unblocks.
+            failReady(new Error("lark-cli event consumer stopped before the subscription was established"));
+            resolve();
+            return;
+          }
+          // Non-zero exit before the ready marker = setup failure (auth exit
+          // 3, network/handshake exit 4, validation exit 2, ...): reject
+          // ready so no fake 'running' state is published and start() aborts /
+          // the restart loop applies bounded backoff instead of reading the
+          // subscription as established.
+          const message = `lark-cli event consumer exited ${code ?? signal} before ready: ${stderr.trim()}`;
+          failReady(new Error(message));
+          reject(new Error(`lark-cli event consumer exited ${code ?? signal}: ${stderr.trim()}`));
         });
       });
     });
