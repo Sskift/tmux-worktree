@@ -109,6 +109,10 @@ enum ManagementShutdown {
     Complete(ManagementCleanupOutcome),
 }
 
+#[cfg(test)]
+type RebuildOverrideFactory =
+    Arc<dyn Fn() -> Result<ManagementChildManager, ManagementStartError> + Send + Sync>;
+
 pub(crate) struct MobileRelayV2ManagementCommandState {
     owner: Mutex<ManagementCommandOwner>,
     shutdown: Mutex<ManagementShutdown>,
@@ -120,9 +124,7 @@ pub(crate) struct MobileRelayV2ManagementCommandState {
     rebuild_handle: Mutex<Option<tauri::AppHandle>>,
     resurrect: Mutex<RespawnBudget>,
     #[cfg(test)]
-    rebuild_override: Mutex<
-        Option<Arc<dyn Fn() -> Result<ManagementChildManager, ManagementStartError> + Send + Sync>>,
-    >,
+    rebuild_override: Mutex<Option<RebuildOverrideFactory>>,
 }
 
 #[derive(Clone, Copy)]
