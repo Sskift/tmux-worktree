@@ -3146,6 +3146,7 @@ class V2ViewModel(
         }
         viewModelScope.launch {
             val issued = current.issued
+            var detachSucceeded = false
             try {
                 // Abort the exact accepted platform mutation while the old runtime admission is
                 // still live; its registration lease keeps this barrier closed until ParserFailed
@@ -3167,6 +3168,7 @@ class V2ViewModel(
                         closeRemote = retirement.closeRemote,
                     )
                 }
+                detachSucceeded = true
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -3178,31 +3180,37 @@ class V2ViewModel(
                 if (failurePublished) {
                     emit(V2UiEffect.Notice("Terminal renderer recovery could not fully detach"))
                 }
-                return@launch
             }
-            synchronized(relayV2UiFenceLock) {
-                val withdrawn = withdrawRetiredRelayV2TerminalRecoverySlot(
-                    current = RelayV2TerminalRecoverySlot(
-                        owner = relayV2Terminal,
-                        claim = relayV2TerminalResetRecoveryClaim,
-                    ),
-                    issued = issued,
-                    claim = current.slotClaim,
-                )
-                if (withdrawn != null) {
-                    relayV2Terminal = withdrawn.owner
-                    // Renderer retirement owns this route teardown; cancel any older automatic
-                    // recovery claim rather than leaving a claim with no local sentinel.
-                    relayV2TerminalResetRecoveryClaim = null
-                }
-                if (current.closeLineageOldestFirst != null) {
-                    relayV2TerminalRoutes.removeOwner(attachmentId, issued)
+            if (detachSucceeded) {
+                synchronized(relayV2UiFenceLock) {
+                    val withdrawn = withdrawRetiredRelayV2TerminalRecoverySlot(
+                        current = RelayV2TerminalRecoverySlot(
+                            owner = relayV2Terminal,
+                            claim = relayV2TerminalResetRecoveryClaim,
+                        ),
+                        issued = issued,
+                        claim = current.slotClaim,
+                    )
+                    if (withdrawn != null) {
+                        relayV2Terminal = withdrawn.owner
+                        // Renderer retirement owns this route teardown; cancel any older automatic
+                        // recovery claim rather than leaving a claim with no local sentinel.
+                        relayV2TerminalResetRecoveryClaim = null
+                    }
+                    if (current.closeLineageOldestFirst != null) {
+                        relayV2TerminalRoutes.removeOwner(attachmentId, issued)
+                    }
                 }
             }
             // The platform mutation was settled before drain; this step only releases the old
-            // WebView generation and publishes its bounded renderer rebuild.
+            // WebView generation and publishes its bounded renderer rebuild. It MUST run even when
+            // the detach chain threw (e.g. an offline transport made the close lease stale):
+            // leaving pendingLoss occupied rejects every later WebView bind and the manual rebuild
+            // flag, producing a permanent black screen with a dead Reconnect button. Both calls
+            // are idempotent (parserAbortClaimed/completionClaimed guards).
+            rendererLoss.abortParserMutationBeforeAttachmentDetach()
             val rebuilt = rendererLoss.completeAfterAttachmentDetach()
-            if (!rebuilt && rendererLoss.isRendererLoss) {
+            if (detachSucceeded && !rebuilt && rendererLoss.isRendererLoss) {
                 publishTerminalRendererRecoveryPaused(
                     issued = issued,
                     retirementRecoveryClaim = current.slotClaim,
