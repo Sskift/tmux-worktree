@@ -1,9 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { expandHomePath, loadConfigFile, type Config } from "./config.js";
 import { homeShort } from "./commands.js";
+import { acquireConfigFileLock, releaseConfigFileLock } from "./hosts.js";
 
 export type AutomationTriggerType = "manual" | "schedule";
 export type AutomationOverlap = "queue" | "skip";
@@ -248,18 +256,68 @@ export function automationStatePath(home = homedir()): string {
   return join(home, AUTOMATIONS_FILE);
 }
 
-function readAutomations(path = automationStatePath()): AutomationRecord[] {
+function automationLockPath(path = automationStatePath()): string {
+  return `${path}.lock`;
+}
+
+// Move a state file that fails to parse out of the way so a torn/legacy
+// write can never brick every automation command. The bytes are kept for
+// forensics; callers then treat the state as empty.
+function quarantineCorruptAutomations(path: string, error: unknown): void {
+  const backup = `${path}.corrupt-${Date.now()}`;
+  try {
+    renameSync(path, backup);
+    console.warn(
+      `warning: automation state at ${path} was corrupt (${error instanceof Error ? error.message : String(error)}); backed it up to ${backup} and starting fresh`,
+    );
+  } catch (renameError) {
+    console.warn(
+      `warning: automation state at ${path} was corrupt (${error instanceof Error ? error.message : String(error)}); could not back it up: ${renameError instanceof Error ? renameError.message : String(renameError)}`,
+    );
+  }
+}
+
+export function readAutomations(path = automationStatePath()): AutomationRecord[] {
   if (!existsSync(path)) return [];
-  const parsed = JSON.parse(readFileSync(path, "utf-8"));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf-8"));
+  } catch (error) {
+    // A torn/half-written file must not take down the whole feature.
+    quarantineCorruptAutomations(path, error);
+    return [];
+  }
   if (!Array.isArray(parsed)) {
     throw new Error(`${path} must contain a JSON array`);
   }
   return parsed as AutomationRecord[];
 }
 
+/// Atomic temp-file + rename, mirroring hosts.ts writeRawConfig so a crash
+/// mid-write leaves the previous complete file in place instead of a
+/// truncated one.
 function writeAutomations(records: AutomationRecord[], path = automationStatePath()): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(records, null, 2) + "\n");
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    renameSync(temp, path);
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+/// Hold the cross-process directory lock for an automation read-modify-write.
+/// The lock path (`<file>.lock`) and its mkdir/owner/stale protocol match
+/// the Rust Dashboard side, so CLI and Dashboard writes are mutually
+/// serialized against the same on-disk lock.
+function withAutomationsLock<T>(path: string, operation: () => T): T {
+  const lock = acquireConfigFileLock(automationLockPath(path));
+  try {
+    return operation();
+  } finally {
+    releaseConfigFileLock(lock);
+  }
 }
 
 function targetLabel(record: AutomationRecord): string {
@@ -319,7 +377,7 @@ export async function automationCmd(args: string[]): Promise<void> {
   switch (sub) {
     case "ls":
     case "list":
-      printAutomationList(readAutomations());
+      withAutomationsLock(automationStatePath(), () => printAutomationList(readAutomations()));
       return;
     case "create":
     case "add":
@@ -330,8 +388,10 @@ export async function automationCmd(args: string[]): Promise<void> {
         config,
         cwd: process.cwd(),
       });
-      const records = readAutomations();
-      writeAutomations([...records, record]);
+      withAutomationsLock(automationStatePath(), () => {
+        const records = readAutomations();
+        writeAutomations([...records, record]);
+      });
       console.log(`✓ 已创建 automation ${record.name} (${record.id})`);
       console.log(`  target: ${targetLabel(record)}`);
       return;
@@ -340,10 +400,12 @@ export async function automationCmd(args: string[]): Promise<void> {
     case "delete": {
       const [target] = extractPositionalArgs(rest);
       if (!target) throw new Error(`用法: tw automation rm <id|name>`);
-      const records = readAutomations();
-      const next = deleteAutomation(records, target);
-      if (next.length === records.length) throw new Error(`automation not found: ${target}`);
-      writeAutomations(next);
+      withAutomationsLock(automationStatePath(), () => {
+        const records = readAutomations();
+        const next = deleteAutomation(records, target);
+        if (next.length === records.length) throw new Error(`automation not found: ${target}`);
+        writeAutomations(next);
+      });
       console.log(`✓ 已删除 automation ${target}`);
       return;
     }
