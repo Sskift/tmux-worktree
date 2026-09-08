@@ -35,6 +35,7 @@ const REMOVE_ORIGIN_BRIDGE_CAPABILITY: &str = "binding.remove-origin.v1";
 const CONSUMER_HEALTH_BRIDGE_CAPABILITY: &str = "bridge.consumer-health.v1";
 const DURABLE_REPLY_BRIDGE_CAPABILITY: &str = "reply.durable-payload.v1";
 const UNKNOWN_BRIDGE_INFO_ERROR: &str = "BRIDGE_ERROR: unknown Feishu bridge operation";
+const PROFILE_MISMATCH_PREFIX: &str = "FEISHU_BRIDGE_PROFILE_MISMATCH:";
 
 #[derive(Default)]
 pub(crate) struct FeishuBridgeRuntimeState {
@@ -648,10 +649,9 @@ fn classify_bridge_probe(
         return Err("FEISHU_BRIDGE_INCOMPATIBLE: bridge.info contains invalid fields".to_string());
     }
     if info.lark_profile != expected_profile {
-        return Err(
-            "FEISHU_BRIDGE_PROFILE_MISMATCH: the running daemon uses a different lark-cli profile"
-                .to_string(),
-        );
+        return Err(format!(
+            "{PROFILE_MISMATCH_PREFIX} the running daemon uses a different lark-cli profile"
+        ));
     }
     let missing = BASE_REQUIRED_BRIDGE_CAPABILITIES
         .iter()
@@ -865,29 +865,70 @@ fn ensure_server(
     app: &tauri::AppHandle,
     state: &FeishuBridgeRuntimeState,
 ) -> Result<BridgeProbe, String> {
-    let (profile, _) = effective_profile()?;
-    let profile = profile
-        .ok_or("FEISHU_PROFILE_NOT_CONFIGURED: choose a bot profile in Settings > Integrations")?;
     let _transition = state
         .transition
         .lock()
         .map_err(|_| "Feishu bridge transition lock poisoned".to_string())?;
-    if !bridge_is_running() {
-        start_server(app, state, &profile, false)?;
-    }
-    let probe = probe_bridge(&profile)?;
-    if !should_upgrade_empty_bridge(&probe)? {
-        return Ok(probe);
-    }
+    ensure_server_locked(app, state)
+}
 
+/// Stop the running (empty) daemon and spawn a bundled one for `profile`,
+/// then probe it. Runs exactly one stop/start cycle and a single re-probe —
+/// no retry loop. Caller must hold the transition guard.
+fn restart_empty_daemon_locked(
+    app: &tauri::AppHandle,
+    state: &FeishuBridgeRuntimeState,
+    profile: &str,
+) -> Result<BridgeProbe, String> {
     let shutdown = request("bridge.shutdown", json!({}))?;
     validate_bridge_shutdown(&shutdown)?;
     wait_for_bridge_stop(state)?;
-    start_server(app, state, &profile, true)?;
-    let upgraded = probe_bridge(&profile)?;
-    if upgraded.disposition != BridgeProbeDisposition::Current
-        || !bridge_has_reply_mode_capability(&upgraded)
-    {
+    start_server(app, state, profile, true)?;
+    let restarted = probe_bridge(profile)?;
+    if restarted.disposition != BridgeProbeDisposition::Current {
+        return Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled daemon did not provide the current bridge capabilities"
+                .to_string(),
+        );
+    }
+    Ok(restarted)
+}
+
+/// Body of [`ensure_server`] for callers that already hold the transition
+/// guard. The effective profile is read *after* taking the lock so a profile
+/// switch (which holds the same guard across stop -> write-config) cannot race
+/// a start_server that spawns the previous profile's daemon.
+fn ensure_server_locked(
+    app: &tauri::AppHandle,
+    state: &FeishuBridgeRuntimeState,
+) -> Result<BridgeProbe, String> {
+    let (profile, _) = effective_profile()?;
+    let profile = profile
+        .ok_or("FEISHU_PROFILE_NOT_CONFIGURED: choose a bot profile in Settings > Integrations")?;
+    if !bridge_is_running() {
+        start_server(app, state, &profile, false)?;
+    }
+    let probe = match probe_bridge(&profile) {
+        Ok(probe) => probe,
+        Err(error) if error.starts_with(PROFILE_MISMATCH_PREFIX) => {
+            // A daemon for a different profile is listening. Only restart it
+            // when it has no durable work (the profile-switch path always
+            // stops an empty bridge first); otherwise fail closed so an active
+            // bot's bindings/turns are never killed out from under it. The
+            // restart is a single bounded cycle via restart_empty_daemon_locked.
+            let snapshot = request("bridge.snapshot", json!({}))?;
+            if !bridge_snapshot_is_empty(&snapshot)? {
+                return Err(error);
+            }
+            return restart_empty_daemon_locked(app, state, &profile);
+        }
+        Err(error) => return Err(error),
+    };
+    if !should_upgrade_empty_bridge(&probe)? {
+        return Ok(probe);
+    }
+    let upgraded = restart_empty_daemon_locked(app, state, &profile)?;
+    if !bridge_has_reply_mode_capability(&upgraded) {
         return Err(
             "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled daemon did not provide the current bridge capabilities"
                 .to_string(),
@@ -1060,9 +1101,22 @@ pub(crate) async fn feishu_integration_save_profile(
         if !profiles.iter().any(|candidate| candidate.name == profile) {
             return Err("The selected lark-cli profile no longer exists".to_string());
         }
-        stop_empty_bridge_for_profile_change(state.as_ref())?;
-        save_configured_profile(profile)?;
-        ensure_server(&app, state.as_ref())?;
+        // Hold the transition guard across the whole stop -> write-config ->
+        // start sequence so a concurrent status poll / binding command cannot
+        // respawn the previous profile's daemon in the gap between stopping the
+        // old bridge and persisting the new profile (which would leave a
+        // wrong-profile daemon that fails every probe). ensure_server_locked
+        // assumes the guard is already held (the non-reentrant std mutex would
+        // self-deadlock if ensure_server re-locked it).
+        {
+            let _transition = state
+                .transition
+                .lock()
+                .map_err(|_| "Feishu bridge transition lock poisoned".to_string())?;
+            stop_empty_bridge_for_profile_change(state.as_ref())?;
+            save_configured_profile(profile)?;
+            ensure_server_locked(&app, state.as_ref())?;
+        }
         integration_status()
     })
     .await
@@ -1093,10 +1147,19 @@ pub(crate) async fn feishu_integration_remove_profile(
         if !profiles.iter().any(|candidate| candidate.name == profile) {
             return Err("The selected bot profile no longer exists".to_string());
         }
-        let (selected, _) = effective_profile()?;
-        if selected.as_deref() == Some(profile) {
-            stop_empty_bridge_for_profile_change(state.as_ref())?;
-            clear_configured_profile(profile)?;
+        // Guard the stop -> clear-config transition the same way save_profile
+        // does, so a poller cannot respawn the daemon between the stop and the
+        // config change. No ensure_server is needed after clearing the profile.
+        {
+            let _transition = state
+                .transition
+                .lock()
+                .map_err(|_| "Feishu bridge transition lock poisoned".to_string())?;
+            let (selected, _) = effective_profile()?;
+            if selected.as_deref() == Some(profile) {
+                stop_empty_bridge_for_profile_change(state.as_ref())?;
+                clear_configured_profile(profile)?;
+            }
         }
         remove_lark_profile_with_program(OsStr::new("lark-cli"), profile)?;
         if list_lark_profiles_raw()?
