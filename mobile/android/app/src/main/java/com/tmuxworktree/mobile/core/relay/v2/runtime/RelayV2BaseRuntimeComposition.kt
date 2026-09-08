@@ -435,6 +435,10 @@ internal class RelayV2BaseRuntimeComposition(
     private var pendingOutboxAdmission: PendingOutboxAdmission? = null
     private var boundOutboxAdmission: BoundOutboxAdmission? = null
     private var credentialRolloverAdmission: CredentialRolloverAdmission? = null
+    // The credential-rollover backoff timer owns no transport connection attempt (the credential
+    // is stale while it runs), so it is tracked separately from [connectionAttemptJob] and must be
+    // cancelled on fence/close and bypassed when the network returns, exactly like a reconnect.
+    private var credentialRolloverRetryJob: Job? = null
     private val actorShutdownStarted = AtomicBoolean(false)
     private val actorOwnerJob = SupervisorJob()
     private val actorScope = CoroutineScope(
@@ -1486,10 +1490,25 @@ internal class RelayV2BaseRuntimeComposition(
      */
     internal fun onNetworkAvailable(): RelayV2NetworkHintResult {
         var previousBackoff: Job? = null
+        var previousRolloverRetry: Job? = null
+        var rolloverToRetry: CredentialRolloverAdmission? = null
         var result: RelayV2NetworkHintResult = RelayV2NetworkHintResult.FENCED
         val attempt = synchronized(connectionLock) {
             if (closed.get() || terminalFailure.get() != null || !reconnectEnabled) {
                 result = RelayV2NetworkHintResult.FENCED
+                return@synchronized null
+            }
+            // A credential rollover parked on backoff owns no transport attempt. When the network
+            // returns, cancel its timer and retry the refresh immediately from the bottom of the
+            // ladder, mirroring the transport backoff bypass below; the stale credential blocks any
+            // connect claim, so report IN_PROGRESS rather than claiming a transport attempt.
+            val rolloverAdmission = credentialRolloverAdmission
+            if (rolloverAdmission != null && credentialRolloverRetryJob != null) {
+                previousRolloverRetry = credentialRolloverRetryJob
+                credentialRolloverRetryJob = null
+                rolloverAdmission.retryAttempt = 0
+                rolloverToRetry = rolloverAdmission
+                result = RelayV2NetworkHintResult.IN_PROGRESS
                 return@synchronized null
             }
             // Bypass a currently owned backoff timer without waiting for it to expire.
@@ -1513,6 +1532,8 @@ internal class RelayV2BaseRuntimeComposition(
             }
             claimed
         }
+        previousRolloverRetry?.cancel()
+        rolloverToRetry?.let { startCredentialRollover(it) }
         if (previousBackoff != null) clearRetryCountdownProjection(resetAttempt = true)
         attempt?.start()
         return result
@@ -1944,10 +1965,13 @@ internal class RelayV2BaseRuntimeComposition(
     /**
      * Re-arms a transiently failed credential rollover on the shared reconnect backoff ladder.
      * The admission stays owned (no connection attempt ever ran while the credential is stale),
-     * so this never competes with the transport retry fence; the retry ordinal is capped at
-     * [MAX_ROLLOVER_RETRY_EXPONENT] and each tick re-checks admission identity, closed, and
-     * terminal state under [connectionLock]. Exhausting the ladder escalates to the terminal
-     * rollover failure — retries are bounded, never storming.
+     * so this never competes with the transport retry fence. The retry is rate-bounded, not
+     * count-bounded: once the ordinal reaches [MAX_ROLLOVER_RETRY_EXPONENT] the delay sits at the
+     * 30s ceiling and keeps re-arming (matching [scheduleReconnect]) rather than escalating — a
+     * pure network/5xx outage must never force re-scan, while a definitive AUTH/refresh-token or
+     * CAS-drift failure is routed to [failCredentialRollover] instead. Each tick re-checks
+     * admission identity, [reconnectEnabled], closed, and terminal state under [connectionLock];
+     * a fence/disconnect in progress drops the retry as STALE without touching terminal state.
      */
     private fun scheduleCredentialRolloverRetry(
         admission: CredentialRolloverAdmission,
@@ -1956,21 +1980,17 @@ internal class RelayV2BaseRuntimeComposition(
         var timer: Job? = null
         val result = synchronized(connectionLock) {
             if (credentialRolloverAdmission !== admission ||
-                closed.get() || terminalFailure.get() != null
+                !reconnectEnabled || closed.get() || terminalFailure.get() != null
             ) {
                 return@synchronized RetryScheduleResult.STALE
-            }
-            if (admission.retryAttempt >= MAX_ROLLOVER_RETRY_EXPONENT) {
-                credentialRolloverAdmission = null
-                detachConnectionAttemptLocked(admission.connectionAttempt, admission.generation)
-                return@synchronized RetryScheduleResult.FENCED
             }
             val policyDelay = reconnectPolicy.delayMillis(admission.retryAttempt)
             val delayMs = serverDelayMs
                 ?.takeIf { it in 1..MAX_ROLLOVER_SERVER_DELAY_MS }
                 ?.coerceAtLeast(policyDelay)
                 ?: policyDelay
-            admission.retryAttempt += 1
+            // Cap the ordinal so the delay stays at the max tier: bounded rate, indefinite retry.
+            admission.retryAttempt = minOf(admission.retryAttempt + 1, MAX_ROLLOVER_RETRY_EXPONENT)
             val retryAtMillis = saturatingAdd(clock(), delayMs)
             val scheduledTimer = pumpScope.launch(start = CoroutineStart.LAZY) {
                 try {
@@ -1985,6 +2005,14 @@ internal class RelayV2BaseRuntimeComposition(
                     startCredentialRollover(admission)
                 }
             }
+            scheduledTimer.invokeOnCompletion {
+                synchronized(connectionLock) {
+                    if (credentialRolloverRetryJob === scheduledTimer) {
+                        credentialRolloverRetryJob = null
+                    }
+                }
+            }
+            credentialRolloverRetryJob = scheduledTimer
             timer = scheduledTimer
             synchronized(stateLock) {
                 if (!closed.get() && terminalFailure.get() == null) {
@@ -1999,10 +2027,6 @@ internal class RelayV2BaseRuntimeComposition(
         }
         if (result == RetryScheduleResult.SCHEDULED) {
             checkNotNull(timer).start()
-        } else if (result == RetryScheduleResult.FENCED) {
-            cancelAgentRecoveryGeneration(admission.generation)
-            clearRecoveredDispatch()
-            failRuntimeIncomplete(RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE)
         }
     }
 
@@ -2010,6 +2034,7 @@ internal class RelayV2BaseRuntimeComposition(
         admission: CredentialRolloverAdmission,
     ): Boolean = synchronized(connectionLock) {
         credentialRolloverAdmission === admission &&
+            reconnectEnabled &&
             !closed.get() &&
             terminalFailure.get() == null
     }
@@ -3366,6 +3391,13 @@ internal class RelayV2BaseRuntimeComposition(
             connectionAttemptJob.also { connectionAttemptJob = null }
         }
         attempt?.cancel()
+        // A credential-rollover backoff timer owns no transport attempt, so it is not the Job
+        // returned above; cancel it too so a drain/close in progress cannot be re-entered by a
+        // rollover retry that fired while the fence was being taken.
+        val rolloverRetry = synchronized(connectionLock) {
+            credentialRolloverRetryJob.also { credentialRolloverRetryJob = null }
+        }
+        rolloverRetry?.cancel()
         return attempt
     }
 
@@ -3522,7 +3554,7 @@ internal class RelayV2BaseRuntimeComposition(
         const val COMMAND_RETRY_BASE_DELAY_MS = 1_000L
         const val COMMAND_RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5
-        /** Bound for transient credential-rollover retries; exhaustion escalates to terminal. */
+        /** Highest backoff tier for transient credential-rollover retries; retry stays at this 30s rate indefinitely (bounded rate, not bounded count) until AUTH/CAS-drift terminates it. */
         const val MAX_ROLLOVER_RETRY_EXPONENT = 5
         /** Server-provided retryAfterMs is honored only as a sane lower bound, never beyond 5m. */
         const val MAX_ROLLOVER_SERVER_DELAY_MS = 300_000L

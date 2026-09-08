@@ -2291,7 +2291,7 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `rollover retries are bounded and escalate to terminal after the ladder is exhausted`() =
+    fun `transient rollover failure keeps retrying at the max backoff tier instead of terminal`() =
         runBlocking {
             val rolloverCalls = AtomicInteger()
             val retry = ControlledRetryDelay()
@@ -2306,19 +2306,75 @@ class RelayV2BaseRuntimeCompositionTest {
                 retryDelayBlock = retry::awaitDelay,
             )
             try {
-                // Arm each bounded backoff as it arrives (initial attempt + 5 retries), then the
-                // exhausted ladder must escalate to the terminal rollover failure.
-                repeat(5) { index ->
+                // Arm far more backoffs than the old bounded-count ladder (initial + 8 retries).
+                // A pure transient outage must keep re-arming at the 30s ceiling and never latch
+                // the terminal rollover failure — the refresh token is still valid.
+                repeat(8) { index ->
                     assertTrue("rollover backoff ${index + 1} never armed", retry.awaitCount(index + 1))
                     retry.release(index)
+                    withTimeout(TIMEOUT_MS) {
+                        while (rolloverCalls.get() < index + 2) delay(1)
+                    }
                 }
-                val state = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-                assertEquals("initial attempt + 5 retries", 6, rolloverCalls.get())
+                // The delay plateaus at the max tier once the ordinal caps (no escalation). 8
+                // released retries arm a 9th backoff before the assertion, hence nine entries.
                 assertEquals(
-                    RelayV2BaseRuntimeFailure.RuntimeIncomplete(
-                        RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE,
+                    listOf(
+                        1_000L, 2_000L, 4_000L, 8_000L, 16_000L,
+                        30_000L, 30_000L, 30_000L, 30_000L,
                     ),
-                    state.failure,
+                    retry.delays,
+                )
+                assertNull(
+                    "transient rollover must never latch terminalFailure past the old cap",
+                    harness.composition.state.value.failure,
+                )
+                assertEquals("initial attempt + 8 retries", 9, rolloverCalls.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    harness.composition.state.value.phase,
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `network available bypasses rollover backoff and retries the refresh immediately`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            val rollover = RelayV2CredentialRolloverPort {
+                rolloverCalls.incrementAndGet()
+                RelayV2CredentialRolloverResult.Retryable()
+            }
+            val harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // First refresh fails transiently and arms a backoff timer.
+                assertTrue("rollover backoff never armed", retry.awaitCount(1))
+                assertEquals(1, rolloverCalls.get())
+
+                // Network returns while the backoff is still parked: the refresh must retry
+                // immediately without releasing the old timer, and the ordinal resets so the
+                // retry starts from the bottom of the ladder.
+                assertEquals(
+                    RelayV2NetworkHintResult.IN_PROGRESS,
+                    harness.composition.onNetworkAvailable(),
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (rolloverCalls.get() < 2) delay(1)
+                }
+                // The immediate retry failed again and armed a fresh, short bottom-tier backoff.
+                assertTrue("fresh rollover backoff never re-armed", retry.awaitCount(2))
+                assertEquals(1_000L, retry.delays.last())
+                assertNull(
+                    "rollover retried via network hint must stay non-terminal",
+                    harness.composition.state.value.failure,
                 )
             } finally {
                 harness.close()
