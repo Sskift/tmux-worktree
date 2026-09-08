@@ -59,10 +59,46 @@ stop = False
 resize_pending = True
 operation_index = 0
 writable = lease is not None
+read_only_confirmed = lease is None
+deterministic_lease_loss = False
 next_renewal = time.monotonic() + 20.0
+# The service-side lease TTL is ~60s and renewal runs every 20s, so a single
+# transport hiccup (the daemon serializing a long agent message behind its
+# store lock, or a brief restart) must not latch the attach read-only. Only
+# deterministic ownership/fence errors do that; transient errors are tolerated
+# until they exceed this budget.
+renew_failures = 0
+last_renew_success = time.monotonic()
+RENEWAL_FAILURE_LIMIT = 3
+RENEWAL_FAILURE_WINDOW_S = 60.0
+RETRYABLE_CODES = frozenset(("RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL"))
+DETERMINISTIC_CODES = frozenset((
+    "PERMISSION_DENIED",
+    "RECOVERY_REQUIRED",
+    "STALE_FENCE",
+    "STALE_LEASE",
+    "TARGET_GONE",
+    "HANDOFF_PENDING",
+))
 
 def notice(message):
     os.write(stdout_fd, ("\r\n\x1b[33m[tw control] " + message + "\x1b[0m\r\n").encode("utf-8", "replace"))
+
+def error_code(error):
+    """Best-effort structured code for an error raised by request()."""
+    text = str(error)
+    prefix = text.split(":", 1)[0]
+    return prefix if prefix and " " not in prefix else ""
+
+def is_transient_error(error):
+    # socket.timeout (queued behind a long agent message) and a refused/closed
+    # connection (daemon restarting) are retryable transport failures.
+    if isinstance(error, (socket.timeout, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)):
+        return True
+    code = error_code(error)
+    if code in DETERMINISTIC_CODES:
+        return False
+    return code in RETRYABLE_CODES or code == ""
 
 def request(kind, **fields):
     envelope = {
@@ -73,7 +109,9 @@ def request(kind, **fields):
     envelope.update(fields)
     payload = (json.dumps(envelope, separators=(",", ":")) + "\n").encode("utf-8")
     peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    peer.settimeout(10.0)
+    # Cover the daemon's documented cold-resume agent-message window (~45s); a
+    # 10s timeout abandoned requests that were merely queued behind it.
+    peer.settimeout(50.0)
     try:
         peer.connect(socket_path)
         peer.sendall(payload)
@@ -103,7 +141,7 @@ def operation_id(kind):
 def controlled_input(data):
     global writable
     if not writable or not data:
-        if data:
+        if data and read_only_confirmed:
             notice("read-only: terminal input ownership is held elsewhere")
         return
     try:
@@ -115,6 +153,11 @@ def controlled_input(data):
             dataBase64=base64.b64encode(data).decode("ascii"),
         )
     except Exception as error:
+        if is_transient_error(error):
+            # Backlog/timeout: keep writable so the next keystroke retries; the
+            # renewal loop is the authority that decides a real lease loss.
+            notice("input delayed while the terminal-control daemon is busy; retry follows")
+            return
         writable = False
         notice("input rejected; attachment is now read-only (" + str(error) + ")")
 
@@ -191,16 +234,56 @@ def route_terminal_input(data, master_fd):
     controlled_input(data[user_start:])
 
 def renew_lease():
-    global lease, writable, next_renewal
-    if not writable or lease is None or time.monotonic() < next_renewal:
+    # Renew (never acquire) on the 20s tick. renew is fence-checked server
+    # side, so it only succeeds while THIS client is still the owner; retrying it
+    # can never steal ownership back. A transport/backlog failure is tolerated
+    # up to the lease TTL budget; a deterministic ownership error confirms
+    # someone else holds the target and stops further attempts (fail-closed).
+    global lease, writable, read_only_confirmed, renew_failures, last_renew_success
+    global deterministic_lease_loss, next_renewal
+    if lease is None or deterministic_lease_loss:
         return
+    if time.monotonic() < next_renewal:
+        return
+    # Schedule the following tick ~20s out (well inside the 60s lease TTL), so a
+    # failed renew gets up to three follow-up attempts before the budget laps.
+    next_renewal = time.monotonic() + 20.0
     try:
         result = request("lease.renew", lease=lease)
         lease = result["lease"]
-        next_renewal = time.monotonic() + 20.0
+        renew_failures = 0
+        last_renew_success = time.monotonic()
+        if not writable:
+            writable = True
+            read_only_confirmed = False
+            notice("terminal input ownership restored; attachment is writable again")
+        return
     except Exception as error:
-        writable = False
-        notice("ownership liveness renewal failed; attachment is now read-only (" + str(error) + ")")
+        if not is_transient_error(error):
+            # Ownership/fence identity lost: another client (e.g. Feishu) now
+            # owns the target. Stay read-only and stop renewing so we never
+            # fight for ownership; this is the intended -r/read-only state.
+            deterministic_lease_loss = True
+            writable = False
+            read_only_confirmed = True
+            notice("ownership renewal rejected; attachment stays read-only (" + str(error) + ")")
+            return
+        renew_failures += 1
+        budget_exceeded = (
+            renew_failures >= RENEWAL_FAILURE_LIMIT
+            or time.monotonic() - last_renew_success > RENEWAL_FAILURE_WINDOW_S
+        )
+        if not budget_exceeded:
+            # Keep writable: the service-side lease is still within TTL and the
+            # daemon is likely just serializing a long agent message.
+            return
+        if writable:
+            writable = False
+            notice("ownership liveness could not be renewed; attachment is now read-only; will retry")
+        read_only_confirmed = False
+        # Lease object is retained: keep issuing lease.renew (not acquire) on
+        # later ticks; a success above flips writable back, self-healing once
+        # the transport window or daemon restart clears.
 
 def terminal_size():
     try:
@@ -213,7 +296,7 @@ def resize_attachment(master_fd):
     global writable
     cols, rows = terminal_size()
     fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-    if not writable:
+    if lease is None or deterministic_lease_loss:
         return
     try:
         request(
@@ -225,6 +308,8 @@ def resize_attachment(master_fd):
             rows=rows,
         )
     except Exception as error:
+        if is_transient_error(error):
+            return
         writable = False
         notice("resize rejected; attachment is now read-only (" + str(error) + ")")
 
