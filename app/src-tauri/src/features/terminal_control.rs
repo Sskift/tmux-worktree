@@ -1746,7 +1746,10 @@ mod tests {
             let mut control = held_control();
             classify_control_error(&mut control, &call_error(code));
             assert!(control.lease.is_some(), "{code} must not clear the lease");
-            assert_eq!(control.last_state, "HELD", "{code} must not flap into recovery");
+            assert_eq!(
+                control.last_state, "HELD",
+                "{code} must not flap into recovery"
+            );
             assert!(control.last_error.is_some());
         }
     }
@@ -1755,6 +1758,9 @@ mod tests {
     fn deterministic_ownership_errors_still_fail_closed() {
         let mut control = held_control();
         classify_control_error(&mut control, &call_error("PERMISSION_DENIED"));
-        assert!(control.lease.is_none(), "PERMISSION_DENIED must clear the lease");
+        assert!(
+            control.lease.is_none(),
+            "PERMISSION_DENIED must clear the lease"
+        );
     }
 }
