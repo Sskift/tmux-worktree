@@ -228,6 +228,73 @@ pub(crate) fn with_pty_control<R>(
     operation(control)
 }
 
+/// A copy of a managed PTY's control state, taken under the global map lock
+/// and refreshed outside it.  Observation-only status polling must not hold the
+/// single `ptys` mutex across a remote terminal-control RPC: a slow or dead
+/// SSH host (up to the 15s proxy timeout plus connect latency) would otherwise
+/// freeze input to every other terminal.  The snapshot is never written back
+/// while this PTY holds a lease, and never writes back lease/hand-off fields,
+/// so an out-of-lock refresh cannot revive an ownership transfer another path
+/// fenced while the RPC was in flight.
+struct ControlSnapshot {
+    instance_id: String,
+    control_target_id: Option<String>,
+    control: PtyControl,
+}
+
+fn snapshot_control_for_refresh(state: &PtyState, id: &str) -> Option<ControlSnapshot> {
+    let mut map = state.ptys.lock().unwrap();
+    let handle = map.get_mut(id)?;
+    if handle.control_pending {
+        return None;
+    }
+    let control = handle.control.as_mut()?;
+    // A live lease means this PTY is the interactive owner: status refresh
+    // then runs `lease.renew`, an ownership operation that may rewrite the
+    // lease. Keep that path under the global lock exactly like pty_write so a
+    // concurrent write cannot fence the lease between drain and commit.
+    if control.lease.is_some() {
+        return None;
+    }
+    Some(ControlSnapshot {
+        instance_id: handle.instance_id.clone(),
+        control_target_id: control.control_target_id.clone(),
+        control: control.clone(),
+    })
+}
+
+/// Run an observation-only refresh against the snapshot without the global map
+/// lock, then merge the result back under the lock. The commit is rejected if
+/// the PTY instance changed (removed/reopened) or its control target changed,
+/// and whenever the live control holds a lease or a hand-off — observation
+/// results must never touch ownership state.
+fn refresh_control_snapshot<R>(
+    state: &PtyState,
+    id: &str,
+    snapshot: ControlSnapshot,
+    refresh: impl FnOnce(&mut PtyControl) -> R,
+) -> Option<R> {
+    let mut refreshed = snapshot.control;
+    let result = refresh(&mut refreshed);
+    let mut map = state.ptys.lock().unwrap();
+    let handle = map.get_mut(id)?;
+    if handle.instance_id != snapshot.instance_id {
+        return None;
+    }
+    let live = handle.control.as_mut()?;
+    if live.control_target_id != snapshot.control_target_id
+        || live.lease.is_some()
+        || live.pending_handoff_id.is_some()
+    {
+        return None;
+    }
+    live.control_epoch = refreshed.control_epoch;
+    live.last_state = std::mem::take(&mut refreshed.last_state);
+    live.last_owner_kind = refreshed.last_owner_kind.take();
+    live.last_error = refreshed.last_error.take();
+    Some(result)
+}
+
 pub(crate) fn kill_managed_session_with_control(
     app: &tauri::AppHandle,
     state: &PtyState,
@@ -235,34 +302,76 @@ pub(crate) fn kill_managed_session_with_control(
     session_name: &str,
     host_id: Option<&str>,
 ) -> Result<(), String> {
-    let mut map = state.ptys.lock().unwrap();
-    let matching_id = map
-        .iter()
-        .filter_map(|(id, handle)| handle.control.as_ref().map(|control| (id, control)))
-        .filter(|(_, control)| {
-            control.session_name == session_name && control.host_id.as_deref() == host_id
-        })
-        .max_by_key(|(_, control)| control.lease.is_some())
-        .map(|(id, _)| id.clone());
-    if let Some(id) = matching_id {
-        let control = map
-            .get_mut(&id)
-            .and_then(|handle| handle.control.as_mut())
-            .ok_or("managed terminal control disappeared")?;
-        return kill_pty_controlled_session(app, control_state, control)
-            .map_err(|error| error.to_string());
-    }
-    drop(map);
+    // Locate a mounted managed terminal for this session under the map lock,
+    // then drop the lock before the remote kill RPC: lifecycle.kill goes over
+    // the same slow SSH lane as status polling, and holding the global map
+    // lock across it would block every other terminal (including the user's
+    // attempt to close other tabs). Ownership transfer inside
+    // kill_pty_controlled_session operates on the cloned control; pty_write
+    // on the same handle still serializes through the map lock, and a
+    // conflicting writer either fences this kill via the terminal-control
+    // authority (fail-closed) or the kill wins — both safe for a kill tab.
+    let (matching_id, mut control) = {
+        let map = state.ptys.lock().unwrap();
+        let found = map
+            .iter()
+            .filter_map(|(id, handle)| handle.control.as_ref().map(|control| (id, control)))
+            .filter(|(_, control)| {
+                control.session_name == session_name && control.host_id.as_deref() == host_id
+            })
+            .max_by_key(|(_, control)| control.lease.is_some())
+            .map(|(id, control)| (id.clone(), control.clone()));
+        match found {
+            Some(found) => found,
+            None => {
+                drop(map);
+                let transient_id = format!("lifecycle-{}", uuid::Uuid::new_v4());
+                let mut control =
+                    open_pty_control(app, control_state, &transient_id, session_name, host_id);
+                return match kill_pty_controlled_session(app, control_state, &mut control) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        release_pty_control(app, control_state, &mut control);
+                        Err(error.to_string())
+                    }
+                };
+            }
+        }
+    };
 
-    let transient_id = format!("lifecycle-{}", uuid::Uuid::new_v4());
-    let mut control = open_pty_control(app, control_state, &transient_id, session_name, host_id);
-    match kill_pty_controlled_session(app, control_state, &mut control) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            release_pty_control(app, control_state, &mut control);
-            Err(error.to_string())
+    let result = kill_pty_controlled_session(app, control_state, &mut control);
+    // Mirror the terminal state onto the live handle if it is still the same
+    // PTY and still points at the same control target; otherwise the result is
+    // stale and is discarded. On success the kill won server-side, so clear the
+    // live ownership fields. On failure a concurrent pty_write may have taken
+    // ownership of the live handle while the RPC was in flight; leave that
+    // lease fenced by the writer instead of overwriting it with stale fields.
+    let mut map = state.ptys.lock().unwrap();
+    if let Some(handle) = map.get_mut(&matching_id) {
+        let target_matches = handle
+            .control
+            .as_ref()
+            .is_some_and(|live| live.control_target_id == control.control_target_id);
+        if target_matches {
+            if result.is_ok() {
+                if let Some(live) = handle.control.as_mut() {
+                    live.lease = None;
+                    live.pending_handoff_id = None;
+                    live.last_state = "TARGET_GONE".to_string();
+                    live.last_owner_kind = None;
+                    live.last_error = None;
+                }
+            } else if let Some(live) = handle.control.as_mut() {
+                if live.lease.is_none() && live.pending_handoff_id.is_none() {
+                    live.last_state = std::mem::take(&mut control.last_state);
+                    live.last_owner_kind = control.last_owner_kind.take();
+                    live.last_error = control.last_error.take();
+                }
+            }
         }
     }
+    drop(map);
+    result.map_err(|error| error.to_string())
 }
 
 /// Shared body of the `kill_session` and `kill_plain_terminal` commands:
@@ -827,7 +936,13 @@ pub(crate) async fn pty_kill(
     let state = Arc::clone(state.inner());
     let control_state = Arc::clone(control_state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let handle = state.ptys.lock().unwrap().remove(&id);
+        // Remove the handle under the map lock, then run the remote lease
+        // release without it: a dead SSH host must not keep the global pty map
+        // locked for 15s+ while users keep typing into other terminals.
+        let handle = {
+            let mut map = state.ptys.lock().unwrap();
+            map.remove(&id)
+        };
         if let Some(mut handle) = handle {
             if let Some(control) = handle.control.as_mut() {
                 release_pty_control(&app, control_state.as_ref(), control);
@@ -846,22 +961,36 @@ pub(crate) fn release_all_pty_controls(
     state: &PtyState,
     control_state: &TerminalControlState,
 ) {
-    let mut map = state.ptys.lock().unwrap();
-    for handle in map.values_mut() {
-        if let Some(control) = handle.control.as_mut() {
-            release_pty_control(app, control_state, control);
-        }
+    // Detach every managed control under the map lock, then issue lease
+    // releases without it so a slow remote host cannot stretch shutdown into a
+    // 15s-per-host stall while other terminal commands queue on the same lock.
+    let mut controls: Vec<PtyControl> = {
+        let mut map = state.ptys.lock().unwrap();
+        map.values_mut()
+            .filter_map(|handle| handle.control.take())
+            .collect()
+    };
+    for control in &mut controls {
+        release_pty_control(app, control_state, control);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        managed_ssh_attach_args, target_from_remote_shell, target_from_tmux_args,
-        valid_terminal_reply, validate_managed_open,
+        managed_ssh_attach_args, refresh_control_snapshot, snapshot_control_for_refresh,
+        target_from_remote_shell, target_from_tmux_args, valid_terminal_reply,
+        validate_managed_open, PtyHandle, PtyState,
     };
+    use crate::features::PtyControl;
     use crate::ipc::OpenArgs;
     use crate::remote::HostConfig;
+    use portable_pty::{native_pty_system, PtySize};
+    use serde_json::json;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn open_args(control_session: Option<&str>) -> OpenArgs {
         OpenArgs {
@@ -975,6 +1104,274 @@ mod tests {
             "set -e; export TERM=xterm-256color; \"$HOME/bin/tmux\" has-session -t '=managed-one'; \"$HOME/bin/tmux\" set-option -g mouse on >/dev/null 2>&1 || true; \"$HOME/bin/tmux\" bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true; \"$HOME/bin/tmux\" bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true; exec \"$HOME/bin/tmux\" attach-session -r -f ignore-size -t '=managed-one'"
         );
     }
+
+    fn test_control(target_id: &str, lease: Option<serde_json::Value>) -> PtyControl {
+        PtyControl {
+            session_name: "tw-term-test".to_string(),
+            host_id: None,
+            control_target_id: Some(target_id.to_string()),
+            control_epoch: Some("epoch-one".to_string()),
+            owner: json!({
+                "kind": "dashboard",
+                "instanceId": "dashboard:instance:pty-test",
+            }),
+            lease,
+            desired_size: None,
+            applied_size: None,
+            next_operation: 0,
+            pending_handoff_id: None,
+            last_state: "FREE".to_string(),
+            last_owner_kind: None,
+            last_error: None,
+        }
+    }
+
+    /// A no-op stand-in for `Box<dyn portable_pty::Child>`: the regression
+    /// tests only need a live pty master/writer to prove lock behaviour, not a
+    /// real subprocess. Spawning a process here made the tests flaky under the
+    /// parallel integration binaries (portable-pty closes inherited fds in
+    /// pre_exec), so the fake keeps them hermetic.
+    #[derive(Debug)]
+    struct FakeChild {
+        killed: std::sync::atomic::AtomicBool,
+    }
+
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeChild {
+                killed: std::sync::atomic::AtomicBool::new(
+                    self.killed.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            })
+        }
+    }
+
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .killed
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(0)
+        }
+    }
+
+    fn test_pty_handle(instance_id: &str, control: Option<PtyControl>) -> PtyHandle {
+        let system = native_pty_system();
+        let pair = system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        PtyHandle {
+            instance_id: instance_id.to_string(),
+            master: pair.master,
+            writer,
+            child: Box::new(FakeChild {
+                killed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            control,
+            control_pending: false,
+        }
+    }
+
+    fn insert_handle(state: &PtyState, id: &str, handle: PtyHandle) {
+        state.ptys.lock().unwrap().insert(id.to_string(), handle);
+    }
+
+    fn kill_all_handles(state: &PtyState) {
+        for (_, mut handle) in state.ptys.lock().unwrap().drain() {
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
+        }
+    }
+
+    fn test_lease() -> serde_json::Value {
+        json!({
+            "controlTargetId": "target-one",
+            "controlEpoch": "epoch-one",
+            "leaseId": "lease-one",
+            "fence": "12",
+            "owner": {
+                "kind": "dashboard",
+                "instanceId": "dashboard:instance:pty-test",
+            },
+            "expiresAt": "2030-07-13T12:00:00.000Z",
+        })
+    }
+
+    #[test]
+    fn status_refresh_snapshot_runs_without_holding_the_global_map_lock() {
+        // C008 regression: observation-only status polling must clone the
+        // control and release the global map lock before its (potentially
+        // 15s+) remote RPC, so another thread can take the lock for a
+        // different PTY while the refresh closure is still running.
+        let state = Arc::new(PtyState::default());
+        insert_handle(
+            &state,
+            "remote",
+            test_pty_handle("inst-remote", Some(test_control("target-remote", None))),
+        );
+        insert_handle(
+            &state,
+            "other",
+            test_pty_handle("inst-other", Some(test_control("target-other", None))),
+        );
+
+        let snapshot = snapshot_control_for_refresh(&state, "remote")
+            .expect("lease-less control must be snapshotted");
+
+        let (in_rpc_tx, in_rpc_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let slow_state = Arc::clone(&state);
+        thread::spawn(move || {
+            // Simulate the slow remote RPC from inside the refresh closure:
+            // this is exactly the window during which the global map lock must
+            // NOT be held.
+            refresh_control_snapshot(slow_state.as_ref(), "remote", snapshot, |control| {
+                in_rpc_tx.send(()).unwrap();
+                thread::sleep(Duration::from_millis(400));
+                control.last_state = "HELD".to_string();
+            });
+            done_tx.send(()).unwrap();
+        });
+        in_rpc_rx.recv().unwrap();
+
+        // A different PTY must be reachable while the refresh RPC is in
+        // flight. The bug held the global map lock for the whole RPC, so
+        // acquiring it here (as pty_write for another id would) blocks until
+        // the slow refresh finished.
+        let start = Instant::now();
+        let _map = state
+            .ptys
+            .lock()
+            .expect("different-id pty lock must not block on the remote status RPC");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "different-id pty access blocked for {elapsed:?} while status RPC was in flight"
+        );
+        drop(_map);
+        done_rx.recv().unwrap();
+
+        // The snapshot merge landed observation fields on the right handle.
+        let map = state.ptys.lock().unwrap();
+        let live = map.get("remote").unwrap().control.as_ref().unwrap();
+        assert_eq!(live.last_state, "HELD");
+        assert!(live.lease.is_none());
+        drop(map);
+        kill_all_handles(state.as_ref());
+    }
+
+    #[test]
+    fn status_snapshot_merge_is_rejected_when_the_pty_instance_changed() {
+        // C008 fence: the PTY tab may have been killed and reopened (new
+        // instance_id) while the refresh RPC was in flight; the stale
+        // observation must be discarded rather than written onto the new
+        // handle.
+        let state = PtyState::default();
+        let snapshot = snapshot_control_for_refresh(&state, "remote");
+        assert!(snapshot.is_none());
+
+        insert_handle(
+            &state,
+            "remote",
+            test_pty_handle("inst-one", Some(test_control("target-one", None))),
+        );
+        let snapshot = snapshot_control_for_refresh(&state, "remote").unwrap();
+
+        // Simulate pty_kill + reopen: remove and insert a fresh instance.
+        state.ptys.lock().unwrap().remove("remote");
+        insert_handle(
+            &state,
+            "remote",
+            test_pty_handle("inst-two", Some(test_control("target-one", None))),
+        );
+
+        let merged = refresh_control_snapshot(&state, "remote", snapshot, |control| {
+            control.last_state = "HELD".to_string();
+        });
+        assert!(
+            merged.is_none(),
+            "stale snapshot must not merge onto a new instance"
+        );
+        let map = state.ptys.lock().unwrap();
+        let handle = map.get("remote").unwrap();
+        assert_eq!(handle.instance_id, "inst-two");
+        assert_eq!(
+            handle.control.as_ref().unwrap().last_state,
+            "FREE",
+            "new instance state must be untouched"
+        );
+        drop(map);
+        kill_all_handles(&state);
+    }
+
+    #[test]
+    fn status_snapshot_is_refused_while_the_pty_holds_a_lease() {
+        // lease.renew is an ownership operation: it must stay on the locked
+        // path (with_pty_control semantics), never on the lock-free snapshot
+        // path, so a concurrent write cannot fence the lease between drain
+        // and commit.
+        let state = PtyState::default();
+        insert_handle(
+            &state,
+            "remote",
+            test_pty_handle(
+                "inst-one",
+                Some(test_control("target-one", Some(test_lease()))),
+            ),
+        );
+        assert!(snapshot_control_for_refresh(&state, "remote").is_none());
+        kill_all_handles(&state);
+    }
+
+    #[test]
+    fn status_snapshot_never_writes_lease_or_handoff_fields_back() {
+        // Even if the remote response (or a forged in-test closure) tries to
+        // populate lease/handoff state on the snapshot, the merge must not
+        // propagate them: observation results cannot revive ownership.
+        let state = PtyState::default();
+        insert_handle(
+            &state,
+            "remote",
+            test_pty_handle("inst-one", Some(test_control("target-one", None))),
+        );
+        let snapshot = snapshot_control_for_refresh(&state, "remote").unwrap();
+        let merged = refresh_control_snapshot(&state, "remote", snapshot, |control| {
+            control.lease = Some(test_lease());
+            control.pending_handoff_id = Some("handoff-stale".to_string());
+            control.last_state = "HELD".to_string();
+        });
+        assert!(merged.is_some());
+        let map = state.ptys.lock().unwrap();
+        let live = map.get("remote").unwrap().control.as_ref().unwrap();
+        assert_eq!(live.last_state, "HELD", "observation field must merge");
+        assert!(live.lease.is_none(), "snapshot must never revive a lease");
+        assert!(
+            live.pending_handoff_id.is_none(),
+            "snapshot must never set a hand-off id"
+        );
+        drop(map);
+        kill_all_handles(&state);
+    }
 }
 
 #[tauri::command]
@@ -987,21 +1384,41 @@ pub(crate) async fn pty_control_status(
     let state = Arc::clone(state.inner());
     let control_state = Arc::clone(control_state.inner());
     tauri::async_runtime::spawn_blocking(move || {
+        let uncontrolled = PtyControlStatus {
+            controlled: false,
+            read_only: false,
+            state: "UNCONTROLLED".to_string(),
+            owner_kind: None,
+            can_take_over: false,
+            can_recover: false,
+            message: None,
+        };
+        // Observation-only path: clone the control under the map lock, run the
+        // remote RPC outside it, and merge back with identity fencing. This
+        // keeps a slow remote status poll (15s+ on an unreachable host) from
+        // blocking input to every other terminal.
+        if let Some(snapshot) = snapshot_control_for_refresh(state.as_ref(), &id) {
+            let merged = refresh_control_snapshot(state.as_ref(), &id, snapshot, |control| {
+                refresh_pty_control_status(&app, control_state.as_ref(), control)
+            });
+            return Ok(merged.unwrap_or_else(|| {
+                // The PTY was removed/reopened or ownership changed while the
+                // RPC was in flight. Report the current cached status without
+                // issuing another remote call.
+                let map = state.ptys.lock().unwrap();
+                map.get(&id)
+                    .and_then(|handle| handle.control.as_ref())
+                    .map(PtyControl::status)
+                    .unwrap_or(uncontrolled)
+            }));
+        }
         let mut map = state.ptys.lock().unwrap();
         let handle = map.get_mut(&id).ok_or("pty not found")?;
         if handle.control_pending {
             return Err("managed PTY control is still initializing".to_string());
         }
         let Some(control) = handle.control.as_mut() else {
-            return Ok(PtyControlStatus {
-                controlled: false,
-                read_only: false,
-                state: "UNCONTROLLED".to_string(),
-                owner_kind: None,
-                can_take_over: false,
-                can_recover: false,
-                message: None,
-            });
+            return Ok(uncontrolled);
         };
         Ok(refresh_pty_control_status(
             &app,
