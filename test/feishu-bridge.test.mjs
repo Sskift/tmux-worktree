@@ -1692,6 +1692,50 @@ test("an external non-force handoff waits for inherited Agent completion", async
   }
 });
 
+test("an inherited task that stops during a draining handoff settles and lets the handoff commit", async () => {
+  let now = Date.parse("2026-09-08T02:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+
+    const localOwner = { kind: "dashboard", instanceId: "dashboard:external:pty-one" };
+    await h.control.beginHandoff(binding.controlTargetId, localOwner);
+    await h.bridge.reconcileHandoffs();
+    assert.equal(h.control.target.state, "DRAINING");
+
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "stop-candidate");
+    now += 1_001;
+    await h.bridge.pollTurns();
+
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "activity.agent-result").length,
+      1,
+      "the inherited task final result must be captured even while DRAINING",
+    );
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /The exact structured final answer\./);
+
+    await h.bridge.reconcileHandoffs();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "handoff.commit").length,
+      1,
+      "a settled watch must let the pending handoff commit",
+    );
+    assert.equal(h.control.target.state, "HELD");
+    assert.equal(h.control.target.owner.kind, "dashboard");
+    assert.equal(h.bridge.snapshot().bindings[0].status, "paused");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("fatal first activity probe leaves committed Feishu ownership stale and visible", async () => {
   const h = harness();
   try {

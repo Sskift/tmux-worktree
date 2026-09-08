@@ -1422,8 +1422,13 @@ export class FeishuBridge {
     let result: CanonicalAgentResultResult;
     try {
       const before = await this.control.ownershipStatus(binding.controlTargetId);
-      if (this.isFeishuDrainingView(binding, lease, before)) return;
-      this.assertLeaseView(binding, lease, before);
+      // A lease-less handoff to a controlled local owner leaves the target
+      // DRAINING for the feishu owner; the canonical layer still allows the
+      // read-only agent-result capture in that state, so the watch reaches a
+      // certain disposition (and the handoff can then commit) instead of
+      // parking at stop-candidate forever. Output generation and the exact
+      // structured source are still enforced below.
+      this.assertActivitySettlementView(binding, lease, before);
       if (before.outputGeneration !== watch.outputGeneration) {
         throw new CanonicalTerminalControlError(
           "STALE_OUTPUT_CURSOR",
@@ -1503,11 +1508,11 @@ export class FeishuBridge {
   ): Promise<void> {
     try {
       const before = await this.control.ownershipStatus(binding.controlTargetId);
-      if (this.isFeishuDrainingView(binding, lease, before)) {
-        await this.deferActivityCompletion(binding.id, watch.id);
-        return;
-      }
-      this.assertLeaseView(binding, lease, before);
+      // The completion card does not require terminal ownership: its text was
+      // fenced when the result was captured and the idempotency key is fixed.
+      // Sending it during a DRAINING lease-less handoff settles the watch so
+      // reconcileBindingHandoff can commit, rather than deferring forever.
+      this.assertActivitySettlementView(binding, lease, before);
       if (before.outputGeneration !== watch.outputGeneration) {
         throw new CanonicalTerminalControlError(
           "STALE_OUTPUT_CURSOR",
@@ -1796,6 +1801,42 @@ export class FeishuBridge {
         "Feishu binding no longer owns the exact terminal target",
       );
     }
+  }
+
+  // Settling an inherited local task (capturing its final result and sending
+  // the group card) is allowed while a lease-less handoff to a controlled
+  // local owner is already DRAINING: the canonical layer allows
+  // agent-status/agent-result/commit in DRAINING for the feishu owner, and
+  // sending a card needs no lease. Mirrors assertTurnAuthority's settling
+  // states. Returns false instead of throwing so callers can choose the
+  // DRAINING-safe path; anything else keeps the strict HELD assertion.
+  private feishuSettlementViewAllowsDraining(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    target: CanonicalTerminalOwnership,
+  ): boolean {
+    return target.controlTargetId === binding.controlTargetId
+      && lease.controlTargetId === binding.controlTargetId
+      && target.controlEpoch === lease.controlEpoch
+      && target.fence === lease.fence
+      && target.ownerKind === "feishu"
+      && lease.owner.kind === "feishu"
+      && target.state === "DRAINING"
+      && (target.nextOwnerKind === "dashboard" || target.nextOwnerKind === "local-cli")
+      && !!target.handoffId;
+  }
+
+  // Strict ownership check for activity completion. HELD requires the normal
+  // lease view; a DRAINING feishu-owned target (lease-less handoff to a
+  // controlled local owner) is accepted only for settling the final result —
+  // the output-generation and structured-source checks still fail closed.
+  private assertActivitySettlementView(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    target: CanonicalTerminalOwnership,
+  ): void {
+    if (this.feishuSettlementViewAllowsDraining(binding, lease, target)) return;
+    this.assertLeaseView(binding, lease, target);
   }
 
   private assertTurnAuthority(
