@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -722,6 +722,54 @@ function harness(options = {}) {
     ...(options.now ? { now: options.now } : {}),
   });
   return { root, paths, control, lark, store, bridge };
+}
+
+// Write a fake `lark-cli` executable into a fresh bin dir on PATH and return
+// a cleanup handle. The fake implements just enough of `event consume` to
+// drive the real LarkCliBridgeAdapter.subscribe(): it emits the stderr
+// `[event] ready event_key=<key>` marker for a healthy subscribe, or a JSON
+// error envelope + non-zero exit (without any marker) for a setup failure.
+// Behavior is selected by FAKE_LARK_MODE so the bridge (which spawns
+// lark-cli inheriting process.env) gets a deterministic child.
+function installFakeLarkCli() {
+  const binDir = mkdtempSync(join(tmpdir(), "tw-fake-lark-"));
+  const binPath = join(binDir, "lark-cli");
+  writeFileSync(binPath, `#!/usr/bin/env node
+const mode = process.env.FAKE_LARK_MODE || "healthy";
+const args = process.argv.slice(2);
+const isConsume = args.includes("event") && args[args.indexOf("event") + 1] === "consume";
+if (!isConsume) { process.exit(0); }
+if (mode === "fail-setup") {
+  process.stderr.write(JSON.stringify({
+    ok: false,
+    error: { type: "auth", subtype: "missing_token",
+      message: "auth failure: missing token" },
+  }) + "\\n");
+  setTimeout(() => process.exit(3), 15);
+} else {
+  process.stderr.write("[event] ready event_key=im.message.receive_v1\\n");
+  if (process.env.FAKE_LARK_EMIT_EVENT === "1") {
+    process.stdout.write(JSON.stringify({
+      type: "im.message.receive_v1", chat_type: "group",
+      event_id: "evt-fake-1", message_id: "om-fake-1", chat_id: "oc-fake",
+      message_type: "text", sender_id: "ou-sender", content: "hello",
+    }) + "\\n");
+  }
+}
+setInterval(() => {}, 1_000_000);
+`);
+  chmodSync(binPath, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath}`;
+  return {
+    binPath,
+    setMode(mode) { process.env.FAKE_LARK_MODE = mode; },
+    restore() {
+      process.env.PATH = previousPath;
+      delete process.env.FAKE_LARK_MODE;
+      rmSync(binDir, { recursive: true, force: true });
+    },
+  };
 }
 
 function currentTurn(h) {
@@ -3186,6 +3234,56 @@ test("Feishu bridge startup fails when the event consumer cannot spawn", async (
   }
 });
 
+test("event consumer setup failure (ready rejects) aborts start and never reports running", async () => {
+  // Regression for the ready/done race (C042): 'ready' now resolves only on
+  // lark-cli's `[event] ready` stderr marker, i.e. once the subscription is
+  // established. A child that spawns but fails during setup (auth exit 3,
+  // network/handshake exit 4) rejects ready BEFORE the marker, so the bridge
+  // must never publish 'running' and start() must abort with the real cause
+  // (matching the ENOENT semantics) instead of entering a reconnect storm.
+  const h = harness();
+  let settleFailure;
+  h.lark.subscribe = () => {
+    let rejectReady;
+    let rejectDone;
+    settleFailure = () => {
+      rejectReady(new Error("lark-cli event consumer exited 3 before ready: auth failure (missing token)"));
+      rejectDone(new Error("lark-cli event consumer exited 3: auth failure (missing token)"));
+    };
+    return {
+      child: undefined,
+      ready: new Promise((_, reject) => { rejectReady = reject; }),
+      done: new Promise((_, reject) => { rejectDone = reject; }),
+      stop() {},
+    };
+  };
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    lark: h.lark,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+  });
+  let startError;
+  const startPromise = server.start().catch((error) => { startError = error; });
+  try {
+    // While setup is still in flight (ready pending), the consumer must read
+    // as 'starting', never 'running'.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const pendingSnapshot = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
+    assert.equal(pendingSnapshot.eventConsumer.state, "starting",
+      "a consumer whose subscription is not established must not be reported running");
+    settleFailure();
+    await startPromise;
+    assert.ok(startError, "start() must reject on a pre-ready setup failure");
+    assert.match(startError.message, /exited 3|auth/);
+    assert.equal(existsSync(h.paths.socket), false, "aborted start cleans up the socket");
+  } finally {
+    await server.stop();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("fast-flapping consumer (ready then quick exit) backs off instead of reconnect-storming", async () => {
   // Regression for the backoff counter reset point (D015): the attempt
   // counter must reset only after a subscription stays up for the stability
@@ -3201,7 +3299,7 @@ test("fast-flapping consumer (ready then quick exit) backs off instead of reconn
     subscribes += 1;
     let rejectDone;
     const done = new Promise((_, reject) => { rejectDone = reject; });
-    // ready resolves (subscription launched) then the child dies quickly.
+    // ready resolves (subscription established) then the child dies quickly.
     setTimeout(() => rejectDone(new Error(`lark-cli event consumer exited 4: network reset (flap ${subscribes})`)), 20);
     return {
       child: undefined,
@@ -3282,6 +3380,49 @@ test("consumer that survives the stability window resets backoff for an immediat
   } finally {
     await server.stop();
     rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("real lark-cli child that fails setup before the ready marker rejects ready (no fake running)", async () => {
+  // End-to-end C042 regression against a real spawned child (fake lark-cli on
+  // PATH): the child launches but never emits `[event] ready` and exits 3
+  // (auth) during setup. With ready wired to the spawn event this read as a
+  // healthy subscription; ready must now reject with the setup cause and the
+  // subscription must never be considered established.
+  const fake = installFakeLarkCli();
+  fake.setMode("fail-setup");
+  try {
+    const adapter = new LarkCliBridgeAdapter();
+    const events = [];
+    const sub = adapter.subscribe((event) => { events.push(event); return Promise.resolve(); });
+    await assert.rejects(sub.ready, /exited 3|auth|missing token/);
+    await assert.rejects(sub.done, /exited 3/);
+    assert.deepEqual(events, []);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("real lark-cli child resolves ready only after the stderr marker and streams events", async () => {
+  // Companion: a healthy child emits `[event] ready` on stderr and then
+  // streams NDJSON on stdout. ready must resolve (subscription established)
+  // and the event must be delivered to onEvent.
+  const fake = installFakeLarkCli();
+  fake.setMode("healthy");
+  process.env.FAKE_LARK_EMIT_EVENT = "1";
+  try {
+    const adapter = new LarkCliBridgeAdapter();
+    const events = [];
+    const sub = adapter.subscribe((event) => { events.push(event); return Promise.resolve(); });
+    await sub.ready; // resolves once the marker is seen
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].message_id, "om-fake-1");
+    sub.stop();
+    await sub.done;
+  } finally {
+    delete process.env.FAKE_LARK_EMIT_EVENT;
+    fake.restore();
   }
 });
 
