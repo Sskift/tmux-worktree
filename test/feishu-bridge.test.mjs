@@ -209,6 +209,7 @@ class FakeControlClient {
     this.agentResultTruncated = false;
     this.agentResultErrors = [];
     this.agentStatusErrors = [];
+    this.tailErrors = [];
     this.failRelease = false;
     this.failRenew = false;
     this.renewErrors = [];
@@ -578,6 +579,8 @@ class FakeControlClient {
       error.code = "STALE_OUTPUT_CURSOR";
       throw error;
     }
+    const tailError = this.tailErrors.shift();
+    if (tailError) throw tailError;
     const source = Buffer.from(this.output, "utf8");
     const maxBytes = Math.min(input.maxBytes, this.tailChunkBytes ?? input.maxBytes);
     const data = source.subarray(input.cursor, input.cursor + maxBytes);
@@ -3037,6 +3040,63 @@ test("tail response fence and ownerKind are checked before marked output can rep
       await h.bridge.close();
       rmSync(h.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("a transient tailOutput transport failure keeps the turn awaiting and a later poll replies", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "reply after a transient tail failure");
+    h.control.tailErrors.push(Object.assign(
+      new Error("terminal-control request timed out"),
+      { code: "ETIMEDOUT" },
+    ));
+
+    await h.bridge.pollTurns();
+
+    let state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "awaiting");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 0);
+
+    await h.bridge.pollTurns();
+
+    state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "completed");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].text, "reply after a transient tail failure");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a deterministic tailOutput authority error still fences the binding", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.tailErrors.push(new CanonicalTerminalControlError(
+      "PERMISSION_DENIED",
+      "tail lease was fenced",
+    ));
+
+    await h.bridge.pollTurns();
+
+    assert.equal(h.lark.replies.length, 0);
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 

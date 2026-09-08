@@ -215,7 +215,12 @@ const RETRYABLE_TRANSPORT_ERROR_CODES = new Set([
   "EAI_AGAIN",
 ]);
 
-function retryableRenderedSnapshotObservation(error: unknown): boolean {
+// A read-only observation (output tail, rendered snapshot, agent status)
+// mutates nothing: success advances a cursor/output buffer, failure leaves
+// durable state untouched. A transient transport/lock stall therefore just
+// waits for the next fenced poll; only a deterministic authority/correlation
+// code is fatal.
+function retryableReadOnlyObservation(error: unknown): boolean {
   if (error instanceof RenderedSnapshotCorrelationError) return false;
   if (!(error instanceof Error)) return false;
   const candidate = error as { code?: unknown; retryable?: unknown };
@@ -224,9 +229,10 @@ function retryableRenderedSnapshotObservation(error: unknown): boolean {
   }
   if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return true;
   if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable === true;
-  // Socket timeouts/resets may not be normalized by the canonical client. The
-  // snapshot is read-only, so an ordinary transport Error can wait for the
-  // next fenced authority check instead of invalidating the binding now.
+  if (RETRYABLE_TRANSPORT_ERROR_CODES.has(candidate.code)) return true;
+  // Socket timeouts/resets may not be normalized by the canonical client.
+  // The observation is read-only, so an ordinary transport Error can wait
+  // for the next fenced authority check instead of fencing the binding now.
   return !(error instanceof CanonicalTerminalControlError);
 }
 
@@ -1202,28 +1208,37 @@ export class FeishuBridge {
           maxBytes: OUTPUT_TAIL_BYTES,
         });
       } catch (error) {
-        if (!hasCode(error, "STALE_OUTPUT_CURSOR")) throw error;
-        const latest = await this.control.ownershipStatus(turn.controlTargetId);
-        this.assertTurnAuthority(turn, lease, latest);
-        const retainedCursor = Math.max(
-          0,
-          latest.outputCursor - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
-        );
-        if (retainedCursor <= turn.cursor) throw error;
-        // A fast command can emit more than the bounded correlation window
-        // between Bridge polls. The current authority view proves the same
-        // Feishu lease/generation, so resume at the minimum guaranteed
-        // retained cursor and rebuild only the read-only marker parser. Input
-        // is never replayed, and generation/fence staleness still fails closed.
-        turn.cursor = retainedCursor;
-        turn.output = "";
-        delete turn.outputRemainderBase64;
-        delete turn.markerSeenAt;
-        const observedAt = this.now();
-        turn.lastOutputAt = new Date(observedAt).toISOString();
-        turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
-        this.persist();
-        return;
+        if (hasCode(error, "STALE_OUTPUT_CURSOR")) {
+          const latest = await this.control.ownershipStatus(turn.controlTargetId);
+          this.assertTurnAuthority(turn, lease, latest);
+          const retainedCursor = Math.max(
+            0,
+            latest.outputCursor - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+          );
+          if (retainedCursor <= turn.cursor) throw error;
+          // A fast command can emit more than the bounded correlation window
+          // between Bridge polls. The current authority view proves the same
+          // Feishu lease/generation, so resume at the minimum guaranteed
+          // retained cursor and rebuild only the read-only marker parser. Input
+          // is never replayed, and generation/fence staleness still fails closed.
+          turn.cursor = retainedCursor;
+          turn.output = "";
+          delete turn.outputRemainderBase64;
+          delete turn.markerSeenAt;
+          const observedAt = this.now();
+          turn.lastOutputAt = new Date(observedAt).toISOString();
+          turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
+          this.persist();
+          return;
+        }
+        // tailOutput is read-only (a failure persists no cursor/output change),
+        // so a transient transport/lock stall just waits for the next poll.
+        // Scope note: only the tail call itself is retried here. Ownership
+        // fence violations come from assertTurnAuthority above (also a bare
+        // Error) and must stay fatal, so they intentionally do not reach this
+        // branch.
+        if (retryableReadOnlyObservation(error)) return;
+        throw error;
       }
       if (chunk.controlEpoch !== turn.controlEpoch
         || chunk.controlTargetId !== turn.controlTargetId
@@ -1313,7 +1328,7 @@ export class FeishuBridge {
         turn.markerNonce,
       );
     } catch (error) {
-      if (retryableRenderedSnapshotObservation(error)) return;
+      if (retryableReadOnlyObservation(error)) return;
       turn.status = "recovery-required";
       turn.completedAt = nowIso(this.now);
       turn.error = error instanceof Error ? error.message : String(error);
