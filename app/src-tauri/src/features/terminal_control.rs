@@ -431,13 +431,19 @@ fn send_once(body: &Value) -> Result<Value, TerminalControlCallError> {
         message: format!("connect terminal-control {}: {error}", path.display()),
     })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        // The daemon serializes one request at a time behind its store lock; a
+        // cold-resume agent message legitimately occupies it for up to ~45s
+        // (the daemon keeps the socket to its 50s idle bound). A 10s read
+        // timeout would abandon a queued request that the daemon is about to
+        // answer, surfacing as a dropped keystroke. Read/write waits cover that
+        // window; a dead connection still fails fast at connect instead.
+        .set_read_timeout(Some(Duration::from_secs(60)))
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
             message: format!("configure terminal-control read timeout: {error}"),
         })?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(Duration::from_secs(60)))
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
             message: format!("configure terminal-control write timeout: {error}"),
@@ -960,10 +966,28 @@ pub(crate) fn release_pty_control(
     }
 }
 
+/// A transient transport/lock error that never proves the canonical control
+/// state changed. The daemon may be serializing a long (cold-resume) agent
+/// message behind the store lock: the waiter times out its lock wait
+/// (retryable RESOURCE_EXHAUSTED) or the client's read times out while queued
+/// (UNAVAILABLE). These must keep the lease and the last observed state so the
+/// next 1s poll retries, instead of flapping the Dashboard into
+/// RECOVERY_REQUIRED and dropping an otherwise valid lease. Deterministic
+/// ownership/fence codes stay fail-closed.
+fn is_transient_control_error(error: &TerminalControlCallError) -> bool {
+    matches!(error.code.as_str(), "RESOURCE_EXHAUSTED" | "UNAVAILABLE")
+}
+
 /// Apply the standard terminal-control error classification: clear the lease
 /// on ownership/handoff failures, mark recovery-required states, and record
 /// the last error for observers.
 fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallError) {
+    if is_transient_control_error(error) {
+        // Keep the lease and state: the keystroke is dropped but the next write
+        // reuses the cached lease and the next status poll reconciles.
+        control.last_error = Some(error.to_string());
+        return;
+    }
     if matches!(
         error.code.as_str(),
         "PERMISSION_DENIED"
@@ -971,7 +995,6 @@ fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallE
             | "TARGET_GONE"
             | "RECOVERY_REQUIRED"
             | "OPERATION_IN_DOUBT"
-            | "UNAVAILABLE"
             | "INTERNAL"
     ) {
         control.lease = None;
@@ -979,7 +1002,7 @@ fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallE
     }
     if matches!(
         error.code.as_str(),
-        "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
+        "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "INTERNAL"
     ) {
         control.last_state = "RECOVERY_REQUIRED".to_string();
         control.last_owner_kind = None;
@@ -1213,13 +1236,22 @@ pub(crate) fn refresh_pty_control_status(
         }
         Err(error) => {
             control.last_error = Some(error.to_string());
-            control.last_state = if error.code == "TARGET_GONE" {
-                "TARGET_GONE".to_string()
+            if error.code == "TARGET_GONE" {
+                control.last_state = "TARGET_GONE".to_string();
+                control.last_owner_kind = None;
+                control.lease = None;
+                control.applied_size = None;
+            } else if is_transient_control_error(&error) {
+                // Lock contention or a queued read timeout while a long agent
+                // message serializes. Preserve the lease and last state: the
+                // next 1s poll reconciles after the store lock frees, so the
+                // Dashboard never shows a recovery prompt it cannot heal.
             } else {
-                "RECOVERY_REQUIRED".to_string()
-            };
-            control.lease = None;
-            control.applied_size = None;
+                control.last_state = "RECOVERY_REQUIRED".to_string();
+                control.last_owner_kind = None;
+                control.lease = None;
+                control.applied_size = None;
+            }
         }
     }
     control.status()
@@ -1669,5 +1701,48 @@ mod tests {
         control.clear_dashboard_lease_after_transfer_attempt();
         assert!(control.current_dashboard_lease().is_err());
         assert_eq!(control.last_state, "RECOVERY_REQUIRED");
+    }
+
+    fn held_control() -> PtyControl {
+        PtyControl {
+            session_name: "tw-term-locked".to_string(),
+            host_id: None,
+            control_target_id: Some("target-held".to_string()),
+            control_epoch: Some("epoch-held".to_string()),
+            owner: json!({ "kind": "dashboard", "instanceId": "dashboard:held" }),
+            lease: Some(json!({ "leaseId": "lease-held" })),
+            desired_size: Some((80, 24)),
+            applied_size: Some((80, 24)),
+            next_operation: 0,
+            pending_handoff_id: None,
+            last_state: "HELD".to_string(),
+            last_owner_kind: Some("dashboard".to_string()),
+            last_error: None,
+        }
+    }
+
+    fn call_error(code: &str) -> TerminalControlCallError {
+        TerminalControlCallError {
+            code: code.to_string(),
+            message: format!("synthetic {code}"),
+        }
+    }
+
+    #[test]
+    fn transient_lock_errors_keep_the_lease_and_held_state() {
+        for code in ["RESOURCE_EXHAUSTED", "UNAVAILABLE"] {
+            let mut control = held_control();
+            classify_control_error(&mut control, &call_error(code));
+            assert!(control.lease.is_some(), "{code} must not clear the lease");
+            assert_eq!(control.last_state, "HELD", "{code} must not flap into recovery");
+            assert!(control.last_error.is_some());
+        }
+    }
+
+    #[test]
+    fn deterministic_ownership_errors_still_fail_closed() {
+        let mut control = held_control();
+        classify_control_error(&mut control, &call_error("PERMISSION_DENIED"));
+        assert!(control.lease.is_none(), "PERMISSION_DENIED must clear the lease");
     }
 }
