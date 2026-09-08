@@ -16,20 +16,39 @@ import type {
 } from "../../platform";
 import { useDashboardBackend } from "../../platform";
 import {
+  createRelayV2SelfHostedPanelController,
+  type RelayV2SelfHostedOperation,
+  type RelayV2SelfHostedPanelController,
+} from "./relayV2SelfHostedPanelController";
+import {
   createRelayV2SelfHostedDraft,
   relayV2ExpiredBootstrapRotationAvailable,
   relayV2SelfHostedDraftMatchesStatus,
   relayV2SelfHostedStatusLabel,
-  selfHostedStatusToDraft,
-  validateRelayV2SelfHostedDraft,
   type RelayV2SelfHostedDraft,
   type RelayV2SelfHostedDraftErrors,
 } from "./relayV2SelfHostedModel";
 
-type Operation = "save" | "deploy" | "start" | "stop" | "rotate" | null;
+type Operation = RelayV2SelfHostedOperation;
 
+// Behavior shell note: all mount-probe/edit/run fence wiring lives in
+// createRelayV2SelfHostedPanelController (relayV2SelfHostedPanelController.ts),
+// which has node-drivable regression tests for the C035 stale-response race
+// (tests/relayV2SelfHostedPanelGate.test.ts). This component only forwards
+// mount/unmount/update/run to that controller and mirrors its state; the
+// forwarding itself is covered by typecheck and the SSR render smoke test
+// (the repo has no jsdom/react-test-renderer, so effects can't run in tests).
 export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[] }) {
   const backend = useDashboardBackend();
+  const [controller] = useState<RelayV2SelfHostedPanelController>(() =>
+    createRelayV2SelfHostedPanelController(backend.relay.v2Deployment, (next) => {
+      setDraft(next.draft);
+      setStatus(next.status);
+      setErrors(next.errors);
+      setOperation(next.operation);
+      setNotice(next.notice);
+    }),
+  );
   const [draft, setDraft] = useState<RelayV2SelfHostedDraft>(
     createRelayV2SelfHostedDraft,
   );
@@ -47,69 +66,19 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
   ], [hosts]);
 
   useEffect(() => {
-    let active = true;
-    void backend.relay.v2Deployment.status().then((next) => {
-      if (!active) return;
-      setStatus(next);
-      setDraft(selfHostedStatusToDraft(next));
-    }).catch((error: unknown) => {
-      if (active) setNotice(error instanceof Error ? error.message : String(error));
-    });
-    return () => {
-      active = false;
-    };
-  }, [backend]);
+    controller.mount();
+    return () => controller.unmount();
+  }, [controller]);
 
   const update = <K extends keyof RelayV2SelfHostedDraft>(
     field: K,
     value: RelayV2SelfHostedDraft[K],
   ) => {
-    setDraft((current) => ({ ...current, [field]: value }));
-    setErrors((current) => ({ ...current, [field]: undefined }));
-    setNotice(null);
+    controller.update(field, value);
   };
 
-  const run = async (kind: Exclude<Operation, null>) => {
-    if (operation) return;
-    setNotice(null);
-    setOperation(kind);
-    try {
-      let next: MobileRelayV2SelfHostedStatus;
-      if (kind === "stop") {
-        next = await backend.relay.v2Deployment.stopCenter();
-      } else if (kind === "rotate") {
-        next = await backend.relay.v2Deployment.rotateExpiredHostBootstrap();
-      } else {
-        const validation = validateRelayV2SelfHostedDraft(draft);
-        setErrors(validation.errors);
-        if (!validation.valid) {
-          setNotice("Review the highlighted Relay v2 deployment fields.");
-          return;
-        }
-        next = kind === "save"
-          ? await backend.relay.v2Deployment.saveConfig(validation.value)
-          : kind === "deploy"
-            ? await backend.relay.v2Deployment.deploy(validation.value)
-            : await backend.relay.v2Deployment.startCenter(validation.value);
-      }
-      setStatus(next);
-      setDraft(selfHostedStatusToDraft(next));
-      setNotice(kind === "save"
-        ? "Self-hosted Relay v2 settings saved."
-        : kind === "deploy"
-          ? draft.externalTlsManagement
-            ? "Canonical tw bundle and deployment profile published; external TLS validated in place."
-            : "Canonical tw bundle, TLS files, and deployment profile published."
-          : kind === "start"
-            ? "Relay v2 Center started on the selected devbox."
-            : kind === "rotate"
-              ? "Expired version-zero Host bootstrap rotated with the same persisted correlation."
-            : "Relay v2 Center stopped; persisted broker state was preserved.");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
-    } finally {
-      setOperation(null);
-    }
+  const run = (kind: Exclude<Operation, null>) => {
+    void controller.run(kind);
   };
 
   const selectFile = async (
