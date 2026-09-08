@@ -3186,6 +3186,47 @@ test("Feishu bridge startup fails when the event consumer cannot spawn", async (
   }
 });
 
+test("flapping event consumer (ready then immediate exit) never publishes running and resubscribes immediately", async () => {
+  // Regression for the ready/done race: lark-cli resolves 'ready' on the
+  // child 'spawn' event, before the subscription is established. A child
+  // that exits immediately after spawn must not be reported as 'running';
+  // the bridge must stay in 'backoff' and resubscribe (immediately on the
+  // first failure, then bounded backoff).
+  const h = harness();
+  let subscribes = 0;
+  h.lark.subscribe = () => {
+    subscribes += 1;
+    // ready and done settle in the same microtask batch, mirroring spawn
+    // followed by an immediate child exit. done rejects so the exit handler
+    // records the failure reason.
+    return {
+      child: undefined,
+      ready: Promise.resolve(),
+      done: Promise.reject(new Error(`lark-cli event consumer exited 1: flap ${subscribes}`)),
+      stop() {},
+    };
+  };
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    lark: h.lark,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+  });
+  try {
+    await server.start();
+    // Let the immediate (0ms) retry fire; it flaps as well.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(subscribes >= 2, `the flapping consumer was resubscribed immediately (got ${subscribes})`);
+    const snapshot = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
+    assert.equal(snapshot.eventConsumer.state, "backoff",
+      "a consumer that exits immediately after spawn must never be reported running");
+    assert.match(snapshot.eventConsumer.error ?? "", /flap|consumer/);
+  } finally {
+    await server.stop();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
 
 test("corrupt state file is quarantined per-file instead of failing the whole bridge", () => {
   // Regression for the crash-loop where a single torn state file made

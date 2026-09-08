@@ -351,6 +351,7 @@ export class FeishuBridgeServer {
   private pollTimer?: ReturnType<typeof setInterval>;
   private renewTimer?: ReturnType<typeof setInterval>;
   private restartTimer?: ReturnType<typeof setTimeout>;
+  private consumerRestartAttempts = 0;
   private pollInFlight = false;
   private renewInFlight = false;
   private stopping = false;
@@ -481,13 +482,22 @@ export class FeishuBridgeServer {
     this.bridge.setEventConsumerHealth("starting");
     this.consumer = this.lark.subscribe((event) => this.bridge.handleEvent(event));
     const consumer = this.consumer;
+    // Track whether the child already exited by the time ready settles.
+    // ready resolves on the 'spawn' event (process launched), not once the
+    // lark-cli subscription is established; a child that exits in the same
+    // microtask batch as spawn (or before the await continuation runs) must
+    // not publish a fake 'running' state. The handler runs before the await
+    // continuation below (it is attached first), so the flag is reliable.
+    let consumerSettledBeforeReady = false;
     void consumer.done.then(
       () => {
+        consumerSettledBeforeReady = true;
         if (!this.stopping) {
           this.bridge.setEventConsumerHealth("backoff", "Feishu event consumer exited");
         }
       },
       (error) => {
+        consumerSettledBeforeReady = true;
         if (this.stopping) return;
         const message = error instanceof Error ? error.message : String(error);
         this.bridge.setEventConsumerHealth("backoff", message);
@@ -495,19 +505,35 @@ export class FeishuBridgeServer {
       },
     ).finally(() => {
       if (this.stopping) return;
+      // Bounded reconnect backoff: immediate first retry after an exit,
+      // then 250ms, 500ms, 1s, 2s, capped at 4s while failures persist.
+      // Health stays 'backoff' throughout, so the UI keeps the Link action
+      // disabled instead of flashing a fake healthy state.
+      const attempt = this.consumerRestartAttempts + 1;
+      this.consumerRestartAttempts = attempt;
+      const delayMs = attempt <= 1 ? 0 : Math.min(250 * 2 ** (attempt - 2), 4_000);
       this.restartTimer = setTimeout(() => {
         void this.startConsumer().catch((error) => {
           if (this.stopping) return;
           const message = error instanceof Error ? error.message : String(error);
           this.bridge.setEventConsumerHealth("backoff", message);
         });
-      }, 2_000);
+      }, delayMs);
       this.restartTimer.unref();
     });
     try {
+      // ready rejects only when the child never spawned (e.g. ENOENT),
+      // which is a deterministic startup failure: propagate it so start()
+      // aborts and the supervisor reports the real cause.
       await consumer.ready;
-      if (!this.stopping && this.consumer === consumer) {
+      if (!this.stopping && this.consumer === consumer && !consumerSettledBeforeReady) {
+        this.consumerRestartAttempts = 0;
         this.bridge.setEventConsumerHealth("running");
+      } else if (!this.stopping && this.consumer === consumer) {
+        // ready resolved but the child already exited (flap): stay in
+        // backoff; the done.finally timer resubscribes (immediately on the
+        // first failure).
+        this.bridge.setEventConsumerHealth("backoff", "Feishu event consumer exited before the subscription was established");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

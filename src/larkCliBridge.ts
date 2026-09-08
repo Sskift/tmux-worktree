@@ -364,6 +364,11 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       if (Buffer.byteLength(stdout, "utf8") > MAX_LARK_OUTPUT_BYTES) {
+        // Backpressure fuse for a pathological single line (normal events are
+        // KB-sized NDJSON and drained per line below, so this only trips on
+        // malformed output). Record why before the supervisor only sees an
+        // exit code; the restart path resubscribes immediately.
+        process.stderr.write("[feishu-bridge] event consumer stdout exceeded 1MiB without a line boundary; restarting the subscription\n");
         child.kill("SIGTERM");
         return;
       }
