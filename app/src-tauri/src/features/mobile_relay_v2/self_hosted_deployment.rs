@@ -2395,90 +2395,126 @@ fn reconcile_relay_v2_self_hosted_connector_desired_state(
     management: &MobileRelayV2ManagementCommandState,
     expected_binding: &SelfHostedManagementBinding,
 ) -> ConnectorWatchdogReconcileOutcome {
-    // The deployment owner mutex is intentionally held across the management
-    // request. Start, stop, replacement, and the watchdog therefore share one
-    // desired-state fence: a user-requested stop cannot race with a stale
-    // watchdog read and be undone after the stop returns.
-    let Ok(owner) = state.operation.lock() else {
-        return ConnectorWatchdogReconcileOutcome::Retry;
+    // The deployment owner mutex serializes management mutations (start, stop,
+    // replacement) with the watchdog: a user-requested stop cannot race with a
+    // stale watchdog decision and be undone after the stop returns. The mutex
+    // is std::sync (not reentrant). The dominant black-hole stall — the
+    // read-only remote probe_status (SSH ServerAlive rounds ≈45s on a
+    // unreachable devbox), which previously ran every tick WHILE the lock was
+    // held — is now performed lock-free (Phase 2). Start_center and the local
+    // child replacement re-acquire the lock (Phase 3) and operate on a FRESH
+    // config so their full-struct save_config is fenced and cannot clobber a
+    // concurrent Save/Deploy; only a deterministic Stopped reading ever reaches
+    // start_center, so the lock is never held across SSH against an
+    // unreachable devbox.
+    let config_snapshot = {
+        let Ok(owner) = state.operation.lock() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        if owner.active_management.as_ref() != Some(expected_binding) {
+            return ConnectorWatchdogReconcileOutcome::Superseded;
+        }
+        let Ok(Some(config)) = load_config() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        if !expected_binding.matches_config(&config) {
+            return ConnectorWatchdogReconcileOutcome::Superseded;
+        }
+        if !config.connector_desired_running {
+            return ConnectorWatchdogReconcileOutcome::Healthy;
+        }
+        if !self_hosted_connector_prerequisites_are_complete(&config) {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        }
+        // Local management IPC (no network): stays in the fenced critical
+        // section. If the child is fine, the connector is healthy without ever
+        // touching the devbox.
+        if management
+            .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
+            .is_ok()
+        {
+            return ConnectorWatchdogReconcileOutcome::Healthy;
+        }
+        config
     };
-    if owner.active_management.as_ref() != Some(expected_binding) {
-        return ConnectorWatchdogReconcileOutcome::Superseded;
-    }
-    let Ok(Some(config)) = load_config() else {
-        return ConnectorWatchdogReconcileOutcome::Retry;
-    };
-    if !expected_binding.matches_config(&config) {
-        return ConnectorWatchdogReconcileOutcome::Superseded;
-    }
-    if !config.connector_desired_running {
-        return ConnectorWatchdogReconcileOutcome::Healthy;
-    }
-    if !self_hosted_connector_prerequisites_are_complete(&config) {
-        return ConnectorWatchdogReconcileOutcome::Retry;
-    }
-    if management
-        .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
-        .is_ok()
-    {
-        return ConnectorWatchdogReconcileOutcome::Healthy;
-    }
-
-    // Connector failures are terminal inside one management composition.
-    // Rebuild that exact child only after the durable binding and desired-state
-    // fence above have both been revalidated.
-    let Ok(Some(prepared)) = prepare_relay_v2_self_hosted_management_prerequisites() else {
-        return ConnectorWatchdogReconcileOutcome::Retry;
-    };
-    let Ok(replacement_binding) = prepared.management_binding() else {
-        return ConnectorWatchdogReconcileOutcome::Retry;
-    };
-    if replacement_binding != *expected_binding {
-        return ConnectorWatchdogReconcileOutcome::Superseded;
-    }
 
     // The connector reaches the remote relay-center over WSS. If the devbox
     // rebooted (or its tmux server was killed), the remote center session is
     // gone and rebuilding the local management child cannot help — every ensure
     // would keep failing and the watchdog would churn-spawn a fresh child each
-    // tick. Re-probe the remote center and idempotently start it before any
-    // local rebuild; skip the rebuild entirely while the center is absent.
-    let Ok(Some(config)) = load_config() else {
-        return ConnectorWatchdogReconcileOutcome::Retry;
-    };
-    let center_status = if self_hosted_connector_prerequisites_are_complete(&config) {
-        Some(probe_status(&config).center_status)
-    } else {
-        None
-    };
-    match remote_center_repair_action(center_status) {
-        RemoteCenterRepairAction::StartRemote => {
-            let mut remote_config = config;
-            // Re-validate the binding/config against the snapshot we are about
-            // to mutate; a concurrent Save may have changed the identity.
-            if !expected_binding.matches_config(&remote_config) {
-                return ConnectorWatchdogReconcileOutcome::Superseded;
-            }
-            if start_center(&mut remote_config).is_err() {
-                return ConnectorWatchdogReconcileOutcome::Retry;
-            }
-            // The remote center came up; the next tick drives ensure.
-            ConnectorWatchdogReconcileOutcome::Retry
+    // tick. Re-probe the remote center before any local rebuild.
+    //
+    // Network phase (read-only): probe_status runs WITHOUT the deployment lock
+    // so a black-holed devbox never parks Stop/Deploy/Save (which take the same
+    // lock) for ~45s every tick. Only a DETERMINISTIC Stopped reading (the probe
+    // script ran and tmux has-session failed) triggers a remote start; Unknown
+    // (a black-holed devbox / SSH failure, the base default) falls through to
+    // the bounded local-rebuild + Retry backoff instead of hammering
+    // start_center.
+    let center_status = Some(probe_status(&config_snapshot).center_status);
+    let remote_action = remote_center_repair_action(center_status);
+
+    // Phase 3: re-acquire the deployment lock and re-validate every fence from a
+    // FRESH config before any mutation. A Stop/Deploy/Save that landed during
+    // the lock-free probe must Supersede this reconcile so the watchdog never
+    // undoes it. start_center (which finishes with a full-struct save_config)
+    // and restart_self_hosted (spawn + readiness IPC, bounded by
+    // STARTUP_TIMEOUT) both run INSIDE the lock on that fresh config: they are
+    // the desired-state management fence, and start_center is only reached on a
+    // deterministic Stopped reading, so the lock is never held across SSH to an
+    // unreachable devbox.
+    {
+        let Ok(owner) = state.operation.lock() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        if owner.active_management.as_ref() != Some(expected_binding) {
+            return ConnectorWatchdogReconcileOutcome::Superseded;
         }
-        RemoteCenterRepairAction::RebuildLocal => {
-            let selection = prepared.selection();
-            if management
-                .restart_self_hosted(app, selection, move || prepared.commit_ready())
-                .is_err()
-            {
+        let Ok(Some(mut config)) = load_config() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        if !expected_binding.matches_config(&config) {
+            return ConnectorWatchdogReconcileOutcome::Superseded;
+        }
+        if !config.connector_desired_running {
+            return ConnectorWatchdogReconcileOutcome::Healthy;
+        }
+        if !self_hosted_connector_prerequisites_are_complete(&config) {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        }
+        if remote_action == RemoteCenterRepairAction::StartRemote {
+            // Freshly load → mutate → save under the lock; a Save/Deploy that
+            // landed during the probe is fenced off above.
+            if start_center(&mut config).is_err() {
                 return ConnectorWatchdogReconcileOutcome::Retry;
             }
-            match management
-                .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
-            {
-                Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
-                Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
-            }
+            // The remote center came up; the next tick drives ensure against it.
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        }
+
+        // Rebuild that exact child only after the durable binding and
+        // desired-state fences above have both been revalidated.
+        let Ok(Some(prepared)) = prepare_relay_v2_self_hosted_management_prerequisites() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        let Ok(replacement_binding) = prepared.management_binding() else {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        };
+        if replacement_binding != *expected_binding {
+            return ConnectorWatchdogReconcileOutcome::Superseded;
+        }
+        let selection = prepared.selection();
+        if management
+            .restart_self_hosted(app, selection, move || prepared.commit_ready())
+            .is_err()
+        {
+            return ConnectorWatchdogReconcileOutcome::Retry;
+        }
+        match management
+            .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
+        {
+            Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
+            Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
         }
     }
 }
@@ -2498,13 +2534,27 @@ enum RemoteCenterRepairAction {
 /// supervision that previously did not exist — a devbox reboot / tmux kill left
 /// the center down permanently because only a manual Start Center brought it
 /// back and restarting the Dashboard did not either.
+///
+/// Only a *deterministic* Stopped reading (the probe script ran and
+/// `tmux has-session` failed) triggers a remote start. Unknown means the SSH
+/// probe never ran — a black-holed devbox / SSH failure leaves center_status at
+/// its default Unknown with only `status.error` set — so treating it as
+/// StartRemote would run a full bootstrap (scp + many SSH round-trips) on every
+/// watchdog tick while holding the deployment lock, re-introducing the
+/// hold-lock stall this supervision was meant to remove. Unknown/Ready/Missing
+/// and None are uncertain: fall back to the local rebuild + bounded Retry
+/// backoff so a deterministic black hole waits in backoff instead of hammering
+/// start_center.
 fn remote_center_repair_action(
     center_status: Option<DeploymentProbeStatus>,
 ) -> RemoteCenterRepairAction {
     match center_status {
         Some(DeploymentProbeStatus::Running) => RemoteCenterRepairAction::RebuildLocal,
-        Some(_) => RemoteCenterRepairAction::StartRemote,
-        None => RemoteCenterRepairAction::RebuildLocal,
+        Some(DeploymentProbeStatus::Stopped) => RemoteCenterRepairAction::StartRemote,
+        Some(DeploymentProbeStatus::Unknown)
+        | Some(DeploymentProbeStatus::Ready)
+        | Some(DeploymentProbeStatus::Missing)
+        | None => RemoteCenterRepairAction::RebuildLocal,
     }
 }
 
@@ -4068,21 +4118,37 @@ mod tests {
     }
 
     #[test]
-    fn connector_watchdog_repairs_a_vanished_remote_center_before_rebuilding() {
-        // A devbox reboot / tmux kill-server leaves the remote center stopped.
-        // Rebuilding the local management child cannot fix that; the watchdog
-        // must start the remote center instead, and only rebuild locally once
-        // the center is observed running again.
+    fn connector_watchdog_starts_remote_only_for_a_deterministic_stopped_center() {
+        // A devbox reboot / tmux kill-server leaves the remote center stopped;
+        // the probe script runs and `tmux has-session` fails. Rebuilding the
+        // local management child cannot fix that, so the watchdog starts the
+        // remote center and only rebuilds locally once the center is observed
+        // running again.
         assert_eq!(
             remote_center_repair_action(Some(DeploymentProbeStatus::Stopped)),
             RemoteCenterRepairAction::StartRemote
         );
         assert_eq!(
-            remote_center_repair_action(Some(DeploymentProbeStatus::Missing)),
-            RemoteCenterRepairAction::StartRemote
+            remote_center_repair_action(Some(DeploymentProbeStatus::Running)),
+            RemoteCenterRepairAction::RebuildLocal
+        );
+        // Review D020: Unknown is the DEFAULT base_status and what a
+        // black-holed devbox / SSH failure leaves behind (the script never
+        // runs; only status.error is set). It must NOT trigger start_center —
+        // that would run a scp bootstrap + many SSH round-trips every watchdog
+        // tick. Unknown / Ready / Missing / None are all uncertain and fall
+        // back to the bounded local-rebuild + Retry backoff.
+        assert_eq!(
+            remote_center_repair_action(Some(DeploymentProbeStatus::Unknown)),
+            RemoteCenterRepairAction::RebuildLocal,
+            "a black-holed devbox (Unknown) must not repeatedly run start_center"
         );
         assert_eq!(
-            remote_center_repair_action(Some(DeploymentProbeStatus::Running)),
+            remote_center_repair_action(Some(DeploymentProbeStatus::Missing)),
+            RemoteCenterRepairAction::RebuildLocal
+        );
+        assert_eq!(
+            remote_center_repair_action(Some(DeploymentProbeStatus::Ready)),
             RemoteCenterRepairAction::RebuildLocal
         );
         // No probe result (incomplete prerequisites / unprobed) falls back to
