@@ -1544,3 +1544,67 @@ test("query distinguishes retry, reissue, expired result, and unknown evidence",
     h.cleanup();
   }
 });
+
+test("C002: persistent capacity/IO failures in claimAccepted reject instead of livelocking the runner", async () => {
+  const h = harness();
+  try {
+    const realStore = await hostState.RelayV2HostStateStore.open({ home: h.home });
+    // Writes fail deterministically after admission succeeds; reads still work,
+    // matching ENOSPC / over-budget where the store can read but never publish.
+    const failingStore = {
+      ...realStore,
+      read: (...args) => realStore.read(...args),
+      serialize: (operation) => realStore.serialize(operation),
+      transaction: async (mutation) => {
+        // Fail once an accepted command is waiting to be claimed: the claim
+        // transaction (and every retry) hits a deterministic publish fault.
+        const snapshot = await realStore.read();
+        const hasAccepted = Object.values(snapshot.commands).some(
+          (record) => record.state === "accepted",
+        );
+        if (hasAccepted) {
+          throw new hostState.RelayV2HostStateCapacityError(
+            512 * 1024 * 1024,
+            512 * 1024 * 1024,
+          );
+        }
+        return realStore.transaction(mutation);
+      },
+    };
+    const fake = fakeExecutor();
+    const resource = fakeResourceMutationOwner();
+    const plane = await commandPlane.RelayV2HostCommandPlane.open({
+      store: failingStore,
+      hostId: HOST_ID,
+      executor: fake.executor,
+      resourceMutationOwner: resource.owner,
+      now: h.now,
+      recover: true,
+    });
+    const window = await plane.issueDedupeWindow();
+    const snapshot = await realStore.read();
+    const frame = commandFrame("command-execute-kill-session", snapshot.hostEpoch, window.windowId);
+
+    // The old code looped forever (10ms retries). Race a timeout so the
+    // regression fails fast instead of hanging the test process.
+    const result = await Promise.race([
+      plane.execute(auth(), frame).then(
+        (response) => ({ kind: "response", response }),
+        (error) => ({ kind: "rejected", error }),
+      ),
+      new Promise((resolve) => setTimeout(() => resolve({ kind: "timed-out" }), 3_000)),
+    ]);
+    assert.notEqual(result.kind, "timed-out", "execute must not livelock on persistent persistence faults");
+    assert.equal(result.kind, "rejected");
+    assert.equal(result.error.code, "RELAY_V2_HOST_STATE_CAPACITY_EXCEEDED");
+
+    // The accepted record stays durable, so the command is re-claimed once
+    // storage recovers (recovery / next execute path is idempotent).
+    const persisted = Object.values((await realStore.read()).commands);
+    const accepted = persisted.find((record) => record.commandId === frame.commandId);
+    assert.ok(accepted, "command record must remain durable after the failed claim");
+    assert.equal(accepted.state, "accepted");
+  } finally {
+    h.cleanup();
+  }
+});
