@@ -24,6 +24,8 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeFailureKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2AttemptInterruptionCause
@@ -93,7 +95,19 @@ internal const val RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE =
 
 internal sealed interface RelayV2CredentialRolloverResult {
     data class Refreshed(val profile: RelayV2Profile) : RelayV2CredentialRolloverResult
+
+    /**
+     * A definitive failure (refresh token rejected/expired, drift, mismatch): the rollover must
+     * not be retried and the composition is terminally fenced.
+     */
     data object Unavailable : RelayV2CredentialRolloverResult
+
+    /**
+     * A transient failure (network loss, retryable HTTP 5xx, timeout). The durable refresh
+     * attempt is safely replayable, so the rollover is retried on a bounded backoff ladder
+     * instead of being escalated to a terminal re-enrollment requirement.
+     */
+    data class Retryable(val retryAfterMs: Long? = null) : RelayV2CredentialRolloverResult
 }
 
 internal fun interface RelayV2CredentialRolloverPort {
@@ -421,6 +435,10 @@ internal class RelayV2BaseRuntimeComposition(
     private var pendingOutboxAdmission: PendingOutboxAdmission? = null
     private var boundOutboxAdmission: BoundOutboxAdmission? = null
     private var credentialRolloverAdmission: CredentialRolloverAdmission? = null
+    // The credential-rollover backoff timer owns no transport connection attempt (the credential
+    // is stale while it runs), so it is tracked separately from [connectionAttemptJob] and must be
+    // cancelled on fence/close and bypassed when the network returns, exactly like a reconnect.
+    private var credentialRolloverRetryJob: Job? = null
     private val actorShutdownStarted = AtomicBoolean(false)
     private val actorOwnerJob = SupervisorJob()
     private val actorScope = CoroutineScope(
@@ -1472,10 +1490,25 @@ internal class RelayV2BaseRuntimeComposition(
      */
     internal fun onNetworkAvailable(): RelayV2NetworkHintResult {
         var previousBackoff: Job? = null
+        var previousRolloverRetry: Job? = null
+        var rolloverToRetry: CredentialRolloverAdmission? = null
         var result: RelayV2NetworkHintResult = RelayV2NetworkHintResult.FENCED
         val attempt = synchronized(connectionLock) {
             if (closed.get() || terminalFailure.get() != null || !reconnectEnabled) {
                 result = RelayV2NetworkHintResult.FENCED
+                return@synchronized null
+            }
+            // A credential rollover parked on backoff owns no transport attempt. When the network
+            // returns, cancel its timer and retry the refresh immediately from the bottom of the
+            // ladder, mirroring the transport backoff bypass below; the stale credential blocks any
+            // connect claim, so report IN_PROGRESS rather than claiming a transport attempt.
+            val rolloverAdmission = credentialRolloverAdmission
+            if (rolloverAdmission != null && credentialRolloverRetryJob != null) {
+                previousRolloverRetry = credentialRolloverRetryJob
+                credentialRolloverRetryJob = null
+                rolloverAdmission.retryAttempt = 0
+                rolloverToRetry = rolloverAdmission
+                result = RelayV2NetworkHintResult.IN_PROGRESS
                 return@synchronized null
             }
             // Bypass a currently owned backoff timer without waiting for it to expire.
@@ -1499,6 +1532,8 @@ internal class RelayV2BaseRuntimeComposition(
             }
             claimed
         }
+        previousRolloverRetry?.cancel()
+        rolloverToRetry?.let { startCredentialRollover(it) }
         if (previousBackoff != null) clearRetryCountdownProjection(resetAttempt = true)
         attempt?.start()
         return result
@@ -1887,6 +1922,8 @@ internal class RelayV2BaseRuntimeComposition(
                 credentialRollover.rollover(admission.expectedProfile)
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (error: RelayV2CredentialExchangeException) {
+                classifyCredentialRolloverExchangeError(error)
             } catch (_: Throwable) {
                 RelayV2CredentialRolloverResult.Unavailable
             }
@@ -1895,8 +1932,111 @@ internal class RelayV2BaseRuntimeComposition(
                     completeCredentialRollover(admission, result.profile)
                 RelayV2CredentialRolloverResult.Unavailable ->
                     failCredentialRollover(admission)
+                is RelayV2CredentialRolloverResult.Retryable ->
+                    scheduleCredentialRolloverRetry(admission, result.retryAfterMs)
             }
         }
+    }
+
+    /**
+     * Maps the credential exchange's typed failure kinds onto rollover semantics. Transport
+     * failures (network loss, retryable HTTP 5xx, server-asserted retryable) stay retryable with
+     * a bounded backoff; AUTH failures and non-retryable configuration/schema faults are
+     * definitive — the refresh token or the request itself is being refused, so the runtime
+     * fails closed into re-enrollment rather than retrying indefinitely.
+     */
+    private fun classifyCredentialRolloverExchangeError(
+        error: RelayV2CredentialExchangeException,
+    ): RelayV2CredentialRolloverResult = when (error.kind) {
+        RelayV2CredentialExchangeFailureKind.NETWORK ->
+            RelayV2CredentialRolloverResult.Retryable(error.retryAfterMs)
+        RelayV2CredentialExchangeFailureKind.HTTP ->
+            if (error.retryable) {
+                RelayV2CredentialRolloverResult.Retryable(error.retryAfterMs)
+            } else {
+                RelayV2CredentialRolloverResult.Unavailable
+            }
+        RelayV2CredentialExchangeFailureKind.AUTH,
+        RelayV2CredentialExchangeFailureKind.CONFIGURATION,
+        RelayV2CredentialExchangeFailureKind.SCHEMA,
+        -> RelayV2CredentialRolloverResult.Unavailable
+    }
+
+    /**
+     * Re-arms a transiently failed credential rollover on the shared reconnect backoff ladder.
+     * The admission stays owned (no connection attempt ever ran while the credential is stale),
+     * so this never competes with the transport retry fence. The retry is rate-bounded, not
+     * count-bounded: once the ordinal reaches [MAX_ROLLOVER_RETRY_EXPONENT] the delay sits at the
+     * 30s ceiling and keeps re-arming (matching [scheduleReconnect]) rather than escalating — a
+     * pure network/5xx outage must never force re-scan, while a definitive AUTH/refresh-token or
+     * CAS-drift failure is routed to [failCredentialRollover] instead. Each tick re-checks
+     * admission identity, [reconnectEnabled], closed, and terminal state under [connectionLock];
+     * a fence/disconnect in progress drops the retry as STALE without touching terminal state.
+     */
+    private fun scheduleCredentialRolloverRetry(
+        admission: CredentialRolloverAdmission,
+        serverDelayMs: Long?,
+    ) {
+        var timer: Job? = null
+        val result = synchronized(connectionLock) {
+            if (credentialRolloverAdmission !== admission ||
+                !reconnectEnabled || closed.get() || terminalFailure.get() != null
+            ) {
+                return@synchronized RetryScheduleResult.STALE
+            }
+            val policyDelay = reconnectPolicy.delayMillis(admission.retryAttempt)
+            val delayMs = serverDelayMs
+                ?.takeIf { it in 1..MAX_ROLLOVER_SERVER_DELAY_MS }
+                ?.coerceAtLeast(policyDelay)
+                ?: policyDelay
+            // Cap the ordinal so the delay stays at the max tier: bounded rate, indefinite retry.
+            admission.retryAttempt = minOf(admission.retryAttempt + 1, MAX_ROLLOVER_RETRY_EXPONENT)
+            val retryAtMillis = saturatingAdd(clock(), delayMs)
+            val scheduledTimer = pumpScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    retryDelay(delayMs)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    failRuntimeIncomplete("RECONNECT_BACKOFF_FAILED")
+                    return@launch
+                }
+                if (ownsCredentialRolloverRetry(admission)) {
+                    startCredentialRollover(admission)
+                }
+            }
+            scheduledTimer.invokeOnCompletion {
+                synchronized(connectionLock) {
+                    if (credentialRolloverRetryJob === scheduledTimer) {
+                        credentialRolloverRetryJob = null
+                    }
+                }
+            }
+            credentialRolloverRetryJob = scheduledTimer
+            timer = scheduledTimer
+            synchronized(stateLock) {
+                if (!closed.get() && terminalFailure.get() == null) {
+                    _state.value = RelayV2BaseRuntimeState(
+                        phase = RelayV2BaseRuntimePhase.CONNECTING,
+                        retryAtMillis = retryAtMillis,
+                        retryAttempt = admission.retryAttempt,
+                    )
+                }
+            }
+            RetryScheduleResult.SCHEDULED
+        }
+        if (result == RetryScheduleResult.SCHEDULED) {
+            checkNotNull(timer).start()
+        }
+    }
+
+    private fun ownsCredentialRolloverRetry(
+        admission: CredentialRolloverAdmission,
+    ): Boolean = synchronized(connectionLock) {
+        credentialRolloverAdmission === admission &&
+            reconnectEnabled &&
+            !closed.get() &&
+            terminalFailure.get() == null
     }
 
     private fun completeCredentialRollover(
@@ -1955,6 +2095,8 @@ internal class RelayV2BaseRuntimeComposition(
             credentialRolloverAdmission = null
             true
         }
+        // A concurrent fence (close/terminal) already retired this admission; do not re-latch a
+        // terminal failure on the successor generation.
         if (!current) return
         cancelAgentRecoveryGeneration(admission.generation)
         clearRecoveredDispatch()
@@ -3249,6 +3391,13 @@ internal class RelayV2BaseRuntimeComposition(
             connectionAttemptJob.also { connectionAttemptJob = null }
         }
         attempt?.cancel()
+        // A credential-rollover backoff timer owns no transport attempt, so it is not the Job
+        // returned above; cancel it too so a drain/close in progress cannot be re-entered by a
+        // rollover retry that fired while the fence was being taken.
+        val rolloverRetry = synchronized(connectionLock) {
+            credentialRolloverRetryJob.also { credentialRolloverRetryJob = null }
+        }
+        rolloverRetry?.cancel()
         return attempt
     }
 
@@ -3405,6 +3554,10 @@ internal class RelayV2BaseRuntimeComposition(
         const val COMMAND_RETRY_BASE_DELAY_MS = 1_000L
         const val COMMAND_RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5
+        /** Highest backoff tier for transient credential-rollover retries; retry stays at this 30s rate indefinitely (bounded rate, not bounded count) until AUTH/CAS-drift terminates it. */
+        const val MAX_ROLLOVER_RETRY_EXPONENT = 5
+        /** Server-provided retryAfterMs is honored only as a sane lower bound, never beyond 5m. */
+        const val MAX_ROLLOVER_SERVER_DELAY_MS = 300_000L
         const val COMMAND_DELIVERY_WATCHDOG_MS = 15_000L
         val CREATE_OPERATIONS = setOf(
             RelayV2OutboxOperation.CREATE_WORKTREE,
@@ -3449,6 +3602,7 @@ internal class RelayV2BaseRuntimeComposition(
         val generation: RelayV2EffectGeneration,
         val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         var transportLost: Boolean = false,
+        var retryAttempt: Int = 0,
     )
 
     private data class RetryStateFence(

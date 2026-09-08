@@ -12,15 +12,19 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.tmuxworktree.mobile.R
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
+import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -36,6 +40,18 @@ class RelayConnectionService : Service() {
     private var healthCollectionJob: Job? = null
     private var relayWakeLock: PowerManager.WakeLock? = null
 
+    /** The most recent start generation; stopSelf(lastStartId) never outranks a newer start. */
+    @Volatile
+    private var lastStartId: Int = 0
+
+    /**
+     * Flips to true once the process-restart composition bootstrap has settled. The health
+     * collector holds the foreground notification until then so a START_STICKY recreation does
+     * not stop the service in the brief window before the persisted auto-connect profile has
+     * been rebuilt (or proven absent).
+     */
+    private val bootstrapSettled = MutableStateFlow(false)
+
     @OptIn(ExperimentalCoroutinesApi::class)
     override fun onCreate() {
         super.onCreate()
@@ -43,12 +59,20 @@ class RelayConnectionService : Service() {
         // Promote to foreground immediately; the notification text is updated from health.
         startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.relay_notification_connecting)))
         acquireRelayWakeLock()
+        serviceScope.launch { ensureProcessCompositionBootstrap() }
         healthCollectionJob = serviceScope.launch {
             // A present-but-not-yet-STOPPED composition is treated as active so the foreground
             // keep-alive survives the startup/recovery window between install and CONNECTING.
             val v2 = RelayV2ConnectionRegistry.composition.flatMapLatest { composition ->
                 if (composition == null) {
-                    flowOf<RelayV2BaseRuntimePhase?>(null)
+                    flow {
+                        // No composition in this process yet: hold the foreground while the
+                        // process-restart bootstrap rebuilds a persisted auto-connect profile.
+                        // Only once it settles with nothing to guard do we emit null -> stopSelf.
+                        emit(RelayV2BaseRuntimePhase.CONNECTING)
+                        bootstrapSettled.first { settled -> settled }
+                        emit(null)
+                    }
                 } else {
                     composition.state.map { state ->
                         if (composition.isTerminalOrClosed()) null else state.phase
@@ -67,8 +91,18 @@ class RelayConnectionService : Service() {
                 }
             }.collectLatest { textRes ->
                 if (textRes == null) {
+                    // Fence aligned with onStartCommand: a successor composition may have been
+                    // installed between the terminal state emission and this collection, and a
+                    // newer start generation must not be stopped by a stale decision.
+                    if (RelayConnectionServiceDecisions.keepForeground(
+                            RelayV2ConnectionRegistry.composition.value,
+                            bootstrapSettled.value,
+                        )
+                    ) {
+                        return@collectLatest
+                    }
                     stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    stopSelf(lastStartId)
                 } else {
                     updateNotification(getString(textRes))
                 }
@@ -77,15 +111,45 @@ class RelayConnectionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         // If every connection is already stopped, stop the service immediately. A present-but-not
-        // terminal/closed v2 composition counts as active during its startup/recovery window.
-        val v2 = RelayV2ConnectionRegistry.composition.value
-        val v2Active = v2 != null && !v2.isTerminalOrClosed()
-        if (!v2Active) {
+        // terminal/closed v2 composition counts as active during its startup/recovery window, and
+        // a still-running process-restart bootstrap holds the foreground until it settles.
+        if (!RelayConnectionServiceDecisions.keepForeground(
+                RelayV2ConnectionRegistry.composition.value,
+                bootstrapSettled.value,
+            )
+        ) {
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            stopSelf(startId)
         }
         return START_STICKY
+    }
+
+    /**
+     * Rebuilds the Relay v2 composition after a process kill + START_STICKY restart. The
+     * composition factory lives in the app/DI layer (it owns Room/DataStore construction); the
+     * service reaches it through [RelayV2ServiceProcessBootstrap], resolved reflectively so the
+     * core runtime package never depends on the app package. The bootstrap is network-free
+     * (startup admission reads only persisted state) and installs onto the process-level
+     * [RelayV2ConnectionRegistry.scope], so a later ViewModel startup reuses this exact
+     * composition via `isReusableFor` instead of creating a second owner.
+     */
+    private suspend fun ensureProcessCompositionBootstrap() {
+        val bootstrap = RelayV2ServiceProcessBootstrapHook.resolve()
+        try {
+            val current = RelayV2ConnectionRegistry.composition.value
+            if (current == null || current.isTerminalOrClosed()) {
+                bootstrap?.bootstrap(applicationContext)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // Fail closed: a bootstrap that throws leaves no composition; the collector stops the
+            // service once settled rather than holding a foreground notification forever.
+        } finally {
+            bootstrapSettled.value = true
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -158,4 +222,53 @@ class RelayConnectionService : Service() {
             }
         }
     }
+}
+
+/**
+ * Foreground keep-alive decision shared by the health collector and onStartCommand so both
+ * observe the same fence: a live (non-terminal) composition always keeps the service up; with
+ * no composition the service is kept only while a process-restart bootstrap is still in flight.
+ */
+internal object RelayConnectionServiceDecisions {
+    fun keepForeground(
+        composition: RelayV2BaseRuntimeComposition?,
+        bootstrapSettled: Boolean,
+    ): Boolean {
+        if (composition != null && !composition.isTerminalOrClosed()) return true
+        return composition == null && !bootstrapSettled
+    }
+}
+
+/**
+ * Process-restart composition bootstrap seam. The production implementation lives in the app/DI
+ * layer (it reads the persisted auto-connect profile and builds the composition on the registry
+ * scope); it must never touch UI state or UI fences. Returns true when a live composition is
+ * installed after the call.
+ */
+internal interface RelayV2ServiceProcessBootstrap {
+    suspend fun bootstrap(context: Context): Boolean
+}
+
+/**
+ * Resolves the production [RelayV2ServiceProcessBootstrap] without a compile-time dependency from
+ * the core runtime package onto the app package. Tests can install an override directly. The
+ * reflective lookup is fail-soft: if the app-layer entry is absent the service behaves exactly
+ * as before (no composition, stop when settled).
+ */
+internal object RelayV2ServiceProcessBootstrapHook {
+    @Volatile
+    private var override: RelayV2ServiceProcessBootstrap? = null
+
+    private val reflective: RelayV2ServiceProcessBootstrap? by lazy {
+        runCatching {
+            val cls = Class.forName("com.tmuxworktree.mobile.app.RelayV2ServiceRuntimeBootstrap")
+            cls.getField("INSTANCE").get(null) as? RelayV2ServiceProcessBootstrap
+        }.getOrNull()
+    }
+
+    fun installForTest(bootstrap: RelayV2ServiceProcessBootstrap?) {
+        override = bootstrap
+    }
+
+    fun resolve(): RelayV2ServiceProcessBootstrap? = override ?: reflective
 }

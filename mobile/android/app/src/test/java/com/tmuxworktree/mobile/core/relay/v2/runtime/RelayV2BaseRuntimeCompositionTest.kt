@@ -46,6 +46,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
+import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionServiceDecisions
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvidence
@@ -71,6 +72,8 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2ResultSessionKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasExpectation
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasResult
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeFailureKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -2189,6 +2192,252 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertEquals(1, failed.factory.requests.size)
             } finally {
                 failed.close()
+            }
+        }
+
+    @Test
+    fun `transient rollover network failure backs off and retries then recovers online`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            lateinit var harness: Harness
+            val rollover = RelayV2CredentialRolloverPort { expected ->
+                when (rolloverCalls.incrementAndGet()) {
+                    1 -> throw RelayV2CredentialExchangeException(
+                        RelayV2CredentialExchangeFailureKind.NETWORK,
+                    )
+                    else -> {
+                        // Durable credential CAS commits with the refresh, exactly as the
+                        // production repository does before the successor transport opens.
+                        harness.advanceCredentialVersion(2)
+                        RelayV2CredentialRolloverResult.Refreshed(
+                            expected.copy(credentialVersion = 2),
+                        )
+                    }
+                }
+            }
+            harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // Cold reconnect claims an expired-credential rollover; the first refresh hits a
+                // network failure. It must stay non-terminal and arm one bounded retry instead.
+                assertTrue(
+                    "rollover was not claimed by cold reconnect",
+                    retry.awaitCount(1),
+                )
+                delay(50)
+                assertNull(
+                    "transient rollover failure must not latch terminalFailure",
+                    harness.composition.state.value.failure,
+                )
+                assertEquals(1, rolloverCalls.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    harness.composition.state.value.phase,
+                )
+
+                retry.release(0)
+                // The retried rollover succeeds; the successor transport must come up ONLINE.
+                val successor = harness.awaitTransport()
+                successor.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                successor.sendFixture("relay-welcome")
+                val hello = successor.awaitSentFrame()
+                val welcome = fixture("host-welcome-caught-up")
+                welcome["requestId"] = hello.stringValue("requestId")
+                successor.sendFrame(welcome)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                assertEquals(2, rolloverCalls.get())
+                assertNull(harness.composition.state.value.failure)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `auth rollover failure stays terminal and does not retry`() = runBlocking {
+        val rolloverCalls = AtomicInteger()
+        val retry = ControlledRetryDelay()
+        val rollover = RelayV2CredentialRolloverPort {
+            rolloverCalls.incrementAndGet()
+            throw RelayV2CredentialExchangeException(
+                RelayV2CredentialExchangeFailureKind.AUTH,
+            )
+        }
+        val harness = Harness(
+            autoConnect = true,
+            credentialRollover = rollover,
+            retryDelayBlock = retry::awaitDelay,
+        )
+        try {
+            harness.connectOnline()
+            harness.transport().sendFixture("auth-expiring")
+            val state = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+            delay(50)
+            assertEquals("AUTH failure must not retry rollover", 1, rolloverCalls.get())
+            assertFalse("AUTH failure must not arm backoff", retry.awaitCount(1, timeoutMs = 200))
+            assertEquals(
+                RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                    RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE,
+                ),
+                state.failure,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `transient rollover failure keeps retrying at the max backoff tier instead of terminal`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            val rollover = RelayV2CredentialRolloverPort {
+                rolloverCalls.incrementAndGet()
+                RelayV2CredentialRolloverResult.Retryable()
+            }
+            val harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // Arm far more backoffs than the old bounded-count ladder (initial + 8 retries).
+                // A pure transient outage must keep re-arming at the 30s ceiling and never latch
+                // the terminal rollover failure — the refresh token is still valid.
+                repeat(8) { index ->
+                    assertTrue("rollover backoff ${index + 1} never armed", retry.awaitCount(index + 1))
+                    retry.release(index)
+                    withTimeout(TIMEOUT_MS) {
+                        while (rolloverCalls.get() < index + 2) delay(1)
+                    }
+                }
+                // The delay plateaus at the max tier once the ordinal caps (no escalation). 8
+                // released retries arm a 9th backoff before the assertion, hence nine entries.
+                assertEquals(
+                    listOf(
+                        1_000L, 2_000L, 4_000L, 8_000L, 16_000L,
+                        30_000L, 30_000L, 30_000L, 30_000L,
+                    ),
+                    retry.delays,
+                )
+                assertNull(
+                    "transient rollover must never latch terminalFailure past the old cap",
+                    harness.composition.state.value.failure,
+                )
+                assertEquals("initial attempt + 8 retries", 9, rolloverCalls.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    harness.composition.state.value.phase,
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `network available bypasses rollover backoff and retries the refresh immediately`() =
+        runBlocking {
+            val rolloverCalls = AtomicInteger()
+            val retry = ControlledRetryDelay()
+            val rollover = RelayV2CredentialRolloverPort {
+                rolloverCalls.incrementAndGet()
+                RelayV2CredentialRolloverResult.Retryable()
+            }
+            val harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = rollover,
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                // First refresh fails transiently and arms a backoff timer.
+                assertTrue("rollover backoff never armed", retry.awaitCount(1))
+                assertEquals(1, rolloverCalls.get())
+
+                // Network returns while the backoff is still parked: the refresh must retry
+                // immediately without releasing the old timer, and the ordinal resets so the
+                // retry starts from the bottom of the ladder.
+                assertEquals(
+                    RelayV2NetworkHintResult.IN_PROGRESS,
+                    harness.composition.onNetworkAvailable(),
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (rolloverCalls.get() < 2) delay(1)
+                }
+                // The immediate retry failed again and armed a fresh, short bottom-tier backoff.
+                assertTrue("fresh rollover backoff never re-armed", retry.awaitCount(2))
+                assertEquals(1_000L, retry.delays.last())
+                assertNull(
+                    "rollover retried via network hint must stay non-terminal",
+                    harness.composition.state.value.failure,
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `service foreground fence holds during bootstrap and on successor composition`() =
+        runBlocking {
+            // START_STICKY restart: no composition yet, bootstrap in flight -> hold foreground.
+            assertTrue(
+                "null composition before bootstrap settles must keep the service alive",
+                RelayConnectionServiceDecisions.keepForeground(
+                    composition = null,
+                    bootstrapSettled = false,
+                ),
+            )
+            // Bootstrap settled with no auto-connect profile -> stop is allowed (fail closed).
+            assertFalse(
+                "null composition after bootstrap settles must allow stopSelf",
+                RelayConnectionServiceDecisions.keepForeground(
+                    composition = null,
+                    bootstrapSettled = true,
+                ),
+            )
+
+            val first = Harness(autoConnect = true)
+            try {
+                // A live (connecting/online) composition always keeps the foreground.
+                assertTrue(
+                    RelayConnectionServiceDecisions.keepForeground(
+                        first.composition,
+                        bootstrapSettled = true,
+                    ),
+                )
+                first.close()
+                withTimeout(TIMEOUT_MS) {
+                    while (!first.composition.isTerminalOrClosed()) delay(1)
+                }
+                // C1 terminal: the old collector decision must now allow stop for C1 alone...
+                assertFalse(
+                    "terminal C1 alone must allow stopSelf",
+                    RelayConnectionServiceDecisions.keepForeground(
+                        first.composition,
+                        bootstrapSettled = true,
+                    ),
+                )
+                // ...but once a successor C2 is installed (the C022 reactivation race), a stale
+                // null/terminal decision must not tear down the foreground keep-alive.
+                val successor = Harness(autoConnect = true)
+                try {
+                    assertTrue(
+                        "successor composition installed during reactivation must hold FGS",
+                        RelayConnectionServiceDecisions.keepForeground(
+                            successor.composition,
+                            bootstrapSettled = true,
+                        ),
+                    )
+                } finally {
+                    successor.close()
+                }
+            } finally {
+                first.close()
             }
         }
 
