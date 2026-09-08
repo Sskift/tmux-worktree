@@ -303,11 +303,13 @@ export class FeishuBridge {
 
   initializeAfterRestart(): void {
     let changed = false;
+    const staleIdleBindings: FeishuBinding[] = [];
     for (const binding of this.state.bindings) {
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
         changed = true;
+        staleIdleBindings.push(binding);
       }
       if (binding.activityWatch?.status === "sending") {
         binding.activityWatch.status = "uncertain";
@@ -337,6 +339,19 @@ export class FeishuBridge {
         reply.completedAt = nowIso(this.now);
         reply.error = "legacy prepared reply omitted the durable payload required for recovery";
         changed = true;
+      }
+    }
+    // Bindings with a recovery-required turn/watch get their own recovery card;
+    // idle bindings (no active work) would otherwise go silent, so tell the
+    // group the control connection must be re-confirmed in Dashboard.
+    for (const binding of staleIdleBindings) {
+      const hasRecoveryTurn = this.state.turns.some((turn) =>
+        turn.bindingId === binding.id && turn.status === "recovery-required");
+      const watch = binding.activityWatch;
+      const hasRecoveryWatch = watch
+        && (watch.status === "uncertain" || watch.status === "recovery-required");
+      if (!hasRecoveryTurn && !hasRecoveryWatch) {
+        this.queueBindingLifecycle(binding, "control-needs-confirm");
       }
     }
     if (changed) this.persist();
@@ -1063,6 +1078,11 @@ export class FeishuBridge {
             watch.completedAt = nowIso(this.now);
             watch.error = "terminal ownership lease renewal failed";
             this.activityPollAfter.delete(watch.id);
+          }
+          if (!turn && !watch) {
+            // An idle binding fences silently and would otherwise swallow later
+            // group messages without a hint; tell the group to repair in Dashboard.
+            this.queueBindingLifecycle(binding, "control-needs-confirm");
           }
           changed = true;
         }

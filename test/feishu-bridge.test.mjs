@@ -2533,7 +2533,14 @@ test("a recovery-required stale binding still detects a certainly deleted sessio
     await h.bridge.reconcileBindingTargets();
     await flushBestEffortEffects();
     assert.equal(h.bridge.snapshot().bindings.length, 0);
-    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+    const deletionCard = h.lark.groupCards
+      .map((sent) => sent.card)
+      .find((card) => /已被删除/.test(cardText(card)));
+    assert.ok(deletionCard, "the deleted-session lifecycle card must still reach the group");
+    const confirmCard = h.lark.groupCards
+      .map((sent) => sent.card)
+      .find((card) => /待重新确认|重新确认/.test(cardText(card)));
+    assert.ok(confirmCard, "the silent stale transition first posted a repair notice");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -3284,6 +3291,62 @@ test("explicit takeover cancellation drains before normal handoff and return rev
     assert.equal(h.control.target.fence, "3");
     assert.equal(h.store.read().bindings[0].status, "active");
     assert.equal(h.store.read().bindings[0].activityWatch.status, "armed");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a bridge restart tells an idle binding's group to re-confirm control", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-restart",
+      botOpenId: "ou-bot",
+    });
+    restarted.initializeAfterRestart();
+    await flushBestEffortEffects();
+
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+    const notice = h.lark.groupCards.find((sent) => sent.chatId === "oc-one");
+    assert.ok(notice, "an idle binding must not go silent after a restart");
+    assert.match(cardText(notice.card), /重新确认/);
+    await restarted.close();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an idle binding fenced by a deterministic renewal failure posts one repair notice", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.renewErrors.push(new CanonicalTerminalControlError(
+      "RECOVERY_REQUIRED",
+      "lease expired while the machine was asleep",
+    ));
+
+    await h.bridge.renewLeases();
+    await flushBestEffortEffects();
+
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    const notices = h.lark.groupCards.filter((sent) =>
+      /重新确认/.test(cardText(sent.card)));
+    assert.equal(notices.length, 1, "the repair notice is sent exactly once");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
