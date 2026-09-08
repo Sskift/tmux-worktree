@@ -3710,6 +3710,89 @@ test("corrupt Feishu bridge storage is preserved and refused", () => {
   }
 });
 
+test("in-memory turns/replies/eventIds are trimmed to the persisted window and finalized turns release output", async () => {
+  const root = mkdtempSync(join("/tmp", "tw-fb-mem-"));
+  const paths = feishuBridgePaths(root);
+  const control = new FakeControlClient();
+  const lark = new FakeLark();
+  const realStore = new FeishuBridgeStore(paths);
+  const store = {
+    paths,
+    lastState: undefined,
+    read() { return realStore.read(); },
+    write(state) {
+      this.lastState = state;
+      realStore.write(state);
+    },
+  };
+  const bridge = new FeishuBridge({
+    control,
+    lark,
+    store,
+    instanceId: "daemon-mem",
+    botOpenId: "ou-bot",
+  });
+  const totalTurns = 300;
+  try {
+    await bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    for (let index = 0; index < totalTurns; index += 1) {
+      await bridge.handleEvent(event({ event_id: `evt-${index}`, message_id: `om-${index}` }));
+      const turn = store.lastState.turns.at(-1);
+      const markers = feishuTurnMarkers(turn.markerNonce);
+      control.output += `${markers.open}answer ${index}${markers.close}`;
+      await bridge.pollTurns();
+    }
+
+    // The in-memory arrays now track the on-disk bounded window instead of
+    // growing for the daemon's whole lifetime.
+    assert.ok(
+      store.lastState.turns.length <= 256,
+      `in-memory turns capped, got ${store.lastState.turns.length}`,
+    );
+    assert.ok(
+      store.lastState.replies.length <= 256,
+      `in-memory replies capped, got ${store.lastState.replies.length}`,
+    );
+    assert.ok(store.lastState.eventIds.length <= 4096);
+    assert.ok(
+      store.lastState.turns.every((turn) =>
+        turn.status === "completed" ? turn.output === "" : true),
+      "finalized turns release their captured output buffer",
+    );
+    // Recent turns are still present and retrievable.
+    const recent = store.lastState.turns.find((turn) => turn.messageId === `om-${totalTurns - 1}`);
+    assert.ok(recent, "the newest completed turn stays in the trimmed window");
+    const old = store.lastState.turns.find((turn) => turn.messageId === "om-0");
+    assert.equal(old, undefined, "turns older than the window are evicted from memory");
+
+    // A live (awaiting) turn must never be evicted, even when more than the
+    // window's worth of finalized turns accumulates in memory afterward.
+    await bridge.handleEvent(event({ event_id: "evt-live", message_id: "om-live" }));
+    const liveTurn = store.lastState.turns.at(-1);
+    assert.equal(liveTurn.status, "awaiting");
+    for (let index = 0; index < 300; index += 1) {
+      store.lastState.turns.push({
+        ...liveTurn,
+        id: `turn-other-${index}`,
+        messageId: `om-other-${index}`,
+        status: "completed",
+        output: "y".repeat(512),
+      });
+    }
+    // A steer event persists, which runs the in-memory trim.
+    await bridge.handleEvent(event({ event_id: "evt-steer", message_id: "om-steer" }));
+    const liveRetained = store.lastState.turns.find((turn) => turn.id === liveTurn.id);
+    assert.ok(liveRetained, "an awaiting turn is never trimmed regardless of history size");
+    assert.equal(liveRetained.status, "awaiting");
+    assert.ok(store.lastState.turns.length <= 257, "only the live turn may exceed the cap");
+  } finally {
+    await bridge.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("store write skips collections whose serialized content did not change", () => {
   const root = mkdtempSync(join("/tmp", "tw-fb-dirty-"));
   try {

@@ -14,6 +14,9 @@ import {
 } from "./canonicalTerminalControlClient.js";
 import {
   FeishuBridgeStore,
+  FEISHU_EVENT_DEDUP_LIMIT,
+  FEISHU_TURN_HISTORY_LIMIT,
+  FEISHU_REPLY_HISTORY_LIMIT,
   type FeishuActivityWatch,
   type FeishuBinding,
   type FeishuHandoffRecord,
@@ -180,6 +183,24 @@ function normalizedSenderType(value: string | undefined): string | undefined {
 
 function hasCode(error: unknown, code: string): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === code;
+}
+
+// Rebuild an array to at most `limit` non-live entries plus every "live"
+// entry (by key, kept regardless of age). Original relative order is
+// preserved so "most recent" tail and reverse-find semantics are unchanged.
+function tailKeepingKeys<T>(
+  items: T[],
+  limit: number,
+  liveKeys: Set<string>,
+  keyOf: (item: T) => string,
+): T[] {
+  const nonLive: T[] = [];
+  for (const item of items) {
+    if (!liveKeys.has(keyOf(item))) nonLive.push(item);
+  }
+  const keptNonLive = nonLive.slice(-limit);
+  const keptKeys = new Set(keptNonLive.map(keyOf));
+  return items.filter((item) => liveKeys.has(keyOf(item)) || keptKeys.has(keyOf(item)));
 }
 
 class RenderedSnapshotCorrelationError extends Error {
@@ -2840,7 +2861,49 @@ export class FeishuBridge {
   private persist(): void {
     this.ensureRecoveryNoticeAttempts();
     this.store.write(this.state);
+    this.trimInMemoryHistory();
     this.queuePreparedOutboundAttempts();
+  }
+
+  // The store slices each collection to a bounded window when writing to disk,
+  // but the in-memory state arrays otherwise grow for the daemon's lifetime
+  // (a completed turn still holds up to 128KB of captured output). Rebuild each
+  // array from the same live predicate used by activeTurn()/pollTurns — a live
+  // turn (prepared/awaiting/replying) or prepared reply is never dropped no
+  // matter how old it is — plus the most recent non-live entries, then release
+  // the output buffers of retained non-live turns. eventIds carry no live
+  // semantics and dedup survives via the on-disk window and Lark idempotency.
+  private trimInMemoryHistory(): void {
+    const liveTurnIds = new Set(this.state.turns
+      .filter((turn) =>
+        turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying")
+      .map((turn) => turn.id));
+    this.state.turns = tailKeepingKeys(
+      this.state.turns,
+      FEISHU_TURN_HISTORY_LIMIT,
+      liveTurnIds,
+      (turn) => turn.id,
+    );
+    for (const turn of this.state.turns) {
+      if (liveTurnIds.has(turn.id)) continue;
+      // A finalized turn's captured output is never parsed again.
+      if (turn.output) turn.output = "";
+      delete turn.outputRemainderBase64;
+    }
+
+    const preparedReplyIds = new Set(this.state.replies
+      .filter((reply) => reply.status === "prepared")
+      .map((reply) => reply.id));
+    this.state.replies = tailKeepingKeys(
+      this.state.replies,
+      FEISHU_REPLY_HISTORY_LIMIT,
+      preparedReplyIds,
+      (reply) => reply.id,
+    );
+
+    if (this.state.eventIds.length > FEISHU_EVENT_DEDUP_LIMIT) {
+      this.state.eventIds = this.state.eventIds.slice(-FEISHU_EVENT_DEDUP_LIMIT);
+    }
   }
 
   private serial<T>(operation: () => Promise<T>): Promise<T> {
