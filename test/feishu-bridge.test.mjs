@@ -211,6 +211,7 @@ class FakeControlClient {
     this.agentStatusErrors = [];
     this.failRelease = false;
     this.failRenew = false;
+    this.renewErrors = [];
     this.tailFence = undefined;
     this.tailOwnerKind = undefined;
     this.tailChunkBytes = undefined;
@@ -419,6 +420,8 @@ class FakeControlClient {
   async renewLease(lease, ttlMs) {
     this.record("lease.renew", { lease: structuredClone(lease), ...(ttlMs === undefined ? {} : { ttlMs }) });
     this.assertLease(lease, true);
+    const queuedError = this.renewErrors.shift();
+    if (queuedError) throw queuedError;
     if (this.failRenew) {
       const error = new Error("lease renewal entered recovery");
       error.code = "RECOVERY_REQUIRED";
@@ -2163,6 +2166,106 @@ test("lease renewal failure settles an inherited task watch as recovery-required
     assert.equal(binding.status, "stale");
     assert.equal(binding.activityWatch.status, "recovery-required");
     assert.match(binding.activityWatch.error, /lease renewal failed/);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a retryable lease renewal failure keeps the binding active and a later tick recovers", async () => {
+  for (const failure of [
+    new CanonicalTerminalControlError(
+      "RESOURCE_EXHAUSTED",
+      "renewal contended the terminal-control store lock",
+      true,
+    ),
+    Object.assign(new Error("terminal-control request timed out"), { code: "ETIMEDOUT" }),
+  ]) {
+    const h = harness();
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      await h.bridge.handleEvent(event());
+      h.control.renewErrors.push(failure);
+
+      await h.bridge.renewLeases();
+
+      let state = h.store.read();
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.equal(state.turns.at(-1).status, "awaiting", failure.code);
+      assert.equal(
+        h.control.requests.filter(({ type }) => type === "lease.renew").length,
+        1,
+        failure.code,
+      );
+
+      await h.bridge.renewLeases();
+      state = h.store.read();
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.equal(state.turns.at(-1).status, "awaiting", failure.code);
+      assert.equal(
+        h.control.requests.filter(({ type }) => type === "lease.renew").length,
+        2,
+        failure.code,
+      );
+    } finally {
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a deterministic renewal failure still fences the active binding and turn", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.renewErrors.push(new CanonicalTerminalControlError(
+      "PERMISSION_DENIED",
+      "lease was fenced by a controlled local recovery",
+    ));
+
+    await h.bridge.renewLeases();
+
+    const state = h.store.read();
+    assert.equal(state.bindings[0].status, "stale");
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("renewal transport failures spanning the lease TTL fence the binding", async () => {
+  let now = Date.parse("2026-09-08T00:00:00.000Z");
+  const h = harness({ now: () => now });
+  const timeout = Object.assign(new Error("terminal-control request timed out"), { code: "ETIMEDOUT" });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_000;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_000;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+
+    now += 20_001;
+    h.control.renewErrors.push(timeout);
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });

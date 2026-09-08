@@ -34,6 +34,11 @@ import {
 } from "./feishuReplyCard.js";
 
 const TURN_IDLE_TIMEOUT_MS = 10 * 60_000;
+// Lease renewals run on a 20s timer against a 60s server-side TTL. A run of
+// transport-class renewal failures spanning that TTL means the server lease
+// has certainly expired (or authority reconciled it), so the binding fences
+// itself instead of retrying forever.
+const LEASE_RENEW_TRANSIENT_GRACE_MS = 60_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
 const MAX_TURN_OUTPUT_BYTES = 128 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
@@ -196,6 +201,20 @@ const FATAL_RENDERED_SNAPSHOT_CODES = new Set([
   "OPERATION_IN_DOUBT",
 ]);
 
+// Socket/transport codes the canonical client may surface as a raw Node error
+// (rather than a normalized CanonicalTerminalControlError) when the daemon is
+// briefly unreachable. They say nothing about lease validity, so read-only
+// observations and renewals retry instead of fencing the binding.
+const RETRYABLE_TRANSPORT_ERROR_CODES = new Set([
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EAI_AGAIN",
+]);
+
 function retryableRenderedSnapshotObservation(error: unknown): boolean {
   if (error instanceof RenderedSnapshotCorrelationError) return false;
   if (!(error instanceof Error)) return false;
@@ -220,6 +239,7 @@ export class FeishuBridge {
   private botOpenId?: string;
   private botMentionIds?: Set<string>;
   private readonly leases = new Map<string, CanonicalTerminalLease>();
+  private readonly renewTransientFailures = new Map<string, number>();
   private readonly pendingProcessingReactions = new Map<string, PendingProcessingReaction>();
   private readonly activityPollAfter = new Map<string, number>();
   private readonly recoveryNoticeTurnIds = new Set<string>();
@@ -987,10 +1007,25 @@ export class FeishuBridge {
           if (renewed.controlEpoch !== lease.controlEpoch
             || renewed.leaseId !== lease.leaseId
             || renewed.fence !== lease.fence) {
-            throw new Error("canonical lease renewal changed terminal ownership identity");
+            const identity = new Error("canonical lease renewal changed terminal ownership identity");
+            Object.assign(identity, { code: "RECOVERY_REQUIRED" });
+            throw identity;
           }
           this.leases.set(bindingId, renewed);
+          this.renewTransientFailures.delete(bindingId);
         } catch (error) {
+          if (this.isRetryableLeaseRenewalFailure(error)) {
+            // Keep the in-memory lease so the next 20s tick retries; once the
+            // transient failure window spans the server lease TTL, fence the
+            // binding instead of retrying indefinitely.
+            const firstFailedAt = this.renewTransientFailures.get(bindingId) ?? this.now();
+            this.renewTransientFailures.set(bindingId, firstFailedAt);
+            process.stderr.write(
+              `[feishu-bridge] lease renewal transport failure for ${bindingId} (retrying): ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+            if (this.now() - firstFailedAt < LEASE_RENEW_TRANSIENT_GRACE_MS) continue;
+          }
+          this.renewTransientFailures.delete(bindingId);
           this.leases.delete(bindingId);
           this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
           const turn = this.activeTurn(bindingId);
@@ -2102,6 +2137,21 @@ export class FeishuBridge {
     if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable !== true;
     if (typeof candidate.code === "string") return true;
     return false;
+  }
+
+  // Renewal hits only control RPCs. A lock-timeout (RESOURCE_EXHAUSTED), an
+  // INTERNAL stall, a retryable CONTROLLER_UNAVAILABLE, or an un-normalized
+  // socket transport error leaves the server lease untouched (its TTL is 60s);
+  // the next 20s tick retries. Deterministic fence codes or a lease identity
+  // change mean the lease is gone and stay fail-closed immediately.
+  private isRetryableLeaseRenewalFailure(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const candidate = error as { code?: unknown; retryable?: unknown };
+    if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return true;
+    if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable === true;
+    if (RETRYABLE_TRANSPORT_ERROR_CODES.has(candidate.code)) return true;
+    if (typeof candidate.code === "string") return false;
+    return !(error instanceof CanonicalTerminalControlError);
   }
 
   private rememberEvent(eventId: string, persist = true): void {
