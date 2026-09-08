@@ -51,6 +51,24 @@ class PreferencesStoreAgentNotificationPermissionTest {
             }
         }
 
+    @Test
+    fun `automatic offer read gate is false before delivery and true once spent`() =
+        runBlocking {
+            val directory = Files.createTempDirectory("agent-notification-offer-read")
+            val file = directory.resolve("preferences.preferences_pb").toFile()
+            try {
+                withStore(file) { store ->
+                    // Before the offer is answered, the automatic gate must not see it as spent,
+                    // so a buffered prompt lost to process death is still re-offered later.
+                    assertFalse(store.automaticAgentNotificationPermissionOffered())
+                    assertTrue(store.claimAutomaticAgentNotificationPermissionOffer())
+                    assertTrue(store.automaticAgentNotificationPermissionOffered())
+                }
+            } finally {
+                directory.toFile().deleteRecursively()
+            }
+        }
+
     private suspend fun <T> withStore(
         file: java.io.File,
         block: suspend (PreferencesStore) -> T,

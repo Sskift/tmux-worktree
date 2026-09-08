@@ -884,6 +884,11 @@ class V2ViewModel(
     private var notificationPermissionRequestPending = false
     private var relayV2NotificationPreferencesLoaded = false
     private var notificationPermissionRequestClaim: Any? = null
+    // Set when an automatic offer was answered with a denial so it does not nag on every later
+    // resume; an explicit settings toggle may still retry regardless.
+    private var notificationPermissionAutomaticOfferDenied = false
+    // Whether the in-flight request (if any) was the one-time automatic offer vs an explicit tap.
+    private var notificationPermissionRequestAutomatic = false
     private val agentNotificationConfigMutex = Mutex()
     private val notificationPermissionRequestChannel = Channel<Unit>(capacity = 1)
     internal val notificationPermissionRequests: Flow<Unit> =
@@ -3638,13 +3643,30 @@ class V2ViewModel(
     /** Activity reports the actual platform result; issuing a request never calls this method. */
     internal fun updateNotificationPermission(granted: Boolean) {
         val composition = synchronized(relayV2UiFenceLock) {
+            // The offer reached the user (the STARTED collector consumed it, or it was answered),
+            // so this is the point at which the one-time automatic offer may be durably spent.
+            // Consuming it before delivery lost the offer permanently when the buffered channel
+            // element died with the process and the durable marker had already been written.
+            val wasAutomaticOffer = notificationPermissionRequestPending &&
+                notificationPermissionRequestAutomatic
             notificationPermissionGranted = granted
             notificationPermissionRequestPending = false
+            notificationPermissionRequestAutomatic = false
             notificationPermissionRequestClaim = null
-            relayV2Composition
+            if (wasAutomaticOffer && !granted) {
+                notificationPermissionAutomaticOfferDenied = true
+            }
+            Triple(relayV2Composition, wasAutomaticOffer, granted)
         }
-        composition?.let { current ->
-            viewModelScope.launch { syncAgentNotificationConfig(current) }
+        val (current, wasAutomaticOffer, grantedNow) = composition
+        if (wasAutomaticOffer && !grantedNow) {
+            // Best effort: spend the one-time durable offer now that the prompt was actually shown
+            // and declined. A storage failure leaves it unspent; the in-memory denied flag still
+            // stops nagging for this process, and the next launch may offer once more.
+            viewModelScope.launch { runCatching { preferencesStore.claimAutomaticAgentNotificationPermissionOffer() } }
+        }
+        current?.let { compositionCurrent ->
+            viewModelScope.launch { syncAgentNotificationConfig(compositionCurrent) }
         }
     }
 
@@ -3661,6 +3683,33 @@ class V2ViewModel(
         expectedComposition: RelayV2BaseRuntimeComposition,
         automatic: Boolean,
     ) {
+        // For the automatic one-time offer, defer consuming the durable marker until the prompt is
+        // actually answered (updateNotificationPermission). An explicit toggle is always allowed
+        // to retry; it must merely be able to read the marker. Gate the automatic path on the
+        // durable marker up front (read-only) so a spent offer does not even enqueue a prompt.
+        if (automatic) {
+            val alreadyOffered = try {
+                preferencesStore.automaticAgentNotificationPermissionOffered()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                // Fail closed: when the durable state cannot be read, do not nag automatically.
+                return
+            }
+            if (alreadyOffered) return
+        } else {
+            val markerReadable = try {
+                preferencesStore.claimAutomaticAgentNotificationPermissionOffer()
+                true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                false
+            }
+            // The explicit toggle may retry after denial, but still needs a readable marker.
+            if (!markerReadable) return
+        }
+
         val requestClaim = synchronized(relayV2UiFenceLock) {
             if (notificationPermissionRequestPending ||
                 !notificationPermissionRequestEligibleLocked(expectedComposition, automatic)
@@ -3670,23 +3719,10 @@ class V2ViewModel(
                 val claim = Any()
                 notificationPermissionRequestClaim = claim
                 notificationPermissionRequestPending = true
+                notificationPermissionRequestAutomatic = automatic
                 claim
             }
         } ?: return
-        val durableClaimed = try {
-            preferencesStore.claimAutomaticAgentNotificationPermissionOffer()
-        } catch (cancelled: CancellationException) {
-            clearNotificationPermissionRequestClaim(requestClaim)
-            throw cancelled
-        } catch (_: Throwable) {
-            null
-        }
-        // Automatic activation owns only a fresh durable claim. An explicit toggle may retry
-        // after denial, but still requires the already-offered marker to be durably readable.
-        if (durableClaimed == null || (automatic && durableClaimed == false)) {
-            clearNotificationPermissionRequestClaim(requestClaim)
-            return
-        }
         val stillCurrent = synchronized(relayV2UiFenceLock) {
             notificationPermissionRequestClaim === requestClaim &&
                 notificationPermissionRequestPending &&
@@ -3710,9 +3746,11 @@ class V2ViewModel(
             relayV2Composition === expectedComposition &&
             state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 &&
             state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE &&
-            (!automatic || relayV2NotificationPreferencesLoaded && with(state.preferences) {
-                waitingNotifications || failedNotifications || completedNotifications
-            })
+            (!automatic ||
+                !notificationPermissionAutomaticOfferDenied &&
+                    relayV2NotificationPreferencesLoaded && with(state.preferences) {
+                        waitingNotifications || failedNotifications || completedNotifications
+                    })
     }
 
     private fun clearNotificationPermissionRequestClaim(requestClaim: Any) {
@@ -3720,6 +3758,7 @@ class V2ViewModel(
             if (notificationPermissionRequestClaim === requestClaim) {
                 notificationPermissionRequestClaim = null
                 notificationPermissionRequestPending = false
+                notificationPermissionRequestAutomatic = false
             }
         }
     }
