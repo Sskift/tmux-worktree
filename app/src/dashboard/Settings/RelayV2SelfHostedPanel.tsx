@@ -8,7 +8,12 @@ import {
   Server,
   Square,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createLatestRequestGate,
+  type LatestRequestGate,
+  type LatestRequestToken,
+} from "../../latestRequestGate";
 import { MenuSelect, type MenuOption } from "../../MenuSelect";
 import type {
   HostConfig,
@@ -28,6 +33,29 @@ import {
 
 type Operation = "save" | "deploy" | "start" | "stop" | "rotate" | null;
 
+/**
+ * The one-shot mount status() probe runs over SSH and can take seconds; a
+ * user keystroke or a completed run() must supersede it before it returns.
+ * Runs and the mount probe each issue a token on the same gate; a user edit
+ * invalidates the in-flight mount probe because its draft backfill would
+ * otherwise clobber unsaved input. Only the newest request may publish its
+ * status/draft — the same latest-request fence used by connectionsAsyncCoordinator.
+ */
+export type RelayV2SelfHostedRequestGate = {
+  request(): LatestRequestToken;
+  userEdited(): void;
+  canPublish(token: LatestRequestToken): boolean;
+};
+
+export function createRelayV2SelfHostedRequestGate(): RelayV2SelfHostedRequestGate {
+  const gate: LatestRequestGate = createLatestRequestGate();
+  return {
+    request: () => gate.issue("relay-v2-self-hosted"),
+    userEdited: () => gate.invalidate(),
+    canPublish: (token) => gate.isCurrent(token),
+  };
+}
+
 export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[] }) {
   const backend = useDashboardBackend();
   const [draft, setDraft] = useState<RelayV2SelfHostedDraft>(
@@ -37,6 +65,11 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
   const [errors, setErrors] = useState<RelayV2SelfHostedDraftErrors>({});
   const [operation, setOperation] = useState<Operation>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const requestGateRef = useRef<RelayV2SelfHostedRequestGate | null>(null);
+  if (requestGateRef.current === null) {
+    requestGateRef.current = createRelayV2SelfHostedRequestGate();
+  }
+  const requestGate = requestGateRef.current;
   const hostOptions = useMemo<MenuOption[]>(() => [
     { value: "", label: "Choose a devbox…" },
     ...hosts.map((host) => ({
@@ -48,22 +81,26 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
 
   useEffect(() => {
     let active = true;
+    const request = requestGate.request();
     void backend.relay.v2Deployment.status().then((next) => {
-      if (!active) return;
+      if (!active || !requestGate.canPublish(request)) return;
       setStatus(next);
       setDraft(selfHostedStatusToDraft(next));
     }).catch((error: unknown) => {
-      if (active) setNotice(error instanceof Error ? error.message : String(error));
+      if (active && requestGate.canPublish(request)) {
+        setNotice(error instanceof Error ? error.message : String(error));
+      }
     });
     return () => {
       active = false;
     };
-  }, [backend]);
+  }, [backend, requestGate]);
 
   const update = <K extends keyof RelayV2SelfHostedDraft>(
     field: K,
     value: RelayV2SelfHostedDraft[K],
   ) => {
+    requestGate.userEdited();
     setDraft((current) => ({ ...current, [field]: value }));
     setErrors((current) => ({ ...current, [field]: undefined }));
     setNotice(null);
@@ -73,11 +110,14 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
     if (operation) return;
     setNotice(null);
     setOperation(kind);
+    let request: LatestRequestToken | null = null;
     try {
       let next: MobileRelayV2SelfHostedStatus;
       if (kind === "stop") {
+        request = requestGate.request();
         next = await backend.relay.v2Deployment.stopCenter();
       } else if (kind === "rotate") {
+        request = requestGate.request();
         next = await backend.relay.v2Deployment.rotateExpiredHostBootstrap();
       } else {
         const validation = validateRelayV2SelfHostedDraft(draft);
@@ -86,12 +126,14 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           setNotice("Review the highlighted Relay v2 deployment fields.");
           return;
         }
+        request = requestGate.request();
         next = kind === "save"
           ? await backend.relay.v2Deployment.saveConfig(validation.value)
           : kind === "deploy"
             ? await backend.relay.v2Deployment.deploy(validation.value)
             : await backend.relay.v2Deployment.startCenter(validation.value);
       }
+      if (!request || !requestGate.canPublish(request)) return;
       setStatus(next);
       setDraft(selfHostedStatusToDraft(next));
       setNotice(kind === "save"
@@ -106,7 +148,9 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
               ? "Expired version-zero Host bootstrap rotated with the same persisted correlation."
             : "Relay v2 Center stopped; persisted broker state was preserved.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      if (!request || requestGate.canPublish(request)) {
+        setNotice(error instanceof Error ? error.message : String(error));
+      }
     } finally {
       setOperation(null);
     }
