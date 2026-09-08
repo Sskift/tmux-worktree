@@ -2083,6 +2083,55 @@ test("a slow reaction API never blocks canonical lease renewal", async () => {
   }
 });
 
+test("a slow agent-message injection does not block the lease renewal RPC", async () => {
+  const h = harness();
+  let releaseInput = () => {};
+  const inputBarrier = new Promise((resolve) => { releaseInput = resolve; });
+  let markInputStarted = () => {};
+  const inputStarted = new Promise((resolve) => { markInputStarted = resolve; });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    h.control.beforeInput = async () => {
+      markInputStarted();
+      await inputBarrier;
+    };
+
+    const inputPromise = h.bridge.handleEvent(event());
+    await inputStarted;
+
+    const renewCountBefore = h.control.requests
+      .filter(({ type }) => type === "lease.renew").length;
+    let renewDone = false;
+    const renewPromise = h.bridge.renewLeases().then(() => { renewDone = true; });
+
+    // While the agent-message RPC is still blocked, the renewal must reach the
+    // control client on its own lane (it does not wait for the mutation lane).
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("renewal was blocked behind the slow agent-message injection")),
+        500,
+      );
+      const check = () => {
+        const reached = h.control.requests.filter(({ type }) => type === "lease.renew").length
+          > renewCountBefore;
+        if (reached) { clearTimeout(timer); resolve(); }
+        else setImmediate(check);
+      };
+      check();
+    });
+
+    releaseInput();
+    await Promise.all([inputPromise, renewPromise]);
+    assert.equal(renewDone, true);
+  } finally {
+    releaseInput();
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("agent-message output correlation, not a pre-input inspect cursor, starts the Feishu turn", async () => {
   const h = harness();
   try {

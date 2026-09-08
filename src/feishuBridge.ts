@@ -280,6 +280,7 @@ export class FeishuBridge {
   private lifecycleMutation = Promise.resolve();
   private activityCompletionMutation = Promise.resolve();
   private outboundMutation = Promise.resolve();
+  private renewMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -1063,70 +1064,121 @@ export class FeishuBridge {
   }
 
   renewLeases(): Promise<void> {
-    return this.serial(async () => {
-      let changed = false;
-      const failedTurnMessageIds: string[] = [];
-      for (const [bindingId, lease] of [...this.leases]) {
-        const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
-        if (!binding || binding.status !== "active") continue;
-        try {
-          const result = await this.control.renewLease(lease);
-          const renewed = this.requireGrantedLease(
-            result,
-            lease.controlTargetId,
-            lease.owner,
-            ["HELD", "DRAINING"],
+    // Renewal runs on its own lane so a slow agent-message injection holding
+    // the mutation lane never delays an RPC. The active-lease snapshot is
+    // collected synchronously at the start of the effect (no await before it,
+    // so it is atomic on the event loop); each outcome then hops back onto the
+    // serial lane, the only lane that mutates this.leases/state/persist.
+    const effect = async () => {
+      const pending = [...this.leases]
+        .map(([bindingId, lease]) => ({ bindingId, lease: structuredClone(lease) }))
+        .filter(({ bindingId }) => {
+          const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+          return binding?.status === "active";
+        });
+      for (const { bindingId, lease } of pending) {
+        await this.renewOneLease(bindingId, lease);
+      }
+    };
+    const queued = this.renewMutation.then(effect, effect);
+    this.renewMutation = queued.then(
+      () => undefined,
+      (error) => {
+        process.stderr.write(`[feishu-bridge] lease renewal sweep failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    );
+    return queued;
+  }
+
+  private async renewOneLease(bindingId: string, lease: CanonicalTerminalLease): Promise<void> {
+    let result;
+    let rpcError: unknown;
+    try {
+      result = await this.control.renewLease(lease);
+    } catch (error) {
+      rpcError = error;
+    }
+    // Apply the outcome back on the serial lane, the only lane that touches
+    // this.leases, state, and persist.
+    await this.serial(async () => {
+      const currentLease = this.leases.get(bindingId);
+      const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+      if (!currentLease || !binding || binding.status !== "active") return;
+      if (rpcError !== undefined) {
+        if (this.isRetryableLeaseRenewalFailure(rpcError)) {
+          const firstFailedAt = this.renewTransientFailures.get(bindingId) ?? this.now();
+          this.renewTransientFailures.set(bindingId, firstFailedAt);
+          process.stderr.write(
+            `[feishu-bridge] lease renewal transport failure for ${bindingId} (retrying): ${rpcError instanceof Error ? rpcError.message : String(rpcError)}\n`,
           );
-          if (renewed.controlEpoch !== lease.controlEpoch
-            || renewed.leaseId !== lease.leaseId
-            || renewed.fence !== lease.fence) {
-            const identity = new Error("canonical lease renewal changed terminal ownership identity");
-            Object.assign(identity, { code: "RECOVERY_REQUIRED" });
-            throw identity;
-          }
-          this.leases.set(bindingId, renewed);
-          this.renewTransientFailures.delete(bindingId);
-        } catch (error) {
-          if (this.isRetryableLeaseRenewalFailure(error)) {
-            // Keep the in-memory lease so the next 20s tick retries; once the
-            // transient failure window spans the server lease TTL, fence the
-            // binding instead of retrying indefinitely.
-            const firstFailedAt = this.renewTransientFailures.get(bindingId) ?? this.now();
-            this.renewTransientFailures.set(bindingId, firstFailedAt);
-            process.stderr.write(
-              `[feishu-bridge] lease renewal transport failure for ${bindingId} (retrying): ${error instanceof Error ? error.message : String(error)}\n`,
-            );
-            if (this.now() - firstFailedAt < LEASE_RENEW_TRANSIENT_GRACE_MS) continue;
-          }
-          this.renewTransientFailures.delete(bindingId);
-          this.leases.delete(bindingId);
-          this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
-          const turn = this.activeTurn(bindingId);
-          const watch = this.activeActivityWatch(binding);
-          if (turn) {
-            turn.status = "recovery-required";
-            turn.completedAt = nowIso(this.now);
-            turn.error = "terminal ownership lease renewal failed";
-            failedTurnMessageIds.push(turn.messageId);
-          }
-          if (watch) {
-            watch.status = "recovery-required";
-            watch.completedAt = nowIso(this.now);
-            watch.error = "terminal ownership lease renewal failed";
-            this.activityPollAfter.delete(watch.id);
-          }
-          if (!turn && !watch) {
-            // An idle binding fences silently and would otherwise swallow later
-            // group messages without a hint; tell the group to repair in Dashboard.
-            this.queueBindingLifecycle(binding, "control-needs-confirm");
-          }
-          changed = true;
+          if (this.now() - firstFailedAt < LEASE_RENEW_TRANSIENT_GRACE_MS) return;
         }
+        this.renewTransientFailures.delete(bindingId);
+        this.leases.delete(bindingId);
+        this.markBindingStale(binding, rpcError instanceof Error ? rpcError.message : String(rpcError));
+        const turn = this.activeTurn(bindingId);
+        const watch = this.activeActivityWatch(binding);
+        if (turn) {
+          turn.status = "recovery-required";
+          turn.completedAt = nowIso(this.now);
+          turn.error = "terminal ownership lease renewal failed";
+          this.queueProcessingReactionSettlement(turn.messageId, "failure");
+        }
+        if (watch) {
+          watch.status = "recovery-required";
+          watch.completedAt = nowIso(this.now);
+          watch.error = "terminal ownership lease renewal failed";
+          this.activityPollAfter.delete(watch.id);
+        }
+        if (!turn && !watch) {
+          // An idle binding fences silently and would otherwise swallow later
+          // group messages without a hint; tell the group to repair.
+          this.queueBindingLifecycle(binding, "control-needs-confirm");
+        }
+        this.persist();
+        return;
       }
-      if (changed) this.persist();
-      for (const messageId of failedTurnMessageIds) {
-        this.queueProcessingReactionSettlement(messageId, "failure");
+      let renewed: CanonicalTerminalLease;
+      try {
+        renewed = this.requireGrantedLease(
+          result!,
+          lease.controlTargetId,
+          lease.owner,
+          ["HELD", "DRAINING"],
+        );
+        if (renewed.controlEpoch !== currentLease.controlEpoch
+          || renewed.leaseId !== currentLease.leaseId
+          || renewed.fence !== currentLease.fence) {
+          const identity = new Error("canonical lease renewal changed terminal ownership identity");
+          Object.assign(identity, { code: "RECOVERY_REQUIRED" });
+          throw identity;
+        }
+      } catch (error) {
+        this.renewTransientFailures.delete(bindingId);
+        this.leases.delete(bindingId);
+        this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
+        const turn = this.activeTurn(bindingId);
+        const watch = this.activeActivityWatch(binding);
+        if (turn) {
+          turn.status = "recovery-required";
+          turn.completedAt = nowIso(this.now);
+          turn.error = "terminal ownership lease renewal failed";
+          this.queueProcessingReactionSettlement(turn.messageId, "failure");
+        }
+        if (watch) {
+          watch.status = "recovery-required";
+          watch.completedAt = nowIso(this.now);
+          watch.error = "terminal ownership lease renewal failed";
+          this.activityPollAfter.delete(watch.id);
+        }
+        if (!turn && !watch) {
+          this.queueBindingLifecycle(binding, "control-needs-confirm");
+        }
+        this.persist();
+        return;
       }
+      this.leases.set(bindingId, renewed);
+      this.renewTransientFailures.delete(bindingId);
     });
   }
 
@@ -1233,6 +1285,7 @@ export class FeishuBridge {
       this.reactionMutation,
       this.lifecycleMutation,
       this.activityCompletionMutation,
+      this.renewMutation,
       this.drainOutboundEffects(),
     ]);
   }
