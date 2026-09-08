@@ -2436,18 +2436,75 @@ fn reconcile_relay_v2_self_hosted_connector_desired_state(
     if replacement_binding != *expected_binding {
         return ConnectorWatchdogReconcileOutcome::Superseded;
     }
-    let selection = prepared.selection();
-    if management
-        .restart_self_hosted(app, selection, move || prepared.commit_ready())
-        .is_err()
-    {
+
+    // The connector reaches the remote relay-center over WSS. If the devbox
+    // rebooted (or its tmux server was killed), the remote center session is
+    // gone and rebuilding the local management child cannot help — every ensure
+    // would keep failing and the watchdog would churn-spawn a fresh child each
+    // tick. Re-probe the remote center and idempotently start it before any
+    // local rebuild; skip the rebuild entirely while the center is absent.
+    let Ok(Some(config)) = load_config() else {
         return ConnectorWatchdogReconcileOutcome::Retry;
+    };
+    let center_status = if self_hosted_connector_prerequisites_are_complete(&config) {
+        Some(probe_status(&config).center_status)
+    } else {
+        None
+    };
+    match remote_center_repair_action(center_status) {
+        RemoteCenterRepairAction::StartRemote => {
+            let mut remote_config = config;
+            // Re-validate the binding/config against the snapshot we are about
+            // to mutate; a concurrent Save may have changed the identity.
+            if !expected_binding.matches_config(&remote_config) {
+                return ConnectorWatchdogReconcileOutcome::Superseded;
+            }
+            if start_center(&mut remote_config).is_err() {
+                return ConnectorWatchdogReconcileOutcome::Retry;
+            }
+            // The remote center came up; the next tick drives ensure.
+            ConnectorWatchdogReconcileOutcome::Retry
+        }
+        RemoteCenterRepairAction::RebuildLocal => {
+            let selection = prepared.selection();
+            if management
+                .restart_self_hosted(app, selection, move || prepared.commit_ready())
+                .is_err()
+            {
+                return ConnectorWatchdogReconcileOutcome::Retry;
+            }
+            match management
+                .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
+            {
+                Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
+                Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
+            }
+        }
     }
-    match management
-        .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
-    {
-        Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
-        Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteCenterRepairAction {
+    /// The remote tmux center is down and must be (idempotently) started
+    /// before rebuilding the local management child is worthwhile.
+    StartRemote,
+    /// The remote center is already running; rebuild the local child.
+    RebuildLocal,
+}
+
+/// Decide the watchdog's repair action for an unhealthy connector from the
+/// observed remote center status (None when prerequisites are incomplete or
+/// the probe could not be run). Pure and unit-testable: this is the remote
+/// supervision that previously did not exist — a devbox reboot / tmux kill left
+/// the center down permanently because only a manual Start Center brought it
+/// back and restarting the Dashboard did not either.
+fn remote_center_repair_action(
+    center_status: Option<DeploymentProbeStatus>,
+) -> RemoteCenterRepairAction {
+    match center_status {
+        Some(DeploymentProbeStatus::Running) => RemoteCenterRepairAction::RebuildLocal,
+        Some(_) => RemoteCenterRepairAction::StartRemote,
+        None => RemoteCenterRepairAction::RebuildLocal,
     }
 }
 
@@ -2457,32 +2514,51 @@ pub(crate) fn start_relay_v2_self_hosted_connector_desired_state_watchdog(
     management: Weak<MobileRelayV2ManagementCommandState>,
     expected_binding: SelfHostedManagementBinding,
 ) {
+    arm_connector_desired_state_watchdog(&app, &state, &management, expected_binding);
+}
+
+/// Spawn a connector desired-state watchdog for a freshly published binding.
+/// This is shared by the app-startup restore path (lib.rs) and the Start
+/// Center / rotate commands: before this, a watchdog was only armed at startup,
+/// so an in-app first Deploy+Start (or a rotate) left the management child
+/// unsupervised and it stayed dead until the Dashboard was restarted.
+pub(crate) fn arm_connector_desired_state_watchdog(
+    app: &tauri::AppHandle,
+    state: &Weak<MobileRelayV2SelfHostedDeploymentState>,
+    management: &Weak<MobileRelayV2ManagementCommandState>,
+    expected_binding: SelfHostedManagementBinding,
+) {
     let _ = thread::Builder::new()
         .name("relay-v2-host-watchdog".to_string())
-        .spawn(move || {
-            let mut next_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
-            let mut retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
-            loop {
-                thread::sleep(next_delay);
-                let (Some(state), Some(management)) = (state.upgrade(), management.upgrade())
-                else {
-                    return;
-                };
-                match reconcile_relay_v2_self_hosted_connector_desired_state(
-                    &app,
-                    state.as_ref(),
-                    management.as_ref(),
-                    &expected_binding,
-                ) {
-                    ConnectorWatchdogReconcileOutcome::Healthy => {
-                        next_delay = CONNECTOR_WATCHDOG_HEALTHY_INTERVAL;
-                        retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+        .spawn({
+            let app = app.clone();
+            let state = state.clone();
+            let management = management.clone();
+            move || {
+                let mut next_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                let mut retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                loop {
+                    thread::sleep(next_delay);
+                    let (Some(state), Some(management)) = (state.upgrade(), management.upgrade())
+                    else {
+                        return;
+                    };
+                    match reconcile_relay_v2_self_hosted_connector_desired_state(
+                        &app,
+                        state.as_ref(),
+                        management.as_ref(),
+                        &expected_binding,
+                    ) {
+                        ConnectorWatchdogReconcileOutcome::Healthy => {
+                            next_delay = CONNECTOR_WATCHDOG_HEALTHY_INTERVAL;
+                            retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                        }
+                        ConnectorWatchdogReconcileOutcome::Retry => {
+                            next_delay = retry_delay;
+                            retry_delay = next_connector_watchdog_retry_delay(retry_delay);
+                        }
+                        ConnectorWatchdogReconcileOutcome::Superseded => return,
                     }
-                    ConnectorWatchdogReconcileOutcome::Retry => {
-                        next_delay = retry_delay;
-                        retry_delay = next_connector_watchdog_retry_delay(retry_delay);
-                    }
-                    ConnectorWatchdogReconcileOutcome::Superseded => return,
                 }
             }
         });
@@ -3643,13 +3719,23 @@ pub(crate) async fn mobile_relay_v2_self_hosted_status(
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let owner = state
+        // Status is a pure read: it probes the remote center over SSH and reads
+        // the persisted config; the only owner field it consumes is the
+        // startup-restore error. Take that snapshot WITHOUT holding the
+        // deployment lock across the SSH round trip (a black-holed devbox can
+        // stall ~50s on ServerAlive keepalives, and Deploy holds this lock for
+        // minutes). try_lock lets a concurrent Deploy/Start/Stop own the mutex;
+        // the one-shot restore error is simply omitted that poll and reappears
+        // on the next refresh. The probe itself never touches the owner, so it
+        // runs entirely outside the desired-state fence.
+        let startup_restore_error = state
             .operation
-            .lock()
-            .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+            .try_lock()
+            .ok()
+            .and_then(|owner| owner.startup_restore_error.clone());
         let mut status = current_status();
         if status.error.is_none() {
-            status.error = owner.startup_restore_error.clone();
+            status.error = startup_restore_error;
         }
         Ok(status)
     })
@@ -3733,69 +3819,92 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
     let state = Arc::clone(state.inner());
     let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let mut owner = state
-            .operation
-            .lock()
-            .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        let saved =
-            load_config()?.ok_or("Save and deploy the Relay v2 self-hosted configuration first")?;
-        let requested = validated_config(
-            args,
-            saved.bootstrap_file_name.clone(),
-            saved.bootstrap_publication_correlation.clone(),
-            false,
-        )?;
-        if !same_deployment_config(&saved, &requested) {
-            return Err(
-                "Save and deploy the current Relay v2 configuration before starting".to_string(),
+        let (committed, binding, previously_supervised) = {
+            let mut owner = state
+                .operation
+                .lock()
+                .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+            let saved = load_config()?
+                .ok_or("Save and deploy the Relay v2 self-hosted configuration first")?;
+            let requested = validated_config(
+                args,
+                saved.bootstrap_file_name.clone(),
+                saved.bootstrap_publication_correlation.clone(),
+                false,
+            )?;
+            if !same_deployment_config(&saved, &requested) {
+                return Err(
+                    "Save and deploy the current Relay v2 configuration before starting"
+                        .to_string(),
+                );
+            }
+            let mut previous = saved;
+            ensure_host_profile_identity(&mut previous)?;
+            let config = previous.clone();
+            ensure_ordinary_center_start_allowed(&config)?;
+            let mut config = save_config_replacement_after_management_barrier(
+                &mut owner,
+                management.as_ref(),
+                Some(previous),
+                config,
+            )?;
+            prepare_local_host_prerequisites_for(&config)?;
+            start_center(&mut config)?;
+            let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
+                .ok_or("Relay v2 self-hosted management configuration disappeared")?;
+            let selection = prepared.selection();
+            let binding = prepared.management_binding()?;
+            management
+                .restart_self_hosted(&app, selection, move || prepared.commit_ready())
+                .map_err(|error| match error {
+                    ManagementStartError::RecoveryRequired => {
+                        "Relay v2 Host cleanup is uncertain; operator recovery is required"
+                            .to_string()
+                    }
+                    ManagementStartError::Unavailable | ManagementStartError::ChannelClosed => {
+                        "Relay v2 self-hosted Host could not become ready".to_string()
+                    }
+                })?;
+            let previously_supervised = owner.active_management.is_some();
+            owner.active_management = Some(binding.clone());
+            let mut committed = revalidate_current_management_binding(&binding)?;
+            let readiness = management
+                .ensure_self_hosted_connector_start_accepted(&binding.steady_launch_key)
+                .map_err(|_| "Relay v2 self-hosted Host start was not accepted".to_string())?;
+            if persist_connector_desired_running(&mut committed, true).is_err() {
+                let _ = management
+                    .stop_self_hosted_connector_for_launch_key(Some(&binding.steady_launch_key));
+                return Err("Relay v2 self-hosted Host desired state was not saved".to_string());
+            }
+            owner.startup_restore_error = None;
+            // Network registration remains controller-owned. Once the accepted
+            // desired state is durable, a bounded readiness wait may fail without
+            // disarming the composition-owned retry policy.
+            management
+                .wait_for_self_hosted_connector_base_readiness(
+                    &binding.steady_launch_key,
+                    readiness,
+                )
+                .map_err(|_| {
+                    "Relay v2 self-hosted Host did not register with all six required capabilities"
+                        .to_string()
+                })?;
+            (committed, binding, previously_supervised)
+        };
+        // Arm a desired-state watchdog after the deployment lock is released
+        // (std::sync::Mutex is not reentrant) and only when this Start created a
+        // new supervised binding — an already-supervised binding is covered by a
+        // watchdog that will Supersede itself on mismatch. Before this, an in-app
+        // first Deploy+Start left the management child unsupervised until the
+        // Dashboard was restarted.
+        if !previously_supervised {
+            arm_connector_desired_state_watchdog(
+                &app,
+                &Arc::downgrade(&state),
+                &Arc::downgrade(&management),
+                binding,
             );
         }
-        let mut previous = saved;
-        ensure_host_profile_identity(&mut previous)?;
-        let config = previous.clone();
-        ensure_ordinary_center_start_allowed(&config)?;
-        let mut config = save_config_replacement_after_management_barrier(
-            &mut owner,
-            management.as_ref(),
-            Some(previous),
-            config,
-        )?;
-        prepare_local_host_prerequisites_for(&config)?;
-        start_center(&mut config)?;
-        let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
-            .ok_or("Relay v2 self-hosted management configuration disappeared")?;
-        let selection = prepared.selection();
-        let binding = prepared.management_binding()?;
-        management
-            .restart_self_hosted(&app, selection, move || prepared.commit_ready())
-            .map_err(|error| match error {
-                ManagementStartError::RecoveryRequired => {
-                    "Relay v2 Host cleanup is uncertain; operator recovery is required".to_string()
-                }
-                ManagementStartError::Unavailable | ManagementStartError::ChannelClosed => {
-                    "Relay v2 self-hosted Host could not become ready".to_string()
-                }
-            })?;
-        owner.active_management = Some(binding.clone());
-        let mut committed = revalidate_current_management_binding(&binding)?;
-        let readiness = management
-            .ensure_self_hosted_connector_start_accepted(&binding.steady_launch_key)
-            .map_err(|_| "Relay v2 self-hosted Host start was not accepted".to_string())?;
-        if persist_connector_desired_running(&mut committed, true).is_err() {
-            let _ = management
-                .stop_self_hosted_connector_for_launch_key(Some(&binding.steady_launch_key));
-            return Err("Relay v2 self-hosted Host desired state was not saved".to_string());
-        }
-        owner.startup_restore_error = None;
-        // Network registration remains controller-owned. Once the accepted
-        // desired state is durable, a bounded readiness wait may fail without
-        // disarming the composition-owned retry policy.
-        management
-            .wait_for_self_hosted_connector_base_readiness(&binding.steady_launch_key, readiness)
-            .map_err(|_| {
-                "Relay v2 self-hosted Host did not register with all six required capabilities"
-                    .to_string()
-            })?;
         Ok(probe_status(&committed))
     })
     .await
@@ -3811,42 +3920,63 @@ pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
     let state = Arc::clone(state.inner());
     let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let mut owner = state
-            .operation
-            .lock()
-            .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        let mut config =
-            load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
-        ensure_host_profile_identity(&mut config)?;
-        rotate_expired_host_bootstrap(&mut config)?;
-        let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
-            .ok_or("Relay v2 self-hosted management configuration disappeared")?;
-        let selection = prepared.selection();
-        let binding = prepared.management_binding()?;
-        management
-            .replace_self_hosted(&app, selection, move || prepared.commit_ready())
-            .map_err(|error| match error {
-                ManagementStartError::RecoveryRequired => {
-                    "Relay v2 Host cleanup is uncertain; operator recovery is required".to_string()
-                }
-                ManagementStartError::Unavailable | ManagementStartError::ChannelClosed => {
-                    "Rotated Relay v2 self-hosted Host could not become ready".to_string()
-                }
-            })?;
-        let committed = revalidate_current_management_binding(&binding)?;
-        owner.active_management = Some(binding.clone());
-        if committed.connector_desired_running {
-            let status = probe_status(&committed);
-            if !self_hosted_connector_should_be_running(&committed, &status) {
-                return Err("Relay v2 self-hosted restore prerequisites are not ready".to_string());
-            }
+        let (committed, binding, arm_watchdog) = {
+            let mut owner = state
+                .operation
+                .lock()
+                .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+            let mut config =
+                load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
+            ensure_host_profile_identity(&mut config)?;
+            rotate_expired_host_bootstrap(&mut config)?;
+            let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
+                .ok_or("Relay v2 self-hosted management configuration disappeared")?;
+            let selection = prepared.selection();
+            let binding = prepared.management_binding()?;
             management
-                .restore_self_hosted_connector_desired_state(&binding.steady_launch_key)
-                .map_err(|_| {
-                    "Relay v2 self-hosted Host desired state could not be restored".to_string()
+                .replace_self_hosted(&app, selection, move || prepared.commit_ready())
+                .map_err(|error| match error {
+                    ManagementStartError::RecoveryRequired => {
+                        "Relay v2 Host cleanup is uncertain; operator recovery is required"
+                            .to_string()
+                    }
+                    ManagementStartError::Unavailable | ManagementStartError::ChannelClosed => {
+                        "Rotated Relay v2 self-hosted Host could not become ready".to_string()
+                    }
                 })?;
+            let committed = revalidate_current_management_binding(&binding)?;
+            owner.active_management = Some(binding.clone());
+            if committed.connector_desired_running {
+                let status = probe_status(&committed);
+                if !self_hosted_connector_should_be_running(&committed, &status) {
+                    return Err(
+                        "Relay v2 self-hosted restore prerequisites are not ready".to_string()
+                    );
+                }
+                management
+                    .restore_self_hosted_connector_desired_state(&binding.steady_launch_key)
+                    .map_err(|_| {
+                        "Relay v2 self-hosted Host desired state could not be restored".to_string()
+                    })?;
+            }
+            owner.startup_restore_error = None;
+            (
+                committed,
+                binding.clone(),
+                owner.active_management.is_some(),
+            )
+        };
+        // Arm a watchdog for the rotated binding after releasing the deployment
+        // lock (std::sync::Mutex is not reentrant). The prior watchdog (armed for
+        // the pre-rotation binding) Supersedes itself on the binding mismatch.
+        if arm_watchdog && committed.connector_desired_running {
+            arm_connector_desired_state_watchdog(
+                &app,
+                &Arc::downgrade(&state),
+                &Arc::downgrade(&management),
+                binding,
+            );
         }
-        owner.startup_restore_error = None;
         Ok(probe_status(&committed))
     })
     .await
@@ -3903,14 +4033,15 @@ mod tests {
         load_ready_commit_journal_at, next_connector_watchdog_retry_delay, normalize_issuer_url,
         persisted_management_config_identity, read_local_private_file,
         ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
-        relay_url_from_issuer, self_hosted_connector_should_be_running,
+        relay_url_from_issuer, remote_center_repair_action,
+        self_hosted_connector_should_be_running,
         self_hosted_connector_should_survive_dashboard_window_close,
         stop_center_and_active_connector, valid_bootstrap_publication_correlation,
         validate_bootstrap_bytes, validate_listen_host, verify_rotation_transfer_identity,
         verify_rotation_transfer_receipt_local_at, BootstrapRotationRequestPhase,
         BootstrapRotationTransferPhase, BootstrapRotationTransferReceipt, DeploymentProbeStatus,
         LocalPrivateFileIdentity, PersistedSelfHostedConfig, ReadyCommitJournal,
-        SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
+        RemoteCenterRepairAction, SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
         BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
         CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
         HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
@@ -3933,6 +4064,32 @@ mod tests {
         assert_eq!(
             next_connector_watchdog_retry_delay(CONNECTOR_WATCHDOG_MAX_RETRY_DELAY),
             CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
+        );
+    }
+
+    #[test]
+    fn connector_watchdog_repairs_a_vanished_remote_center_before_rebuilding() {
+        // A devbox reboot / tmux kill-server leaves the remote center stopped.
+        // Rebuilding the local management child cannot fix that; the watchdog
+        // must start the remote center instead, and only rebuild locally once
+        // the center is observed running again.
+        assert_eq!(
+            remote_center_repair_action(Some(DeploymentProbeStatus::Stopped)),
+            RemoteCenterRepairAction::StartRemote
+        );
+        assert_eq!(
+            remote_center_repair_action(Some(DeploymentProbeStatus::Missing)),
+            RemoteCenterRepairAction::StartRemote
+        );
+        assert_eq!(
+            remote_center_repair_action(Some(DeploymentProbeStatus::Running)),
+            RemoteCenterRepairAction::RebuildLocal
+        );
+        // No probe result (incomplete prerequisites / unprobed) falls back to
+        // the prior behaviour: rebuild the local child.
+        assert_eq!(
+            remote_center_repair_action(None),
+            RemoteCenterRepairAction::RebuildLocal
         );
     }
 
