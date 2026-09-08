@@ -713,6 +713,109 @@ test("host registration commits delivery before admission and supersedes only a 
   assert.equal(reconnectedPresence.previousHostInstanceId, winningInstance);
 });
 
+test("old host disconnecting in new carrier's registered commit window rebases it", async () => {
+  // C024/D009: a new host process (new hostInstanceId) sends host.hello and
+  // queues host.registered while the previous connector is still active. The
+  // old socket's close lands before the new carrier's delivery ACK: disconnect
+  // publishes offline (revision bump) and deletes the previous owner. Without
+  // rebasing, the new carrier's commit fence sees the revision mismatch plus a
+  // vanished previous owner and fail-closes with 1013 registration_commit_race,
+  // kicking the only healthy connector and forcing a needless extra reconnect.
+  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const hostEpoch = randomUUID();
+  const oldInstance = randomUUID();
+  const oldIncarnation = randomUUID();
+  // L: committed active owner.
+  core.attachHostCarrier("host-old-window", authContext("host", {
+    jti: "old-window-jti",
+  }), oldIncarnation);
+  const oldHello = await core.receiveHostFrame(
+    "host-old-window",
+    carrierBytes(hostHello({ hostEpoch, hostInstanceId: oldInstance })),
+  );
+  const oldRegistered = oldHello.actions.find((action) => (
+    action.kind === "send_host" && action.frame.type === "host.registered"
+  ));
+  assert.equal(
+    core.acknowledgeHostControlDelivery("host-old-window", oldRegistered.deliveryId).accepted,
+    true,
+  );
+  assert.equal(core.inspectHost(HOST_ID).state, "online");
+
+  // W: new host process, hello + registered queued but NOT yet acked.
+  const newInstance = randomUUID();
+  const newIncarnation = randomUUID();
+  core.attachHostCarrier("host-new-window", authContext("host", {
+    jti: "new-window-jti",
+  }), newIncarnation);
+  const newHello = await core.receiveHostFrame(
+    "host-new-window",
+    carrierBytes(hostHello({ hostEpoch, hostInstanceId: newInstance })),
+  );
+  const newRegistered = newHello.actions.find((action) => (
+    action.kind === "send_host" && action.frame.type === "host.registered"
+  ));
+  assert.ok(newRegistered);
+  assert.equal(newRegistered.frame.payload.disposition, "replaced");
+  assert.equal(core.inspectHost(HOST_ID).connectorId, oldRegistered.frame.connectorId);
+
+  // L's residual socket closes before W's registered delivery ACK lands.
+  const disconnect = core.disconnectHost("host-old-window");
+  assert.equal(disconnect.accepted, true);
+  assert.equal(core.inspectHost(HOST_ID).state, "offline");
+
+  // W's delivery ACK now commits instead of 1013-cancelling.
+  const commit = core.acknowledgeHostControlDelivery(
+    "host-new-window",
+    newRegistered.deliveryId,
+  );
+  assert.equal(commit.accepted, true, "new carrier commits after previous owner vanished");
+  assert.equal(
+    commit.actions.some((action) => action.kind === "close_host"),
+    false,
+    "no registration_commit_race / superseded close of the healthy new carrier",
+  );
+  const directory = core.inspectHost(HOST_ID);
+  assert.equal(directory.state, "online");
+  assert.equal(directory.connectorId, newRegistered.frame.connectorId);
+  assert.equal(directory.hostInstanceId, newInstance);
+  // No host.superseded is sent: the previous owner is already gone, not live.
+  assert.equal(
+    commit.actions.some((action) => action.frame?.type === "host.superseded"),
+    false,
+  );
+
+  // Fail-closed invariant: a third new process that hello's while W is still
+  // registering (before this point W already committed, so use a fresh window)
+  // — more directly, a registration_busy newcomer is still rejected.
+  const busyCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  busyCore.attachHostCarrier("busy-old", authContext("host", { jti: "busy-old-jti" }), randomUUID());
+  const busyOldHello = await busyCore.receiveHostFrame("busy-old", carrierBytes(hostHello()));
+  busyCore.acknowledgeHostControlDelivery(
+    "busy-old",
+    busyOldHello.actions.find((a) => a.deliveryId).deliveryId,
+  );
+  busyCore.attachHostCarrier("busy-pending", authContext("host", { jti: "busy-pending-jti" }), randomUUID());
+  const busyPendingHello = await busyCore.receiveHostFrame(
+    "busy-pending",
+    carrierBytes(hostHello({ hostInstanceId: randomUUID() })),
+  );
+  assert.equal(busyPendingHello.accepted, true);
+  busyCore.attachHostCarrier("busy-third", authContext("host", { jti: "busy-third-jti" }), randomUUID());
+  const busyThirdHello = await busyCore.receiveHostFrame(
+    "busy-third",
+    carrierBytes(hostHello({ hostInstanceId: randomUUID() })),
+  );
+  assert.equal(busyThirdHello.accepted, false);
+  assert.equal(busyThirdHello.error.code, "BUSY");
+  assert.equal(
+    busyThirdHello.actions.some((action) => (
+      action.kind === "close_host" && action.reason === "registration_busy"
+    )),
+    true,
+  );
+});
+
 test("carrier route admission hard-bounds disconnect cleanup production", async () => {
   const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
   const transportId = "host-route-hard-ceiling";
@@ -2530,6 +2633,117 @@ test("post-101 route races choose exactly one welcome or unavailable outcome", a
   assert.equal(closeOpened.accepted, true);
   assert.equal(closeCore.unbindClient(closeConnectionId, "client_closed").accepted, true);
   assert.equal(closeCore.drainClient(closeConnectionId).length, 0);
+});
+
+test("client unbind during route.open handshake tolerates crossing route.opened/rejected", async () => {
+  // D008: a client socket that closes in the route.open handshake window sends
+  // route.unbind while the host's route.opened is already in flight. The unbind
+  // must fence the opening route (firstApplicationFrame='unavailable') exactly
+  // like the auth/offline fences, so the crossing ACK is scored as a benign
+  // late frame instead of stale_route_opened 4400-killing the whole host
+  // carrier and kicking every other healthy client on that host.
+  const openedCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const openedHost = await registerHost(openedCore, "host-unbind-cross-opened");
+  // A fully-open healthy sibling on the same host: it must survive the flake.
+  await openRoute(openedCore, "host-unbind-cross-opened", "client-unbind-cross-healthy");
+
+  const flakyConnectionId = "client-unbind-cross-flaky";
+  assert.equal(
+    openedCore.openClientRoute(flakyConnectionId, authContext("client", {
+      jti: "unbind-cross-flaky-jti",
+    })).accepted,
+    true,
+  );
+  const [openDelivery] = openedCore.drainHostCarrier(
+    "host-unbind-cross-opened",
+    { maxFrames: 1 },
+  );
+  assert.equal(openDelivery.frame.type, "route.open");
+  assert.equal(
+    openedCore.acknowledgeHostDelivery(
+      "host-unbind-cross-opened",
+      openDelivery.deliveryId,
+    ).accepted,
+    true,
+    "route.open is already in flight to the host",
+  );
+  // Client socket closes mid-handshake, before route.opened arrives back.
+  assert.equal(
+    openedCore.unbindClient(flakyConnectionId, "client_closed").accepted,
+    true,
+  );
+  const lateOpened = await openedCore.receiveHostFrame(
+    "host-unbind-cross-opened",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "route.opened",
+      requestId: openDelivery.frame.requestId,
+      connectorId: openedHost.connectorId,
+      routeId: openDelivery.frame.routeId,
+      routeFence: openDelivery.frame.routeFence,
+      payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+    }),
+  );
+  assert.equal(lateOpened.accepted, true, "crossing route.opened is a benign late ACK");
+  assert.deepEqual(lateOpened.actions.map((action) => action.kind), []);
+  assert.equal(openedCore.inspectHost(HOST_ID).state, "online");
+  assert.equal(openedCore.inspectHost(HOST_ID).connectorId, openedHost.connectorId);
+  assert.equal(
+    openedCore.drainClient(flakyConnectionId).length,
+    0,
+    "a late route.opened never resurrects relay.welcome",
+  );
+
+  // route.rejected crossing variant: the late rejection drops the route
+  // quietly rather than becoming stale_route_rejected.
+  const rejectedCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const rejectedHost = await registerHost(rejectedCore, "host-unbind-cross-rejected");
+  const rejectedConnectionId = "client-unbind-cross-rejected-flaky";
+  assert.equal(
+    rejectedCore.openClientRoute(rejectedConnectionId, authContext("client", {
+      jti: "unbind-cross-rejected-jti",
+    })).accepted,
+    true,
+  );
+  const [rejectedOpen] = rejectedCore.drainHostCarrier(
+    "host-unbind-cross-rejected",
+    { maxFrames: 1 },
+  );
+  assert.equal(
+    rejectedCore.acknowledgeHostDelivery(
+      "host-unbind-cross-rejected",
+      rejectedOpen.deliveryId,
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    rejectedCore.unbindClient(rejectedConnectionId, "client_closed").accepted,
+    true,
+  );
+  const lateRejected = await rejectedCore.receiveHostFrame(
+    "host-unbind-cross-rejected",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "route.rejected",
+      requestId: rejectedOpen.frame.requestId,
+      connectorId: rejectedHost.connectorId,
+      routeId: rejectedOpen.frame.routeId,
+      routeFence: rejectedOpen.frame.routeFence,
+      payload: null,
+      error: {
+        code: "BUSY",
+        message: "route rejected: BUSY",
+        retryable: true,
+        retryAfterMs: 250,
+        commandDisposition: "not_applicable",
+        details: null,
+      },
+    }),
+  );
+  assert.equal(lateRejected.accepted, true, "crossing route.rejected drops quietly");
+  assert.deepEqual(lateRejected.actions.map((action) => action.kind), []);
+  assert.equal(rejectedCore.inspectHost(HOST_ID).state, "online");
+  assert.equal(rejectedCore.drainClient(rejectedConnectionId).length, 0);
 });
 
 test("route frame limit is the minimum of broker, host hello, and route.opened", async () => {

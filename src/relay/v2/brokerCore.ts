@@ -2368,6 +2368,28 @@ export class RelayV2BrokerCore {
       this.activeCarriers.delete(carrier.authContext.hostId);
       this.publishDirectory(carrier, "offline", "disconnected", null);
       this.invalidateConnectorRoutes(carrier, actions, false);
+      // A newer host process (new hostInstanceId) may be sitting in its
+      // host.registered delivery-commit window: it hello'd and queued the
+      // registered frame while this older connector was still the active
+      // owner. Its commit fence (acknowledgeHostControlDelivery) would
+      // otherwise see this offline revision bump plus its previous owner
+      // vanishing, and fail-closed with 1013 registration_commit_race —
+      // closing the only healthy connector and forcing a needless extra
+      // reconnect. Rebase its CAS snapshot onto this offline publish: the
+      // previous owner is definitively gone (deleted below) and there is no
+      // third active owner to supersede. Genuine fences stay closed: a real
+      // third-party revision still mismatches, a still-present previous owner
+      // still fails, and a registration_busy newcomer is rejected on hello.
+      const pending = this.registeringCarriers.get(carrier.authContext.hostId);
+      if (
+        pending
+        && pending.registration
+        && pending.registration.previousTransportId === carrier.transportId
+      ) {
+        pending.registration.previousTransportId = null;
+        pending.registration.baseDirectoryRevision =
+          this.directory.get(carrier.authContext.hostId)?.revision ?? 0n;
+      }
     }
     this.discardCarrier(carrier);
     carrier.status = "closed";
@@ -4048,6 +4070,13 @@ export class RelayV2BrokerCore {
     }
     this.discardQueuedRouteData(carrier, route);
     this.discardQueuedClientData(route);
+    // A client-initiated unbind is a fence sibling of authorization/offline:
+    // route.open may already be in flight to the host, so a crossing
+    // route.opened/route.rejected must hit the benign late-ACK branches rather
+    // than be scored as a stale frame that 4400s the whole carrier.
+    if (route.status === "opening" && route.firstApplicationFrame === "pending") {
+      route.firstApplicationFrame = "unavailable";
+    }
     route.status = "closing";
     const frame = {
       carrierVersion: 1,
