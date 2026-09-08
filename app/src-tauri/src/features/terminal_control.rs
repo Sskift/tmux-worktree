@@ -22,6 +22,12 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
 const REMOTE_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+// A daemon spawned by the Dashboard self-terminates after this long with no
+// socket activity, so a Dashboard that was SIGKILLed/crashed leaves an orphan
+// that reclaims its socket and server lock within ~10 minutes instead of
+// pinning them indefinitely (which would block a later-versioned Dashboard
+// from taking over). Only the bundled CLI is guaranteed to accept the flag.
+const DAEMON_IDLE_EXIT_MS: &str = "600000";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteTerminalControlFingerprint {
@@ -656,7 +662,13 @@ fn spawn_server(app: &tauri::AppHandle) -> Result<Child, String> {
                 ));
             }
             match command
-                .args([cli_arg.as_str(), "terminal-control", "serve"])
+                .args([
+                    cli_arg.as_str(),
+                    "terminal-control",
+                    "serve",
+                    "--idle-exit-ms",
+                    DAEMON_IDLE_EXIT_MS,
+                ])
                 .env("TW_TERMINAL_CONTROL_CLI", &cli_arg)
                 .process_group(0)
                 .stdin(Stdio::null())
