@@ -2527,7 +2527,15 @@ export class FeishuBridge {
         `tw-${digest(idempotencySeed).slice(0, 40)}`,
         binding.options.replyMode,
       );
-    } catch {}
+    } catch (error) {
+      // This notice is deliberately transient (a resend-after-retry hint); it
+      // must not become a durable reply that could arrive after the window
+      // closed. But a totally silent failure hid a dropped message, so at least
+      // record it alongside the other best-effort Feishu delivery paths.
+      process.stderr.write(
+        `[feishu-bridge] inform reply card failed for ${messageId} (${idempotencySeed}): ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
   }
 
   private queueProcessingReactionStart(messageId: string): void {

@@ -1664,6 +1664,63 @@ test("a group message arriving while the final reply card delivers is not steere
   }
 });
 
+test("a failed transient inform card logs and still leaves the message uninjected", async () => {
+  const h = harness();
+  const logs = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => {
+    logs.push(String(chunk));
+    return true;
+  };
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markAnswerStarted = () => {};
+  const answerStarted = new Promise((resolve) => { markAnswerStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "answer");
+    h.lark.beforeReply = async ({ messageId }) => {
+      if (messageId === "om-one") {
+        markAnswerStarted();
+        await replyBarrier;
+      }
+      if (messageId === "om-two") throw new Error("lark-cli reply timed out");
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await answerStarted;
+    // The turn is replying; the follow-up hits the replying gate and its inform
+    // card fails to send.
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+    await flushBestEffortEffects();
+
+    assert.equal(h.control.inputs.length, 1, "the message must not be injected");
+    const followup = h.lark.replies.find((reply) => reply.messageId === "om-two");
+    assert.ok(followup, "the inform card was attempted");
+    assert.ok(
+      logs.some((line) => line.includes("inform reply card failed") && line.includes("om-two")),
+      "the failed inform is logged instead of being swallowed silently",
+    );
+    assert.equal(
+      h.store.read().replies.some((reply) => reply.sourceMessageId === "om-two"),
+      false,
+      "the transient inform is not made durable",
+    );
+    releaseReply();
+    await pollPromise;
+  } finally {
+    process.stderr.write = originalWrite;
+    releaseReply();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an external non-force handoff waits for inherited Agent completion", async () => {
   const h = harness();
   try {
