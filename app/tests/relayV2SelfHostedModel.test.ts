@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createRelayV2SelfHostedDraft,
   relayV2ExpiredBootstrapRotationAvailable,
+  relayV2SelfHostedCenterVersionNotice,
   relayV2SelfHostedConnectorDesiredRunning,
   relayV2SelfHostedStackLabel,
   relayV2SelfHostedStatusLabel,
@@ -42,6 +43,9 @@ const configuredStatus: MobileRelayV2SelfHostedStatus = {
   remoteTlsCaPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/ca.pem",
   remoteProfilePath: "~/.tmux-worktree/relay-v2-self-hosted/deployment-profile-v1.json",
   remoteStateDirectory: "~/.tmux-worktree/relay-v2-self-hosted/state",
+  runningBundleVersion: null,
+  centerVersionStale: false,
+  dashboardBundleVersion: "1.0.24",
   error: null,
 };
 
@@ -263,4 +267,45 @@ test("persisted self-hosted inputs restore without implying Host or Android read
     }),
     "Relay Center running",
   );
+});
+
+test("a running Center on an older bundle is flagged with a deploy-to-restart notice", () => {
+  const stale: MobileRelayV2SelfHostedStatus = {
+    ...configuredStatus,
+    centerStatus: "running",
+    runningBundleVersion: "1.0.23",
+    centerVersionStale: true,
+    dashboardBundleVersion: "1.0.24",
+  };
+  const notice = relayV2SelfHostedCenterVersionNotice(stale);
+  assert.ok(notice, "stale running Center must produce a notice");
+  assert.match(notice!, /1\.0\.23/);
+  assert.match(notice!, /1\.0\.24/);
+  assert.match(notice!, /Deploy restarts the Center/i);
+});
+
+test("a running Center with no recorded version is treated as stale (started by an older Dashboard)", () => {
+  const legacyRunning: MobileRelayV2SelfHostedStatus = {
+    ...configuredStatus,
+    centerStatus: "running",
+    runningBundleVersion: null,
+    centerVersionStale: true,
+  };
+  const notice = relayV2SelfHostedCenterVersionNotice(legacyRunning);
+  assert.ok(notice);
+  assert.match(notice!, /older version/);
+});
+
+test("no stale-version notice for a current running Center or a stopped Center", () => {
+  assert.equal(
+    relayV2SelfHostedCenterVersionNotice({
+      ...configuredStatus,
+      centerStatus: "running",
+      runningBundleVersion: "1.0.24",
+      centerVersionStale: false,
+    }),
+    null,
+  );
+  assert.equal(relayV2SelfHostedCenterVersionNotice(configuredStatus), null);
+  assert.equal(relayV2SelfHostedCenterVersionNotice(null), null);
 });

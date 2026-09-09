@@ -94,18 +94,30 @@ export function createRelayV2SelfHostedPanelController(
   const successNotice = (
     kind: Exclude<RelayV2SelfHostedOperation, null>,
     draft: RelayV2SelfHostedDraft,
-  ): string =>
-    kind === "save"
-      ? "Self-hosted Relay v2 settings saved."
-      : kind === "deploy"
-        ? draft.externalTlsManagement
-          ? "Canonical tw bundle and deployment profile published; external TLS validated in place."
-          : "Canonical tw bundle, TLS files, and deployment profile published."
-        : kind === "start"
-          ? "Relay v2 Center started on the selected devbox."
-          : kind === "rotate"
-            ? "Expired version-zero Host bootstrap rotated with the same persisted correlation."
-            : "Relay v2 Center stopped; persisted broker state was preserved.";
+    next: MobileRelayV2SelfHostedStatus,
+  ): string => {
+    if (kind === "save") {
+      return "Self-hosted Relay v2 settings saved.";
+    }
+    if (kind === "deploy") {
+      const base = draft.externalTlsManagement
+        ? "Canonical tw bundle and deployment profile published; external TLS validated in place."
+        : "Canonical tw bundle, TLS files, and deployment profile published.";
+      // Deploy restarts a running Center onto the new bundle (a publish alone
+      // only swaps the `current` symlink); a stopped Center stays stopped and
+      // is brought up by Start / the watchdog.
+      return next.centerStatus === "running"
+        ? `${base} The running Relay v2 Center was restarted onto the new bundle; phone connections dropped briefly and are reconnecting.`
+        : base;
+    }
+    if (kind === "start") {
+      return "Relay v2 Center started on the selected devbox.";
+    }
+    if (kind === "rotate") {
+      return "Expired version-zero Host bootstrap rotated with the same persisted correlation.";
+    }
+    return "Relay v2 Center stopped; persisted broker state was preserved.";
+  };
 
   return {
     get state() {
@@ -172,7 +184,7 @@ export function createRelayV2SelfHostedPanelController(
         publish({
           status: next,
           draft: selfHostedStatusToDraft(next),
-          notice: successNotice(kind, draftAtIssue),
+          notice: successNotice(kind, draftAtIssue, next),
         });
       } catch (error) {
         if (!request || gate.canPublish(request)) {

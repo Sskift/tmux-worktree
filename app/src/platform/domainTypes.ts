@@ -469,6 +469,14 @@ export type MobileRelayV2SelfHostedStatus = {
   remoteTlsCaPath: string;
   remoteProfilePath: string;
   remoteStateDirectory: string;
+  /** Bundle version the live remote Center process was started from, or null
+   *  when the Center is stopped / was started by an older Dashboard. */
+  runningBundleVersion: string | null;
+  /** True when a running Center is not on this Dashboard's bundle version:
+   *  Deploy restarts it onto the new code. */
+  centerVersionStale: boolean;
+  /** The bundle version this Dashboard ships and deploys. */
+  dashboardBundleVersion: string;
   error: string | null;
 };
 
