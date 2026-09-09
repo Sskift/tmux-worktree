@@ -130,6 +130,115 @@ export function spawnInteropHost(config = {}) {
 }
 
 /**
+ * Start the Relay v2 local-development broker IN-PROCESS (no broker child
+ * process). The spawned CLI lane (`dist/cli.cjs relay-server --v2-local-dev
+ * --host-bootstrap-output`) writes exactly ONE host bootstrap secret, and the
+ * local-dev credential authority treats it as single-use, so a second host
+ * process can never bootstrap against a spawned broker. The in-process handle
+ * exposes the same admin surface the CLI uses once at startup
+ * (handle.admin.createHostBootstrap, src/relayServer.ts:256), letting a test
+ * issue a FRESH secret per host. Test/tooling infrastructure only — no
+ * production code path calls this.
+ *
+ * Options: { port?, tlsKeyPath, tlsCertificatePath }. The listener binds
+ * 127.0.0.1; the advertised origin is pinned to the same loopback IP so host
+ * profiles and client URLs dial exactly the address listeners are bound to
+ * (no localhost <-> 127.0.0.1 ambiguity).
+ *
+ * Returns { handle, port, issuerUrl, relayUrl, clientRelayUrl,
+ * issueHostBootstrap(): Promise<secret>, close(): Promise<void> }.
+ */
+export async function startInProcessBroker(options = {}) {
+  const { startRelayV2BrokerLocalDevelopment } = await import("../../dist/relayServer.js");
+
+  // Bind a listener with bounded retries: the local-dev activation throws
+  // (TLS_SERVER_FAILED) on EADDRINUSE, and the 18000-19000 range can collide
+  // with unrelated loopback services. Retry on a fresh port a few times; only
+  // transient bind collisions are retried.
+  let handle = null;
+  let chosenPort = options.port ?? 0;
+  let lastError = null;
+  const maxBindAttempts = options.port !== undefined ? 1 : 8;
+  for (let attempt = 0; attempt < maxBindAttempts && handle === null; attempt++) {
+    if (chosenPort === 0) chosenPort = 18000 + Math.floor(Math.random() * 1000);
+    try {
+      handle = await startRelayV2BrokerLocalDevelopment({
+        port: chosenPort,
+        tlsKeyPath: options.tlsKeyPath,
+        tlsCertificatePath: options.tlsCertificatePath,
+        advertisedOrigin: `https://127.0.0.1:${chosenPort}/`,
+      });
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message ?? error);
+      const bindCollision = /EADDRINUSE|EACCES|TLS listener creation failed/i.test(message);
+      if (options.port !== undefined || !bindCollision || attempt + 1 >= maxBindAttempts) {
+        throw error;
+      }
+      chosenPort = 0;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  if (handle === null) throw lastError ?? new Error("in-process broker failed to start");
+  const port = chosenPort;
+
+  // Real readiness evidence: wait until the HTTPS listener actually answers.
+  // The shipping root resolves only after binding, but probe anyway (any HTTP
+  // status, even 404, counts) so a caller never proceeds against a half-open
+  // broker. NODE_TLS_REJECT_UNAUTHORIZED=0 is set for this harness process.
+  const readinessDeadline = Date.now() + BROKER_READY_DEADLINE_MS;
+  let readinessError = null;
+  for (;;) {
+    try {
+      const probe = await fetch(handle.issuerUrl, { method: "GET" });
+      try { await probe.body?.cancel?.(); } catch {}
+      break;
+    } catch (error) {
+      readinessError = error;
+      if (Date.now() >= readinessDeadline) {
+        await handle.shutdown().catch(() => {});
+        throw new Error(
+          `in-process broker readiness probe failed: ${readinessError?.message ?? readinessError}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  const issueHostBootstrap = async () => {
+    let delivered = null;
+    const result = await handle.admin.createHostBootstrap({}, (secret) => {
+      delivered = secret;
+    });
+    if (typeof delivered !== "string" || delivered.length === 0) {
+      throw new Error(
+        `in-process broker createHostBootstrap delivered no secret (result=${JSON.stringify(result)})`,
+      );
+    }
+    return delivered;
+  };
+
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await handle.shutdown().catch(() => {});
+  };
+
+  return {
+    handle,
+    port: handle.port,
+    issuerUrl: handle.issuerUrl,
+    relayUrl: handle.relayUrl,
+    clientRelayUrl: handle.relayUrl.endsWith("/client")
+      ? handle.relayUrl
+      : `${handle.relayUrl.replace(/\/$/, "")}/client`,
+    issueHostBootstrap,
+    close,
+  };
+}
+
+/**
  * Start the full interop topology (TLS, broker, host, enrollment, redeem).
  *
  * Options:
@@ -163,38 +272,73 @@ export async function startInteropTopology(options = {}) {
   // -------------------------------------------------------------------------
   // Broker
   // -------------------------------------------------------------------------
-  const brokerPort = 18000 + Math.floor(Math.random() * 1000);
-  const brokerProc = spawn(process.execPath, [
-    "dist/cli.cjs",
-    "relay-server",
-    "--v2-local-dev",
-    "--port", String(brokerPort),
-    "--v2-dev-tls-key", tlsKeyPath,
-    "--v2-dev-tls-cert", tlsCertPath,
-    "--host-bootstrap-output", join(tmpRoot, "host-bootstrap.txt"),
-  ], {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
-  });
-
-  const brokerLog = [];
-  brokerProc.stdout.on("data", (d) => brokerLog.push(d.toString()));
-  brokerProc.stderr.on("data", (d) => brokerLog.push(d.toString()));
-
+  // Spawn with bounded retries on a transient port collision: the broker
+  // exits immediately on EADDRINUSE, and the 18000-19000 range is shared with
+  // other loopback services (and, during test runs, sibling brokers). Retry
+  // on a fresh port a few times rather than failing the whole topology on an
+  // unrelated listener.
   const bootstrapOutputPath = join(tmpRoot, "host-bootstrap.txt");
-  await new Promise((resolve, reject) => {
-    const deadline = Date.now() + BROKER_READY_DEADLINE_MS;
-    const check = () => {
-      if (existsSync(bootstrapOutputPath)) return resolve();
-      if (brokerProc.exitCode !== null) {
-        console.error("Broker stderr:", brokerLog.join(""));
-        return reject(new Error("broker exited early"));
-      }
-      if (Date.now() >= deadline) return reject(new Error("broker startup timed out"));
-      setTimeout(check, 100);
-    };
-    check();
-  });
+  let brokerProc = null;
+  let brokerPort = 0;
+  let brokerLog = [];
+  const MAX_BROKER_BIND_ATTEMPTS = 8;
+  for (let attempt = 0; attempt < MAX_BROKER_BIND_ATTEMPTS; attempt++) {
+    brokerPort = 18000 + Math.floor(Math.random() * 1000);
+    brokerLog = [];
+    const proc = spawn(process.execPath, [
+      "dist/cli.cjs",
+      "relay-server",
+      "--v2-local-dev",
+      "--port", String(brokerPort),
+      "--v2-dev-tls-key", tlsKeyPath,
+      "--v2-dev-tls-cert", tlsCertPath,
+      "--host-bootstrap-output", bootstrapOutputPath,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+    proc.stdout.on("data", (d) => brokerLog.push(d.toString()));
+    proc.stderr.on("data", (d) => brokerLog.push(d.toString()));
+
+    const outcome = await new Promise((resolve) => {
+      const deadline = Date.now() + BROKER_READY_DEADLINE_MS;
+      const check = () => {
+        if (existsSync(bootstrapOutputPath)) return resolve("ready");
+        if (proc.exitCode !== null) {
+          const logText = brokerLog.join("");
+          resolve(/EADDRINUSE|address already in use/i.test(logText)
+            ? "bind-failed"
+            : "exited-other");
+          return;
+        }
+        if (Date.now() >= deadline) { resolve("timeout"); return; }
+        setTimeout(check, 100);
+      };
+      check();
+    });
+
+    if (outcome === "ready") {
+      brokerProc = proc;
+      break;
+    }
+    // A deterministic early exit (TLS/config error) will not improve on a
+    // different port — fail fast and surface the broker log.
+    if (outcome === "exited-other") {
+      try { proc.kill("SIGKILL"); } catch {}
+      console.error("Broker stderr:", brokerLog.join(""));
+      throw new Error("broker exited early");
+    }
+    // Transient bind collision or slow start: reap and retry on a fresh port.
+    try { proc.kill("SIGKILL"); } catch {}
+    await new Promise((r) => setTimeout(r, 100));
+    brokerProc = null;
+  }
+  if (brokerProc === null) {
+    console.error("Broker stderr:", brokerLog.join(""));
+    throw new Error(
+      `broker startup failed: no free port after ${MAX_BROKER_BIND_ATTEMPTS} attempts`,
+    );
+  }
   console.log("[setup] broker started on port", brokerPort);
 
   const bootstrapSecret = readFileSync(bootstrapOutputPath, "utf8").trim();

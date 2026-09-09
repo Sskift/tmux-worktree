@@ -16,6 +16,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -28,7 +29,9 @@ import WebSocket from "ws";
 import {
   startInteropTopology,
   spawnInteropHost,
+  startInProcessBroker,
 } from "./internal/relayV2InteropHarness.mjs";
+import { createSelfSignedCertificate } from "./internal/relayV2InteropTls.mjs";
 
 const RESULTS = [];
 const SCENARIO_STATS = [];
@@ -548,6 +551,14 @@ async function waitForHostRegistered(hostRequest, timeoutMs = 20_000) {
     await delay(200);
   }
   throw new Error("host did not reach registered: " + JSON.stringify(last).slice(0, 400));
+}
+
+function hostLogTail(host) {
+  try {
+    return (host?.hostLog ?? []).join("").split("\n")
+      .filter((l) => /bootstrap|activation|provision|reject|https|ECONNREFUSED|ACTIVATION|credential|duplicate|superseded|AUTH/i.test(l))
+      .slice(-6).join(" | ").slice(0, 600);
+  } catch { return ""; }
 }
 
 async function stopScopedTerminalControlDaemon(trustedHome) {
@@ -1385,150 +1396,265 @@ try {
   // -------------------------------------------------------------------------
   // A2 (C024/D009): old owner disconnects while a replacement host is
   // registering. Requires two LIVE host processes sharing hostId with
-  // DISTINCT hostInstanceIds. We attempt to construct that for real:
-  // host1 is the registered topology host; host2 is spawned via
-  // spawnInteropHost with the SAME hostId/profile but a FRESH trusted home
-  // (which yields a fresh hostInstanceId — the broker rebase precondition:
-  // brokerCore.registerHost only 4411 duplicate_connector on the SAME
-  // hostInstanceId, and emits host.registered disposition="replaced" for a
-  // same-hostId/different-instance carrier).
-  //
-  // Measured result (this topology): host2 cannot reach start_connector.
-  // The local-dev broker issues exactly ONE bootstrap secret at startup, and
-  // it is single-use (brokerCredentialAuthority.bootstrapHost: once
-  // terminalReason="consumed", any reuse is rejected AUTH_INVALID). host1
-  // consumes it; host2's credential bootstrap is therefore rejected before
-  // it ever opens a carrier / sends host.hello, so two concurrently
-  // registered carriers sharing hostId cannot be built, and the kill-old-
-  // while-new-registers fault cannot be injected. This is a harness
-  // credential-provisioning limitation; the broker rebase code path itself
-  // is NOT covered here or by A8 (A8's respawn is likewise SKIP).
+  // DISTINCT hostInstanceIds. Constructed for real against an IN-PROCESS
+  // broker (startInProcessBroker): the spawned CLI broker writes exactly ONE
+  // host bootstrap secret which is single-use
+  // (brokerCredentialAuthority.bootstrapHost: once terminalReason="consumed"
+  // any reuse is rejected AUTH_INVALID), so a second host could never
+  // bootstrap against it — the reason this scenario used to SKIP. The
+  // in-process handle exposes the same admin surface the CLI uses once at
+  // startup (handle.admin.createHostBootstrap), letting us issue a FRESH
+  // secret per host. host2 then registers with disposition="replaced"
+  // (brokerCore: same hostId + different hostInstanceId; 4411
+  // duplicate_connector only fires on the SAME hostInstanceId), the broker
+  // force-closes host1's carrier (4409 host_superseded), and the new carrier
+  // commits without a 1013 registration_commit_race. The commit-window rebase
+  // itself is pinned by test/relay-v2-broker-core.test.mjs; this scenario
+  // proves the end-to-end wiring.
   // -------------------------------------------------------------------------
   await scenario("A2", async () => {
-    const t2 = await startIsolatedTopology(extraTopologies, { hostId: "fault-host-a2", label: "fault-a2" });
-    const host1Pid = t2.hostProc.pid;
+    const a2HostId = "fault-host-a2";
+    const a2TmpRoot = mkdtempSync(join(tmpdir(), "relay-v2-fault-a2-"));
+    const a2Tls = createSelfSignedCertificate({ commonName: "localhost" });
+    const a2KeyPath = join(a2TmpRoot, "tls-key.pem");
+    const a2CertPath = join(a2TmpRoot, "tls-cert.pem");
+    writeFileSync(a2KeyPath, a2Tls.key);
+    writeFileSync(a2CertPath, a2Tls.cert);
+    chmodSync(a2KeyPath, 0o600);
+    chmodSync(a2CertPath, 0o600);
+    // Register the tmp root so the shared finally kills scoped tmux sessions
+    // created against this topology and removes the root. Hosts/homes are
+    // registered via extraHosts/extraTrustedHomes and torn down in this
+    // scenario's own finally; the in-process broker has no child process, so
+    // hostProc/brokerProc stay null (terminateChild no-ops on them). The
+    // shared extraTopologies cleanup loop unconditionally joins
+    // hostTrustedHome (outside try/catch), so it must be a string — point it
+    // at a path inside tmpRoot that never exists: stopScopedTerminalControlDaemon
+    // no-ops on missing lock files and rmSync(..., {force:true}) ignores it.
+    extraTopologies.push({
+      tmpRoot: a2TmpRoot,
+      hostTrustedHome: join(a2TmpRoot, "no-host-home"),
+      hostProc: null,
+      brokerProc: null,
+    });
 
-    // Second profile: same hostId, same broker endpoints.
-    const profile2 = {
-      contract: "tmux-worktree-relay-v2-host-production-profile",
-      schemaVersion: 1,
-      hostId: t2.hostId,
-      relayUrl: t2.relayUrl,
-      credentialIssuerUrl: t2.issuerUrl,
-      credentialReference: "relay-v2-host-credential-ref:local-dev",
-      bootstrapSecretReference: "local-dev-bootstrap",
-      refreshSecretReference: "local-dev-refresh",
-    };
-    const profile2Path = join(t2.tmpRoot, "host-profile-2.json");
-    writeFileSync(profile2Path, JSON.stringify(profile2));
-    chmodSync(profile2Path, 0o600);
-
-    // Spawn host2 with a FRESH trusted home (fresh hostInstanceId). Let the
-    // harness allocate the home, then register it for teardown.
+    let broker = null;
+    let host1 = null;
     let host2 = null;
-    let host2Home = null;
-    let stage2 = "not-attempted";
-    let evidence2 = "";
-    const host2LogTail = () => {
-      try {
-        return (host2?.hostLog ?? []).join("").split("\n")
-          .filter((l) => /bootstrap|activation|provision|reject|https|ECONNREFUSED|ACTIVATION|credential|duplicate/i.test(l))
-          .slice(-6).join(" | ").slice(0, 600);
-      } catch { return ""; }
+    let topoView = null;
+
+    // The host production profile requires the ROOT wss/https origins
+    // (exactRootUrl); the host appends the /client carrier path itself
+    // (hostCarrier dashboardManagementUrl). broker.relayUrl carries the
+    // /client carrier endpoint clients use, so derive the root here. Called
+    // only after broker is up.
+    const writeHostProfile = (path) => {
+      writeFileSync(path, JSON.stringify({
+        contract: "tmux-worktree-relay-v2-host-production-profile",
+        schemaVersion: 1,
+        hostId: a2HostId,
+        relayUrl: `wss://127.0.0.1:${broker.port}/`,
+        credentialIssuerUrl: `https://127.0.0.1:${broker.port}/`,
+        credentialReference: "relay-v2-host-credential-ref:local-dev",
+        bootstrapSecretReference: "local-dev-bootstrap",
+        refreshSecretReference: "local-dev-refresh",
+      }));
+      chmodSync(path, 0o600);
     };
+    const writeSecretFile = (path, secret) => {
+      writeFileSync(path, secret);
+      chmodSync(path, 0o600);
+    };
+
     try {
-      host2 = spawnInteropHost({
-        tlsCertPath: t2.tlsCertPath,
-        profilePath: profile2Path,
-        bootstrapSecretPath: t2.bootstrapSecretPath,
-      });
-      host2Home = host2.hostTrustedHome;
-      extraTrustedHomes.add(host2Home);
-      extraHosts.add(host2.hostProc);
-      const host2Pid = host2.hostProc.pid;
       try {
-        await host2.ready;
-        stage2 = "dashboard-ready";
+        broker = await startInProcessBroker({
+          tlsKeyPath: a2KeyPath,
+          tlsCertificatePath: a2CertPath,
+        });
       } catch (error) {
-        stage2 = "activation-failed";
-        evidence2 = `ready=${error.message.slice(0, 120)}; ${host2LogTail()}`;
-      }
-      if (stage2 === "dashboard-ready") {
-        const boot = await host2.hostRequest("bootstrap_host")
-          .catch((e) => ({ ok: false, error: { message: e.message } }));
-        const start = await host2.hostRequest("start_connector")
-          .catch((e) => ({ ok: false, error: { message: e.message } }));
-        if (boot.ok && start.ok) {
-          const reg = await waitForHostRegistered(host2.hostRequest, 20_000)
-            .then(() => true).catch(() => false);
-          stage2 = reg ? "registered" : "register-failed";
-          if (!reg) evidence2 = `bootstrap ok=${boot.ok} start ok=${start.ok} but never registered; ${host2LogTail()}`;
-        } else {
-          stage2 = "connector-start-failed";
-          evidence2 = `bootstrap ok=${boot.ok}(${JSON.stringify(boot.error ?? "").slice(0, 120)}) start ok=${start.ok}(${JSON.stringify(start.error ?? "").slice(0, 160)}); ${host2LogTail()}`;
-        }
-      }
-      const host2Exit = host2.hostExitCode();
-      evidence2 += `; host2Pid=${host2Pid} exitCode=${host2Exit}`;
-
-      const host1Alive = t2.hostExitCode() === null;
-      let host1Registered = false;
-      try {
-        const st1 = await t2.hostRequest("status");
-        host1Registered = st1.ok && st1.result?.connector?.status === "registered";
-      } catch {}
-
-      // Record the construction attempt honestly. If host2 never reaches a
-      // live carrier that is a harness credential-provisioning limitation
-      // (single-use bootstrap secret), not a product regression — surface it
-      // as a SKIP note, not a FAIL. The real rebase fault is asserted below
-      // only when host2 actually registers.
-      record("A2 dual-host registration rebase (C024/D009)", true,
-        `SKIP: host1Pid=${host1Pid}(alive=${host1Alive},registered=${host1Registered}), host2Stage=${stage2}; ${evidence2}`);
-
-      if (stage2 !== "registered") {
+        // Fallback per spec: if the in-process broker cannot be brought up,
+        // report SKIP with the concrete reason rather than failing the suite.
         return skip(
-          `C024/D009 registration rebase not constructible in local-dev topology: `
-          + `host2 (same hostId=${t2.hostId}, fresh home=fresh hostInstanceId) never reached a live carrier `
-          + `(stage="${stage2}"; ${evidence2}). `
-          + `The broker rebase path exists (brokerCore.registerHost: same hostId + different hostInstanceId -> host.registered disposition="replaced"; 4411 duplicate_connector only on the SAME hostInstanceId), `
-          + `but the local-dev broker hands out exactly ONE single-use bootstrap secret which host1 consumes, so host2's credential bootstrap is rejected (AUTH_INVALID) before it can send host.hello. `
-          + `Two concurrently-registered carriers sharing hostId cannot be built here; this path is NOT covered by A8 either (A8 respawn is itself SKIP).`,
+          `C024/D009 registration rebase not constructible: in-process broker `
+          + `failed to start (${error?.message ?? error}). The rebase commit `
+          + `window itself is covered by test/relay-v2-broker-core.test.mjs `
+          + `(replaced disposition, no 1013, BUSY fail-closed).`,
         );
       }
 
-      // --- Reachable only if host2 registered: inject the real rebase fault.
-      // Kill host1 hard while host2 is the registering/new owner.
-      await terminateChild(t2.hostProc, { closeInput: true });
-      await delay(4_000);
+      // --- host1: fresh secret -> spawn -> bootstrap -> register.
+      const secret1Path = join(a2TmpRoot, "host-bootstrap-1.txt");
+      writeSecretFile(secret1Path, await broker.issueHostBootstrap());
+      const profile1Path = join(a2TmpRoot, "host-profile-1.json");
+      writeHostProfile(profile1Path);
+
+      host1 = spawnInteropHost({
+        tlsCertPath: a2CertPath,
+        profilePath: profile1Path,
+        bootstrapSecretPath: secret1Path,
+      });
+      extraHosts.add(host1.hostProc);
+      extraTrustedHomes.add(host1.hostTrustedHome);
+      await host1.ready;
+      const boot1 = await host1.hostRequest("bootstrap_host");
+      if (!boot1.ok) throw new Error("host1 bootstrap failed: " + JSON.stringify(boot1.error));
+      const start1 = await host1.hostRequest("start_connector");
+      if (!start1.ok) throw new Error("host1 connector start failed: " + JSON.stringify(start1.error));
+      await waitForHostRegistered(host1.hostRequest, 20_000);
+
+      // --- Enroll + redeem a client credential against host1's broker.
+      const enrollResp = await host1.hostRequest("create_enrollment", { deviceLabel: "fault-a2" });
+      if (!enrollResp.ok || enrollResp.result.enrollment.status !== "active") {
+        throw new Error("A2 enrollment creation failed: "
+          + JSON.stringify(enrollResp.error ?? enrollResp.result?.enrollment));
+      }
+      const enrollment = enrollResp.result.enrollment.review.enrollment;
+      const clientInstanceId = "fault-a2-" + Math.random().toString(36).slice(2, 12);
+      const redeemResp = await fetch(`${broker.issuerUrl}v2/enrollments/redeem`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        body: JSON.stringify({
+          exchangeAttemptId: "exchange-" + Math.random().toString(36).slice(2, 12),
+          enrollmentId: enrollment.enrollmentId,
+          enrollmentCode: enrollment.enrollmentCode,
+          clientInstanceId,
+          deviceLabel: "fault-a2",
+        }),
+        ca: a2Tls.cert,
+      });
+      if (!redeemResp.ok) {
+        const body = await redeemResp.text().catch(() => "");
+        throw new Error(`A2 enrollment redeem failed: ${redeemResp.status} ${body.slice(0, 200)}`);
+      }
+      const clientCreds = await redeemResp.json();
+      topoView = {
+        tls: a2Tls,
+        tmpRoot: a2TmpRoot,
+        hostId: a2HostId,
+        clientInstanceId,
+        clientCreds,
+        issuerUrl: broker.issuerUrl,
+        relayUrl: broker.relayUrl,
+        clientRelayUrl: broker.clientRelayUrl,
+      };
+
+      // --- host2: SAME hostId, FRESH trusted home (fresh hostInstanceId),
+      // FRESH single-use bootstrap secret. Its host.hello queues
+      // host.registered disposition="replaced"; on commit the broker
+      // force-closes host1's carrier (4409 host_superseded) and host2 becomes
+      // the single active owner — the C024/D009 rebase.
+      const secret2Path = join(a2TmpRoot, "host-bootstrap-2.txt");
+      writeSecretFile(secret2Path, await broker.issueHostBootstrap());
+      const profile2Path = join(a2TmpRoot, "host-profile-2.json");
+      writeHostProfile(profile2Path);
+
+      host2 = spawnInteropHost({
+        tlsCertPath: a2CertPath,
+        profilePath: profile2Path,
+        bootstrapSecretPath: secret2Path,
+      });
+      extraHosts.add(host2.hostProc);
+      extraTrustedHomes.add(host2.hostTrustedHome);
+
+      let host2Stage = "not-attempted";
+      let evidence2 = "";
+      try {
+        await host2.ready;
+        const boot2 = await host2.hostRequest("bootstrap_host")
+          .catch((e) => ({ ok: false, error: { message: e.message } }));
+        const start2 = await host2.hostRequest("start_connector")
+          .catch((e) => ({ ok: false, error: { message: e.message } }));
+        if (boot2.ok && start2.ok) {
+          const reg = await waitForHostRegistered(host2.hostRequest, 25_000)
+            .then(() => true)
+            .catch((e) => { evidence2 = e.message.slice(0, 160); return false; });
+          host2Stage = reg ? "registered" : "register-failed";
+          if (!reg) evidence2 += `; ${hostLogTail(host2)}`;
+        } else {
+          host2Stage = "connector-start-failed";
+          evidence2 = `bootstrap ok=${boot2.ok}(${JSON.stringify(boot2.error ?? "").slice(0, 120)}) `
+            + `start ok=${start2.ok}(${JSON.stringify(start2.error ?? "").slice(0, 160)}); ${hostLogTail(host2)}`;
+        }
+      } catch (error) {
+        host2Stage = "activation-failed";
+        evidence2 = `${error.message.slice(0, 120)}; ${hostLogTail(host2)}`;
+      }
+      evidence2 += `; host2Pid=${host2.hostProc.pid} exitCode=${host2.hostExitCode()}`;
+
+      let host1StillRegistered = false;
+      try {
+        const st1 = await host1.hostRequest("status");
+        host1StillRegistered = st1.ok && st1.result?.connector?.status === "registered";
+      } catch {}
+
+      record("A2 dual-host registration rebase (C024/D009)", host2Stage === "registered",
+        `host1Pid=${host1.hostProc.pid}(alive=${host1.hostExitCode() === null},stillRegistered=${host1StillRegistered}), `
+        + `host2Pid=${host2.hostProc.pid} stage=${host2Stage}; ${evidence2}`);
+
+      if (host2Stage !== "registered") {
+        throw new Error(
+          `A2 host2 (same hostId=${a2HostId}, fresh home=fresh hostInstanceId, fresh bootstrap secret) `
+          + `never reached registered: stage="${host2Stage}"; ${evidence2}`,
+        );
+      }
+
+      // Let the directory converge, then kill host1 hard. host2 must stay the
+      // sole registered owner and a fresh client must get a terminal with no
+      // 1013 registration_commit_race.
+      await delay(2_000);
+      await terminateChild(host1.hostProc, { closeInput: true });
+      await delay(3_000);
+
       let host2StillRegistered = false;
       try {
         const st2 = await host2.hostRequest("status");
         host2StillRegistered = st2.ok && st2.result?.connector?.status === "registered";
       } catch {}
-      const client = track(await openClient(t2));
+
+      const client = track(await openClient(topoView));
       let clientOk = false;
       let clientDetail = "";
+      let saw1013 = false;
       try {
         await discoverScope(client);
-        const sid = await createTerminal(client, t2.tmpRoot, "a2-after-rebase");
+        const sid = await createTerminal(client, a2TmpRoot, "a2-after-rebase");
         const opened = await openTerminalStream(client, { sessionId: sid }, { maxAttempts: 10 });
         clientOk = opened.response?.type === "terminal.opened";
         clientDetail = opened.response?.type ?? opened.response?.error?.code;
+        saw1013 = client.drainEvents((f) => {
+          const code = f?.closeCode ?? f?.payload?.closeCode ?? f?.error?.code;
+          return code === 1013 || f?.payload?.reason === "registration_commit_race";
+        }).length > 0;
       } catch (error) {
         clientDetail = error.message.slice(0, 150);
       } finally {
         client.close();
       }
-      const rebaseOk = host2StillRegistered && clientOk;
+
+      const rebaseOk = host2StillRegistered && clientOk && !saw1013;
       record("A2 old-owner kill during registration converges to single host (C024/D009)", rebaseOk,
-        `host1Killed=${t2.hostExitCode()}, host2Registered=${host2StillRegistered}, clientOpen=${clientOk}(${clientDetail})`);
+        `host1Killed=${host1.hostExitCode()}, host2Registered=${host2StillRegistered}, `
+        + `clientOpen=${clientOk}(${clientDetail}), clientSaw1013=${saw1013}`);
       if (!rebaseOk) throw new Error("A2 rebase assertion failed: " + clientDetail);
-      return `host2Registered=${host2StillRegistered} clientOpen=${clientOk}`;
+      return `host2Registered=${host2StillRegistered} clientOpen=${clientOk} saw1013=${saw1013}`;
     } finally {
-      if (host2 && host2.hostExitCode() === null) {
-        try { await host2.hostRequest("stop_connector"); } catch {}
+      // Hosts down first (clean connector stop, then process kill, daemon +
+      // detached segment-writer sweep), then the in-process broker. The shared
+      // finally reaps anything left via extraHosts/extraTrustedHomes and
+      // removes a2TmpRoot via the extraTopologies entry.
+      for (const h of [host2, host1]) {
+        if (h && h.hostExitCode() === null) {
+          try { await h.hostRequest("stop_connector"); } catch {}
+        }
       }
+      for (const h of [host2, host1]) {
+        if (!h) continue;
+        try { await terminateChild(h.hostProc, { closeInput: true }); } catch {}
+        try { await stopScopedTerminalControlDaemon(h.hostTrustedHome); } catch {}
+        await killProcessesReferencingHome(h.hostTrustedHome);
+      }
+      if (broker) { try { await broker.close(); } catch {} }
     }
   });
 
