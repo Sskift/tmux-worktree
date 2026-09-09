@@ -37,6 +37,9 @@ const configuredSelfHosted: MobileRelayV2SelfHostedStatus = {
   remoteTlsCaPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/ca.pem",
   remoteProfilePath: "~/.tmux-worktree/relay-v2-self-hosted/deployment-profile-v1.json",
   remoteStateDirectory: "~/.tmux-worktree/relay-v2-self-hosted/state",
+  runningBundleVersion: "1.0.24",
+  centerVersionStale: false,
+  dashboardBundleVersion: "1.0.24",
   error: null,
 };
 

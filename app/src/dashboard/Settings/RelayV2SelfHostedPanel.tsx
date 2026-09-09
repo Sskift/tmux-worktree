@@ -23,6 +23,7 @@ import {
 import {
   createRelayV2SelfHostedDraft,
   relayV2ExpiredBootstrapRotationAvailable,
+  relayV2SelfHostedCenterVersionNotice,
   relayV2SelfHostedDraftMatchesStatus,
   relayV2SelfHostedStatusLabel,
   type RelayV2SelfHostedDraft,
@@ -230,6 +231,11 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           </span>
         </div>
       )}
+      {status?.centerVersionStale && (
+        <div className="connections-notice connections-notice--pending" role="status">
+          <span>{relayV2SelfHostedCenterVersionNotice(status)}</span>
+        </div>
+      )}
       <p className="connections-relay-v2-deployment__hint">
         Enter the devbox&apos;s private IPv4 explicitly. Using 0.0.0.0 is an
         explicit opt-in to listen on every interface.{" "}
@@ -251,6 +257,12 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           <span>{notice || status?.error}</span>
         </div>
       )}
+      <p className="connections-relay-v2-deployment__hint">
+        Deploy publishes the bundle to the devbox and, when the Center is
+        running, restarts it onto the new code so broker fixes take effect.
+        Phone relay connections drop briefly during the restart and reconnect
+        automatically.
+      </p>
       <div className="connections-actions connections-actions--relay">
         <button
           type="button"
@@ -264,7 +276,8 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
         <button
           type="button"
           className="connections-button"
-          disabled={locked || running}
+          disabled={locked}
+          title="Publish the bundle to the devbox and restart a running Relay v2 Center onto it. Phone relay connections drop briefly and reconnect automatically."
           onClick={() => void run("deploy")}
         >
           {operation === "deploy" ? <LoaderCircle className="connections-spin" size={14} /> : <Server size={14} />}

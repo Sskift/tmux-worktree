@@ -217,6 +217,20 @@ export function relayV2SelfHostedConnectorDesiredRunning(
   return status?.connectorDesiredRunning === true;
 }
 
+/**
+ * A running Center on an older bundle (or one started before version tracking
+ * existed) keeps serving the old broker code until Deploy restarts it onto the
+ * freshly published `current` symlink. This returns the human-readable warning
+ * line for that state, or null when the Center is current/stopped.
+ */
+export function relayV2SelfHostedCenterVersionNotice(
+  status: MobileRelayV2SelfHostedStatus | null,
+): string | null {
+  if (!status?.centerVersionStale) return null;
+  const running = status.runningBundleVersion ?? "an older version";
+  return `Center is running ${running}; Dashboard ships ${status.dashboardBundleVersion}. Deploy restarts the Center so the new code takes effect (phone connections drop briefly and reconnect).`;
+}
+
 export function relayV2SelfHostedStackLabel(
   status: MobileRelayV2SelfHostedStatus | null,
 ): string {

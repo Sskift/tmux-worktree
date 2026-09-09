@@ -10,6 +10,7 @@ import type { MobileRelayV2SelfHostedStatus } from "../src/platform/domainTypes.
 import type { MobileRelayV2SelfHostedDeploymentPort } from "../src/platform/dashboardBackend.ts";
 import { createFakeDashboardBackend } from "../src/platform/fakeBackend.ts";
 import { RelayV2SelfHostedPanel } from "../src/dashboard/Settings/RelayV2SelfHostedPanel.tsx";
+import { relayV2SelfHostedCenterVersionNotice } from "../src/dashboard/Settings/relayV2SelfHostedModel.ts";
 import {
   createRelayV2SelfHostedPanelController,
   createRelayV2SelfHostedRequestGate,
@@ -45,6 +46,9 @@ function savedStatus(config: MobileRelayV2SelfHostedConfigInput): MobileRelayV2S
     remoteTlsCaPath: "",
     remoteProfilePath: "",
     remoteStateDirectory: "",
+    runningBundleVersion: null,
+    centerVersionStale: false,
+    dashboardBundleVersion: "1.0.24",
     error: null,
   };
 }
@@ -265,4 +269,93 @@ test("C035: panel renders through the dashboard backend provider", () => {
   );
   assert.match(markup, /Relay v2 · self-hosted/);
   assert.match(markup, /HTTPS Relay URL/);
+});
+
+function deploymentStatus(
+  overrides: Partial<MobileRelayV2SelfHostedStatus> = {},
+): MobileRelayV2SelfHostedStatus {
+  return {
+    ...savedStatus(savedConfig),
+    centerStatus: "running",
+    hostCredentialProvisioned: true,
+    runningBundleVersion: "1.0.23",
+    centerVersionStale: true,
+    dashboardBundleVersion: "1.0.24",
+    ...overrides,
+  };
+}
+
+test("deploy: success notice says the running Center was restarted onto the new bundle", async () => {
+  const result = deploymentStatus({ runningBundleVersion: "1.0.24", centerVersionStale: false });
+  const deployment: MobileRelayV2SelfHostedDeploymentPort = {
+    status: async () => result,
+    saveConfig: async () => result,
+    deploy: async () => result,
+    startCenter: async () => result,
+    rotateExpiredHostBootstrap: async () => result,
+    stopCenter: async () => result,
+  };
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {});
+  controller.update("enabled", true);
+  controller.update("brokerHostId", "devbox-old");
+  controller.update("issuerUrl", "https://old-relay.example.com/");
+  controller.update("listenHost", "10.0.0.1");
+  controller.update("externalTlsManagement", true);
+  await controller.run("deploy");
+  assert.match(controller.state.notice ?? "", /published/);
+  assert.match(
+    controller.state.notice ?? "",
+    /Center was restarted onto the new bundle/,
+  );
+});
+
+test("deploy: no restart claim when the Center was not running", async () => {
+  const stopped = deploymentStatus({ centerStatus: "stopped" });
+  const deployment: MobileRelayV2SelfHostedDeploymentPort = {
+    status: async () => stopped,
+    saveConfig: async () => stopped,
+    deploy: async () => stopped,
+    startCenter: async () => stopped,
+    rotateExpiredHostBootstrap: async () => stopped,
+    stopCenter: async () => stopped,
+  };
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {});
+  controller.update("enabled", true);
+  controller.update("brokerHostId", "devbox-old");
+  controller.update("issuerUrl", "https://old-relay.example.com/");
+  controller.update("listenHost", "10.0.0.1");
+  controller.update("externalTlsManagement", true);
+  await controller.run("deploy");
+  assert.match(controller.state.notice ?? "", /published/);
+  assert.doesNotMatch(controller.state.notice ?? "", /restarted/);
+});
+
+test("stale status from the deploy/mount probe carries the deploy-to-restart notice the panel renders", async () => {
+  // The panel is a thin shell over this controller (its effects can't run under
+  // renderToStaticMarkup); a status published here is exactly what the panel
+  // mirrors into React state and renders via relayV2SelfHostedCenterVersionNotice.
+  const stale = deploymentStatus();
+  const deployment: MobileRelayV2SelfHostedDeploymentPort = {
+    status: async () => stale,
+    saveConfig: async () => stale,
+    deploy: async () => stale,
+    startCenter: async () => stale,
+    rotateExpiredHostBootstrap: async () => stale,
+    stopCenter: async () => stale,
+  };
+  let publishes = 0;
+  const controller = createRelayV2SelfHostedPanelController(deployment, () => {
+    publishes += 1;
+  });
+  controller.mount();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.ok(publishes > 0, "the mount probe must publish the stale status into panel state");
+  assert.equal(controller.state.status?.centerVersionStale, true);
+  assert.equal(controller.state.status?.runningBundleVersion, "1.0.23");
+  // The exact node the panel renders inside its stale-notice container.
+  const notice = relayV2SelfHostedCenterVersionNotice(controller.state.status);
+  assert.match(notice ?? "", /Center is running 1\.0\.23/);
+  assert.match(notice ?? "", /Dashboard ships 1\.0\.24/);
+  assert.match(notice ?? "", /Deploy restarts the Center/);
 });

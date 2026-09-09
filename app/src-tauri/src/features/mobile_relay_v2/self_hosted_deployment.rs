@@ -33,6 +33,13 @@ const REMOTE_PROFILE_SCHEMA_VERSION: u32 = 1;
 const FEATURE_KIND: &str = "explicit_self_hosted";
 const CENTER_SESSION: &str = "tw-relay-v2-center";
 const REMOTE_ROOT: &str = ".tmux-worktree/relay-v2-self-hosted";
+/// Records the bundle version the live Center process was started from.
+/// Written atomically by the center-start script right after the tmux session
+/// comes up (the launcher execs `current/cli.cjs`, so this is the code the
+/// process actually runs), and removed by the center-stop script. The probe
+/// reads it to detect a Center still running an older bundle after a Deploy
+/// swapped the `current` symlink.
+const REMOTE_CENTER_RUNNING_VERSION_FILE: &str = "center.running-version";
 const REMOTE_TLS_KEY: &str = ".tmux-worktree/relay-v2-self-hosted/tls/tls.key";
 const REMOTE_TLS_CERTIFICATE: &str = ".tmux-worktree/relay-v2-self-hosted/tls/tls.crt";
 const REMOTE_TLS_CA: &str = ".tmux-worktree/relay-v2-self-hosted/tls/ca.pem";
@@ -446,6 +453,16 @@ pub(crate) struct MobileRelayV2SelfHostedStatus {
     remote_tls_ca_path: String,
     remote_profile_path: String,
     remote_state_directory: String,
+    /// Bundle version the live remote Center process was started from, read
+    /// from `center.running-version` during the probe. `None` for a stopped
+    /// center or one started by an older Dashboard that never wrote the file.
+    running_bundle_version: Option<String>,
+    /// True while a running Center is not on this Dashboard's bundle version
+    /// (including a Center started before version tracking existed): Deploy
+    /// restarts it onto the new code.
+    center_version_stale: bool,
+    /// The bundle version this Dashboard ships and deploys.
+    dashboard_bundle_version: String,
     error: Option<String>,
 }
 
@@ -2147,6 +2164,9 @@ fn base_status(
         remote_tls_ca_path: format!("~/{REMOTE_TLS_CA}"),
         remote_profile_path: format!("~/{REMOTE_PROFILE}"),
         remote_state_directory: format!("~/{REMOTE_STATE_DIRECTORY}"),
+        running_bundle_version: None,
+        center_version_stale: false,
+        dashboard_bundle_version: env!("CARGO_PKG_VERSION").to_string(),
         error,
     }
 }
@@ -2239,9 +2259,9 @@ else
   printf 'bundle=missing\n'
 fi
 {tls_probe}
-if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n'; else printf 'center=stopped\n'; fi
+{center_probe}
 "#,
-        remote_tmux_cmd(&host),
+        center_probe = build_remote_center_status_probe_snippet(&remote_tmux_cmd(&host)),
     );
     match run_remote_cmd_check_strings(&host, &["sh".into(), "-lc".into(), script]) {
         Ok(output) => {
@@ -2270,12 +2290,23 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n
                     }
                     "center=running" => status.center_status = DeploymentProbeStatus::Running,
                     "center=stopped" => status.center_status = DeploymentProbeStatus::Stopped,
-                    _ => {}
+                    _ => {
+                        if let Some(version) = line.strip_prefix("center-version=") {
+                            let version = version.trim();
+                            if valid_center_running_version(version) {
+                                status.running_bundle_version = Some(version.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
         Err(error) => status.error = Some(error),
     }
+    status.center_version_stale = center_running_version_is_stale(
+        status.center_status,
+        status.running_bundle_version.as_deref(),
+    );
     if config.external_tls_management && status.tls_status == DeploymentProbeStatus::Ready {
         let chain_ready = local_host_ca_input_path().is_ok_and(|path| {
             read_local_private_file(
@@ -3154,6 +3185,54 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf running; else pri
     Ok(output == "running")
 }
 
+/// Probe snippet (runs with the probe script's `set -u`, inside the relay
+/// layout where `$root` is defined): reports the tmux session state and, when
+/// the Center is running, the bundle version its process was started from. The
+/// version file is written by the start script and removed by the stop script;
+/// a running Center without it predates version tracking. The version is
+/// whitelisted to `[0-9A-Za-z._-]` so the probe output line can never carry
+/// injected characters.
+fn build_remote_center_status_probe_snippet(tmux: &str) -> String {
+    format!(
+        r#"if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then
+  printf 'center=running\n'
+  running_version_file="$root/{REMOTE_CENTER_RUNNING_VERSION_FILE}"
+  if test -f "$running_version_file"; then
+    center_running_version="$(head -n 1 "$running_version_file" 2>/dev/null | tr -d '\r\n')"
+    case "$center_running_version" in
+      '' | *[!0-9A-Za-z._-]*) ;;
+      *) printf 'center-version=%s\n' "$center_running_version" ;;
+    esac
+  fi
+else
+  printf 'center=stopped\n'
+fi
+"#
+    )
+}
+
+/// A running Center is stale (running old broker code) when its recorded
+/// version differs from this Dashboard's bundle version. A running Center with
+/// no version file was started by an older Dashboard that never recorded one,
+/// so it cannot be on the current bundle either; a stopped/unknown Center is
+/// never stale (nothing is running).
+fn center_running_version_is_stale(
+    center_status: DeploymentProbeStatus,
+    running_version: Option<&str>,
+) -> bool {
+    center_status == DeploymentProbeStatus::Running
+        && running_version != Some(env!("CARGO_PKG_VERSION"))
+}
+
+/// Mirror of the probe script's whitelist: accept only non-empty version
+/// strings made of `[0-9A-Za-z._-]`.
+fn valid_center_running_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn remote_bootstrap_is_available(
     host: &HostConfig,
     config: &PersistedSelfHostedConfig,
@@ -3432,6 +3511,7 @@ fn start_center_with_pending_rotation_output(
     );
     let tmux = remote_tmux_cmd(&host);
     let state_directory_preflight = build_remote_state_directory_launcher_preflight();
+    let center_version = env!("CARGO_PKG_VERSION");
     let script = format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
 set -eu
@@ -3469,7 +3549,12 @@ if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then exit 0; fi
 {tmux} new-session -d -s {CENTER_SESSION} "\"{launcher}\""
 sleep 1
 {tmux} has-session -t {CENTER_SESSION}
+# Record the bundle version the live Center process exec'd (the launcher runs
+# "$root/current/cli.cjs"). Only reached after the session postcondition above,
+# so a failed start never refreshes the record of a previously running process.
+{running_version_publish}
 "#,
+        running_version_publish = build_remote_center_running_version_publish(center_version),
         launcher_security_functions = REMOTE_SECURITY_FUNCTIONS,
         bootstrap_output_guard = bootstrap_attempt
             .as_ref()
@@ -3513,6 +3598,109 @@ fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
     start_center_with_pending_rotation_output(config, false)
 }
 
+/// Shell fragment (runs inside the center-start script, where `$root` is
+/// defined) that best-effort publishes the bundle version the live Center
+/// process exec'd, after the tmux session postcondition already held. This is
+/// observability only — the Center's liveness is the `has-session` check above
+/// — so a marker write failure must never turn a successful start into an
+/// error: the probe conservatively reads a missing marker (a Center started
+/// before version tracking) as stale instead.
+fn build_remote_center_running_version_publish(version: &str) -> String {
+    format!(
+        r#"running_version_stage="$root/.{REMOTE_CENTER_RUNNING_VERSION_FILE}.$$"
+if printf '%s\n' {version} > "$running_version_stage" 2>/dev/null \
+   && chmod 600 "$running_version_stage" 2>/dev/null \
+   && mv -Tf "$running_version_stage" "$root/{REMOTE_CENTER_RUNNING_VERSION_FILE}" 2>/dev/null; then
+  :
+else
+  rm -f -- "$running_version_stage" 2>/dev/null || true
+fi
+"#,
+        version = shell_quote(version),
+    )
+}
+
+/// Restart the remote Center onto the freshly published bundle. The publish
+/// only atomically swaps the `current` symlink; a live Center keeps exec'ing
+/// the old bundle's `cli.cjs`, so without this every broker-side fix shipped
+/// by Deploy stayed silently inactive until a manual Stop + Start.
+///
+/// - No Center running → nothing happens (Deploy never starts a stopped
+///   Center; that is the explicit Start action / watchdog path).
+/// - Center running → stop the tmux session and start it again from the new
+///   `current`. Phone WSS connections drop briefly and self-heal via the
+///   mobile relay reconnect path.
+///
+/// Desired-state semantics: `connector_desired_running=true` is latched BEFORE
+/// the stop, so if the stop succeeds but the start fails, the Center is stopped
+/// but wanted and the D020 watchdog (deterministic Stopped → StartRemote)
+/// retries the remote start with bounded backoff. A user-initiated Stop always
+/// persists desired=false first, so this latch can never revive an
+/// intentionally stopped Center. Deterministic start refusals (a pending
+/// bootstrap rotation) are checked BEFORE the stop so a running Center is never
+/// killed when the restart could not have been attempted.
+///
+/// Returns `true` when a Center was actually restarted. The closures mirror the
+/// real functions so the ordering and desired-state latch are unit-testable
+/// without SSH.
+fn restart_running_center_after_deploy_with<
+    IsRunning,
+    EnsureStartAllowed,
+    PersistDesired,
+    Stop,
+    Start,
+>(
+    config: &mut PersistedSelfHostedConfig,
+    mut is_running: IsRunning,
+    mut ensure_start_allowed: EnsureStartAllowed,
+    mut persist_desired_running: PersistDesired,
+    mut stop_center: Stop,
+    mut start_center: Start,
+) -> Result<bool, String>
+where
+    IsRunning: FnMut() -> Result<bool, String>,
+    EnsureStartAllowed: FnMut(&PersistedSelfHostedConfig) -> Result<(), String>,
+    PersistDesired: FnMut(&mut PersistedSelfHostedConfig, bool) -> Result<(), String>,
+    Stop: FnMut(&PersistedSelfHostedConfig) -> Result<(), String>,
+    Start: FnMut(&mut PersistedSelfHostedConfig) -> Result<(), String>,
+{
+    if !is_running()? {
+        return Ok(false);
+    }
+    if let Err(error) = ensure_start_allowed(config) {
+        // Deterministic refusal (a pending bootstrap rotation): leave the
+        // running Center on the old bundle rather than killing it ahead of a
+        // start that could not run; the explicit rotate / Start flow recovers.
+        return Err(format!(
+            "Relay v2 bundle deployed, but the running Center was left untouched: {error}"
+        ));
+    }
+    persist_desired_running(config, true)?;
+    stop_center(config)?;
+    if let Err(error) = start_center(config) {
+        return Err(format!(
+            "Relay v2 bundle deployed; the running Center was stopped to load it but could not be \
+             restarted: {error}. The Center stays marked as wanted and its start is retried \
+             automatically (or press Start v2 Relay Center)."
+        ));
+    }
+    Ok(true)
+}
+
+fn restart_running_center_after_deploy(
+    host: &HostConfig,
+    config: &mut PersistedSelfHostedConfig,
+) -> Result<bool, String> {
+    restart_running_center_after_deploy_with(
+        config,
+        || center_is_running(host),
+        ensure_ordinary_center_start_allowed,
+        persist_connector_desired_running,
+        stop_center,
+        start_center,
+    )
+}
+
 fn build_remote_center_stop_script(tmux: &str) -> String {
     format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
@@ -3525,6 +3713,10 @@ else
   center_has_session_status=$?
 fi
 test "$center_has_session_status" -eq 1
+# The session is provably gone, so no process is running this bundle anymore;
+# drop the running-version record so the probe never reports a live version
+# for a stopped Center.
+rm -f -- "$HOME/{REMOTE_ROOT}/{REMOTE_CENTER_RUNNING_VERSION_FILE}"
 "#,
     )
 }
@@ -3841,7 +4033,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_deploy(
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
         let (previous, config) = validated_config_with_persisted_state(args, true)?;
-        let config = save_config_replacement_after_management_barrier(
+        let mut config = save_config_replacement_after_management_barrier(
             &mut owner,
             management.as_ref(),
             previous,
@@ -3853,6 +4045,12 @@ pub(crate) async fn mobile_relay_v2_self_hosted_deploy(
         // the chain is available.
         deploy_bundle(&app, &config)?;
         prepare_local_host_prerequisites_for(&config)?;
+        // Publish only swaps the `current` symlink: a live Center keeps running
+        // the old bundle until it is restarted. Restart it under the operation
+        // lock so the new code actually takes effect; no restart happens when no
+        // Center is running. On stop-success/start-failure the error surfaces
+        // here and the persisted desired=true lets the watchdog retry.
+        restart_running_center_after_deploy(&find_host(&config.broker_host_id)?, &mut config)?;
         Ok(probe_status(&config))
     })
     .await
@@ -4074,31 +4272,35 @@ mod tests {
     use super::{
         base_status, bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
-        build_remote_bundle_stage_validation_script, build_remote_center_stop_script,
+        build_remote_bundle_stage_validation_script, build_remote_center_running_version_publish,
+        build_remote_center_status_probe_snippet, build_remote_center_stop_script,
         build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
-        certificate_bodies, commit_bootstrap_ready_state, commit_config_replacement_with_barrier,
-        consumed_local_private_file_path, deployment_fingerprint, ensure_host_profile_identity,
-        ensure_ordinary_center_start_allowed, ensure_self_contained_ca_chain,
-        finish_consuming_if_present, fresh_bootstrap_publication_correlation,
-        load_ready_commit_journal_at, next_connector_watchdog_retry_delay, normalize_issuer_url,
+        center_running_version_is_stale, certificate_bodies, commit_bootstrap_ready_state,
+        commit_config_replacement_with_barrier, consumed_local_private_file_path,
+        deployment_fingerprint, ensure_host_profile_identity, ensure_ordinary_center_start_allowed,
+        ensure_self_contained_ca_chain, finish_consuming_if_present,
+        fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
+        next_connector_watchdog_retry_delay, normalize_issuer_url,
         persisted_management_config_identity, read_local_private_file,
         ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
         relay_url_from_issuer, remote_center_repair_action,
-        self_hosted_connector_should_be_running,
+        restart_running_center_after_deploy_with, self_hosted_connector_should_be_running,
         self_hosted_connector_should_survive_dashboard_window_close,
         stop_center_and_active_connector, valid_bootstrap_publication_correlation,
-        validate_bootstrap_bytes, validate_listen_host, verify_rotation_transfer_identity,
-        verify_rotation_transfer_receipt_local_at, BootstrapRotationRequestPhase,
-        BootstrapRotationTransferPhase, BootstrapRotationTransferReceipt, DeploymentProbeStatus,
-        LocalPrivateFileIdentity, PersistedSelfHostedConfig, ReadyCommitJournal,
-        RemoteCenterRepairAction, SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
+        valid_center_running_version, validate_bootstrap_bytes, validate_listen_host,
+        verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
+        BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
+        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
+        PersistedSelfHostedConfig, ReadyCommitJournal, RemoteCenterRepairAction,
+        SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
         BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
         CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
         HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
         READY_COMMIT_JOURNAL_CONTRACT, READY_COMMIT_JOURNAL_SCHEMA_VERSION,
-        REMOTE_BOOTSTRAP_FD_READER, ROTATION_PENDING_CONFIG_SCHEMA_VERSION,
-        ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
+        REMOTE_BOOTSTRAP_FD_READER, REMOTE_CENTER_RUNNING_VERSION_FILE,
+        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
+    use std::cell::RefCell;
     use std::time::Duration;
 
     #[test]
@@ -4570,8 +4772,6 @@ mod tests {
 
     #[test]
     fn center_stop_without_an_active_management_child_still_runs_the_remote_barrier() {
-        use std::cell::RefCell;
-
         let events = RefCell::new(Vec::new());
         stop_center_and_active_connector(
             None,
@@ -4587,6 +4787,245 @@ mod tests {
         .unwrap();
 
         assert_eq!(events.into_inner(), ["remote_absence_barrier"]);
+    }
+
+    #[test]
+    fn deploy_restarts_a_running_center_and_ends_with_desired_running_true() {
+        let events = RefCell::new(Vec::<&str>::new());
+        let mut config = config();
+        config.connector_desired_running = false;
+
+        let restarted = restart_running_center_after_deploy_with(
+            &mut config,
+            || {
+                events.borrow_mut().push("is_running:yes");
+                Ok(true)
+            },
+            |_| {
+                events.borrow_mut().push("ensure_start_allowed:ok");
+                Ok(())
+            },
+            |config, desired| {
+                events.borrow_mut().push("persist_desired:true");
+                assert!(desired);
+                config.connector_desired_running = desired;
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("stop_center");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("start_center");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(restarted);
+        assert_eq!(
+            events.into_inner(),
+            [
+                "is_running:yes",
+                "ensure_start_allowed:ok",
+                "persist_desired:true",
+                "stop_center",
+                "start_center",
+            ]
+        );
+        // The latch is durable on the config so the watchdog treats the center
+        // as wanted even though it was briefly stopped during the restart.
+        assert!(config.connector_desired_running);
+    }
+
+    #[test]
+    fn deploy_stop_success_start_failure_returns_err_and_keeps_the_center_wanted() {
+        let events = RefCell::new(Vec::new());
+        let mut config = config();
+        config.connector_desired_running = false;
+
+        let result = restart_running_center_after_deploy_with(
+            &mut config,
+            || Ok(true),
+            |_| Ok(()),
+            |config, desired| {
+                config.connector_desired_running = desired;
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("stop_center");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("start_center");
+                Err("remote tmux new-session failed".to_string())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("could not be restarted"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("marked as wanted"),
+            "error must tell the operator the watchdog will retry: {error}"
+        );
+        assert_eq!(events.into_inner(), ["stop_center", "start_center"]);
+        // stop succeeded and start failed: the Center is down but desired=true
+        // must be latched so D020 (Stopped -> StartRemote) retries the start.
+        assert!(
+            config.connector_desired_running,
+            "desired must remain true after a stop-success/start-failure restart"
+        );
+    }
+
+    #[test]
+    fn deploy_does_not_touch_a_center_that_is_not_running() {
+        let events = RefCell::new(Vec::<&str>::new());
+        let mut config = config();
+        config.connector_desired_running = false;
+
+        let restarted = restart_running_center_after_deploy_with(
+            &mut config,
+            || {
+                events.borrow_mut().push("is_running:no");
+                Ok(false)
+            },
+            |_| {
+                events.borrow_mut().push("ensure_start_allowed");
+                Ok(())
+            },
+            |_, _desired| {
+                events.borrow_mut().push("persist_desired");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("stop_center");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("start_center");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!restarted);
+        assert_eq!(events.into_inner(), ["is_running:no"]);
+        // A stopped center is never started or latched by Deploy.
+        assert!(!config.connector_desired_running);
+    }
+
+    #[test]
+    fn deploy_leaves_a_running_center_untouched_when_the_restart_start_is_refused() {
+        let events = RefCell::new(Vec::<&str>::new());
+        let mut config = config();
+        config.bootstrap_rotation_pending = true;
+        config.connector_desired_running = true;
+
+        let result = restart_running_center_after_deploy_with(
+            &mut config,
+            || Ok(true),
+            |_| Err("Relay v2 Host bootstrap rotation must be completed".to_string()),
+            |_, _desired| {
+                events.borrow_mut().push("persist_desired");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("stop_center");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("start_center");
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("was left untouched"), "{error}");
+        // The deterministic refusal happens before any mutation: never kill a
+        // running center ahead of a start that could not have run.
+        assert!(events.into_inner().is_empty());
+        assert!(config.connector_desired_running);
+    }
+
+    #[test]
+    fn center_status_probe_reports_the_running_version_through_a_whitelist() {
+        let snippet = build_remote_center_status_probe_snippet("/usr/bin/tmux");
+        assert!(snippet.contains("has-session -t tw-relay-v2-center"));
+        assert!(snippet.contains("printf 'center=running\\n'"));
+        assert!(snippet.contains("printf 'center=stopped\\n'"));
+        assert!(snippet.contains(REMOTE_CENTER_RUNNING_VERSION_FILE));
+        // The version line is only emitted after a whitelist case, so a hostile
+        // version file can never inject probe output.
+        assert!(snippet.contains("printf 'center-version=%s\\n'"));
+        assert!(snippet.contains("*[!0-9A-Za-z._-]*"));
+    }
+
+    #[test]
+    fn center_start_publishes_the_running_version_and_stop_removes_it() {
+        let publish = build_remote_center_running_version_publish("1.0.24");
+        assert!(publish.contains("printf '%s\\n' '1.0.24'"));
+        assert!(publish.contains("chmod 600"));
+        assert!(publish.contains(REMOTE_CENTER_RUNNING_VERSION_FILE));
+        // Atomic rename: never leave a partial version the probe could read.
+        assert!(publish.contains("mv -Tf"));
+
+        let stop = build_remote_center_stop_script("/usr/bin/tmux");
+        let postcondition = stop
+            .find("test \"$center_has_session_status\" -eq 1")
+            .unwrap();
+        // The version record is removed only AFTER the absent-session
+        // postcondition, so a still-alive center never loses its record.
+        assert!(stop[postcondition..]
+            .contains(&format!("rm -f -- \"$HOME/.tmux-worktree/relay-v2-self-hosted/{REMOTE_CENTER_RUNNING_VERSION_FILE}\"")));
+    }
+
+    #[test]
+    fn center_running_version_stale_logic_matches_the_deploy_semantics() {
+        // Running + different version -> stale.
+        assert!(center_running_version_is_stale(
+            DeploymentProbeStatus::Running,
+            Some("1.0.23"),
+        ));
+        // Running + current version -> fresh.
+        assert!(!center_running_version_is_stale(
+            DeploymentProbeStatus::Running,
+            Some(env!("CARGO_PKG_VERSION")),
+        ));
+        // Running with no recorded version (started by an older Dashboard that
+        // never wrote one) is conservatively stale: a Deploy restart is the
+        // only way to know it runs the current bundle.
+        assert!(center_running_version_is_stale(
+            DeploymentProbeStatus::Running,
+            None,
+        ));
+        // Nothing running -> never stale.
+        assert!(!center_running_version_is_stale(
+            DeploymentProbeStatus::Stopped,
+            None,
+        ));
+        assert!(!center_running_version_is_stale(
+            DeploymentProbeStatus::Unknown,
+            Some("0.0.1"),
+        ));
+    }
+
+    #[test]
+    fn center_running_version_validation_mirrors_the_shell_whitelist() {
+        for valid in ["1.0.24", "1.0.24-rc.1", "2.0.0_beta-3"] {
+            assert!(valid_center_running_version(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "1.0.24\ncenter=running",
+            "1.0 24",
+            "v1;rm -rf /",
+            "v1/2",
+        ] {
+            assert!(!valid_center_running_version(invalid), "{invalid}");
+        }
     }
 
     #[test]
