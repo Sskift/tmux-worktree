@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import test from "node:test";
 
 const { FeishuBridge, extractFeishuMarkedReply, feishuTurnMarkers } = await import("../dist/feishuBridge.js");
@@ -21,6 +21,7 @@ const {
 } = await import("../dist/canonicalTerminalControlClient.js");
 const {
   LarkCliBridgeAdapter,
+  LARK_CLI_READY_TIMEOUT_CODE,
   larkCliCommandArgs,
   parseFeishuChatPage,
   parseFeishuBotOpenId,
@@ -739,7 +740,9 @@ function harness(options = {}) {
 // a cleanup handle. The fake implements just enough of `event consume` to
 // drive the real LarkCliBridgeAdapter.subscribe(): it emits the stderr
 // `[event] ready event_key=<key>` marker for a healthy subscribe, or a JSON
-// error envelope + non-zero exit (without any marker) for a setup failure.
+// error envelope + non-zero exit (without any marker) for a setup failure,
+// or stays alive forever WITHOUT the marker (an old lark-cli that predates
+// the ready contract / a hung setup) for a ready-timeout.
 // Behavior is selected by FAKE_LARK_MODE so the bridge (which spawns
 // lark-cli inheriting process.env) gets a deterministic child.
 function installFakeLarkCli() {
@@ -750,6 +753,9 @@ const mode = process.env.FAKE_LARK_MODE || "healthy";
 const args = process.argv.slice(2);
 const isConsume = args.includes("event") && args[args.indexOf("event") + 1] === "consume";
 if (!isConsume) { process.exit(0); }
+if (process.env.FAKE_LARK_START_LOG) {
+  try { require("node:fs").appendFileSync(process.env.FAKE_LARK_START_LOG, process.pid + "\\n"); } catch {}
+}
 if (mode === "fail-setup") {
   process.stderr.write(JSON.stringify({
     ok: false,
@@ -757,6 +763,11 @@ if (mode === "fail-setup") {
       message: "auth failure: missing token" },
   }) + "\\n");
   setTimeout(() => process.exit(3), 15);
+} else if (mode === "stale-no-marker") {
+  // Old / hung lark-cli: the process launches and stays alive (stdin is a pipe
+  // held open by the bridge) but never emits the [event] ready marker, so the
+  // bridge's ready watchdog must time out, classify, and kill it.
+  process.stderr.write("[event] listening for events (legacy binary, no ready marker)\\n");
 } else {
   process.stderr.write("[event] ready event_key=im.message.receive_v1\\n");
   if (process.env.FAKE_LARK_EMIT_EVENT === "1") {
@@ -775,9 +786,11 @@ setInterval(() => {}, 1_000_000);
   return {
     binPath,
     setMode(mode) { process.env.FAKE_LARK_MODE = mode; },
+    setStartLog(path) { process.env.FAKE_LARK_START_LOG = path; },
     restore() {
       process.env.PATH = previousPath;
       delete process.env.FAKE_LARK_MODE;
+      delete process.env.FAKE_LARK_START_LOG;
       rmSync(binDir, { recursive: true, force: true });
     },
   };
@@ -3957,6 +3970,111 @@ test("real lark-cli child resolves ready only after the stderr marker and stream
   } finally {
     delete process.env.FAKE_LARK_EMIT_EVENT;
     fake.restore();
+  }
+});
+
+test("a lark-cli child that never emits the ready marker times out, is killed, and classifies the cause", async () => {
+  // Regression for the ready-forever-pending hang: an old lark-cli (or one
+  // that renamed the marker / hung during setup) stays alive but never prints
+  // `[event] ready`. Before the watchdog, `consumer.ready` never settled,
+  // health stayed on 'starting', the Link action stayed disabled, and the user
+  // saw only a generic failure with no upgrade hint. The ready watchdog must
+  // reject ready (and done) with a classified LARK_CLI_TOO_OLD error carrying an
+  // actionable upgrade message, and must kill the child so no process leaks.
+  const fake = installFakeLarkCli();
+  fake.setMode("stale-no-marker");
+  try {
+    const adapter = new LarkCliBridgeAdapter({ readyTimeoutMs: 300 });
+    const events = [];
+    const sub = adapter.subscribe((event) => { events.push(event); return Promise.resolve(); });
+    assert.ok(sub.child.pid, "the lark-cli child was spawned");
+    const childPid = sub.child.pid;
+    const readyError = await sub.ready.then(
+      () => { throw new Error("ready must reject for a marker-less child"); },
+      (error) => error,
+    );
+    assert.equal(readyError.code, LARK_CLI_READY_TIMEOUT_CODE);
+    assert.match(readyError.message, /did not report readiness within 300ms/);
+    assert.match(readyError.message, /lark-cli --version/);
+    assert.match(readyError.message, /upgrade/);
+    // `done` rejects with the same classified error (not a generic SIGTERM).
+    await assert.rejects(sub.done, (error) =>
+      error?.code === LARK_CLI_READY_TIMEOUT_CODE);
+    assert.deepEqual(events, []);
+    // The watchdog must kill the child so no process leaks across restarts.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    let alive = false;
+    try { process.kill(childPid, 0); alive = true; } catch {}
+    assert.equal(alive, false, `timed-out lark-cli child pid=${childPid} must be killed`);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("ready-timeout keeps the daemon alive in bounded backoff with the actionable error", async () => {
+  // Server-level companion: a persistent too-old lark-cli must NOT abort start
+  // (the daemon stays up so the Dashboard feishu panel can show the upgrade
+  // error), health reads 'backoff' with the classified message, and the
+  // bounded-backoff counter drives retries rather than a reconnect storm.
+  const fake = installFakeLarkCli();
+  fake.setMode("stale-no-marker");
+  const startLog = join(mkdtempSync(join(tmpdir(), "tw-fake-lark-pids-")), "pids.log");
+  fake.setStartLog(startLog);
+  const h = harness();
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+    larkReadyTimeoutMs: 200,
+  });
+  const loggedPids = () =>
+    (existsSync(startLog) ? readFileSync(startLog, "utf8") : "")
+      .split("\n").filter(Boolean).map(Number);
+  const waitForSpawns = async (minimum, deadlineMs) => {
+    const start = Date.now();
+    while (Date.now() - start < deadlineMs) {
+      if (loggedPids().length >= minimum) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  try {
+    await server.start(); // must NOT reject on a ready-timeout
+    // The first child is spawned synchronously by start(); wait for it to log.
+    await waitForSpawns(1, 2_000);
+    // First ready-timeout fires after ~200ms; give it time to settle into
+    // backoff and schedule the bounded retry.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const snapshot = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
+    assert.equal(snapshot.eventConsumer.state, "backoff",
+      "a marker-less lark-cli must surface as backoff, never stuck on starting/running");
+    assert.match(snapshot.eventConsumer.error ?? "", /did not report readiness within/);
+    assert.match(snapshot.eventConsumer.error ?? "", /lark-cli --version/);
+    assert.ok(loggedPids().length >= 1, "at least one lark-cli child was spawned");
+    // Bounded backoff must not storm: with a 200ms ready-timeout, an unbounded
+    // retry loop would re-spawn the child ~5x/sec (and the old storm measured
+    // ~25/sec). Bounded backoff (0ms, then 250ms, 500ms, 1s, ... capped at 4s)
+    // yields only a handful of spawns over the observation window.
+    const spawnsAtWindowStart = loggedPids().length;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const spawns = loggedPids().length;
+    assert.ok(spawns - spawnsAtWindowStart <= 4,
+      `ready-timeout failures must back off, not reconnect-storm (${spawns - spawnsAtWindowStart} extra spawns in 2s; total ${spawns})`);
+    const later = await new FeishuBridgeClient(h.paths.socket).request("bridge.snapshot", {});
+    assert.equal(later.eventConsumer.state, "backoff");
+    assert.match(later.eventConsumer.error ?? "", /did not report readiness within/);
+    // Every spawned child must have been killed by the watchdog (no leak).
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const pid of loggedPids()) {
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; } catch {}
+      assert.equal(alive, false, `ready-timeout child pid=${pid} must be killed, not leaked`);
+    }
+  } finally {
+    await server.stop();
+    fake.restore();
+    rmSync(h.root, { recursive: true, force: true });
+    rmSync(dirname(startLog), { recursive: true, force: true });
   }
 });
 

@@ -13,7 +13,7 @@ import { dirname } from "node:path";
 import packageMetadata from "../package.json";
 import { FeishuBridge, type CreateFeishuBindingInput } from "./feishuBridge.js";
 import { FeishuBridgeStore, exactKeys, feishuBridgePaths, isRecord, processExists, type FeishuBridgePaths } from "./feishuBridgeStorage.js";
-import { LarkCliBridgeAdapter, type FeishuEventSubscription, type FeishuLarkAdapter } from "./larkCliBridge.js";
+import { LarkCliBridgeAdapter, LARK_CLI_READY_TIMEOUT_CODE, type FeishuEventSubscription, type FeishuLarkAdapter } from "./larkCliBridge.js";
 import {
   CanonicalTerminalControlSocketClient,
   type CanonicalTerminalControlClient,
@@ -392,12 +392,14 @@ export class FeishuBridgeServer {
     lark?: FeishuLarkAdapter;
     larkProfile?: string;
     botOpenId?: string;
+    larkReadyTimeoutMs?: number;
   } = {}): Promise<FeishuBridgeServer> {
     const paths = options.paths ?? feishuBridgePaths();
     const control = options.control ?? new CanonicalTerminalControlSocketClient();
     const larkProfile = options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE ?? "";
     const lark = options.lark ?? new LarkCliBridgeAdapter({
       profile: larkProfile || undefined,
+      ...(options.larkReadyTimeoutMs !== undefined ? { readyTimeoutMs: options.larkReadyTimeoutMs } : {}),
     });
     const bridge = new FeishuBridge({
       control,
@@ -486,7 +488,15 @@ export class FeishuBridgeServer {
 
   private async startConsumer(): Promise<void> {
     if (this.stopping) return;
-    this.bridge.setEventConsumerHealth("starting");
+    // Only the genuine first subscription reads as the optimistic 'starting'.
+    // A bounded-backoff retry (attempts > 0) must leave health at 'backoff'
+    // with the prior actionable error (e.g. "lark-cli too old") instead of
+    // clobbering it back to 'starting' for the duration of each ready-wait —
+    // otherwise a persistent ready-timeout would oscillate starting<->backoff
+    // and hide the upgrade hint from the Dashboard feishu panel.
+    if (this.consumerRestartAttempts === 0) {
+      this.bridge.setEventConsumerHealth("starting");
+    }
     this.consumer = this.lark.subscribe((event) => this.bridge.handleEvent(event));
     const consumer = this.consumer;
     // A stability timer from a previous consumer must not outlive it.
@@ -535,9 +545,10 @@ export class FeishuBridgeServer {
       // ready resolves only on lark-cli's `[event] ready event_key=<key>`
       // stderr marker, i.e. once the subscription is actually established —
       // not on the child 'spawn' event. It rejects on a pre-ready setup
-      // failure (auth exit 3, network/handshake exit 4, validation exit 2)
-      // or when the child never spawned (ENOENT): no fake 'running' is
-      // published for those.
+      // failure (auth exit 3, network/handshake exit 4, validation exit 2),
+      // when the child never spawned (ENOENT), or when the child stays alive
+      // but never reports readiness within the watchdog window (an lark-cli
+      // too old to emit the marker): no fake 'running' is published for those.
       await consumer.ready;
       if (!this.stopping && this.consumer === consumer) {
         this.bridge.setEventConsumerHealth("running");
@@ -553,14 +564,19 @@ export class FeishuBridgeServer {
         this.consumerStabilityTimer = stabilityTimer;
       }
     } catch (error) {
-      // Deterministic startup/setup failure: propagate so the *initial*
-      // start() aborts (the supervisor reports the real cause, matching the
-      // ENOENT semantics). On a restart attempt the rejection is caught by
-      // the restart callback, which leaves health in 'backoff'; the
-      // done.finally handler schedules the bounded retry.
       const message = error instanceof Error ? error.message : String(error);
+      // A ready-timeout (lark-cli too old / hung) is a persistent condition,
+      // not a crash-worthy setup failure: the child is already killed by the
+      // watchdog, and `done` rejects with the same classified error so the
+      // bounded-restart loop keeps retrying (and surfaces the upgrade message
+      // via 'backoff' health). Keep the daemon running so the Dashboard can
+      // show the actionable error; deterministic spawn/setup failures (ENOENT,
+      // auth exit 3, ...) still abort the *initial* start() to report the real
+      // cause, matching the existing semantics.
+      const isReadyTimeout = error instanceof Error
+        && (error as { code?: string }).code === LARK_CLI_READY_TIMEOUT_CODE;
       this.bridge.setEventConsumerHealth("backoff", message);
-      throw error;
+      if (!isReadyTimeout) throw error;
     }
   }
 }

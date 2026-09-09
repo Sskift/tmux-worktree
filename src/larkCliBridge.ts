@@ -6,6 +6,26 @@ import type { FeishuReplyCard } from "./feishuReplyCard.js";
 const MAX_LARK_OUTPUT_BYTES = 1024 * 1024;
 const LARK_COMMAND_TIMEOUT_MS = 15_000;
 const MAX_FEISHU_GROUP_PAGES = 100;
+// lark-cli emits a `[event] ready event_key=<key>` line on stderr once the
+// subscription is actually established (the lark-event skill contract). The
+// real binary (1.0.93) prints it within ~1.3s locally; a slow network or auth
+// handshake can stretch setup to ~10s. Wait 15s before concluding the
+// installed lark-cli is too old (predating the marker) or hung: long enough to
+// never false-trip on a healthy-but-slow start, short enough to fail fast with
+// an actionable upgrade error instead of leaving `ready` pending and the
+// health state stuck on 'starting' forever.
+const LARK_READY_TIMEOUT_MS = 15_000;
+// Oldest lark-cli verified to emit the ready marker. There is no feature flag
+// to introspect, so this is the floor we have actually measured.
+const LARK_CLI_MIN_READY_VERSION = "1.0.93";
+// After a ready-timeout SIGTERM, escalate to SIGKILL if the child ignores it,
+// so a hung/old binary can never leak a process across restart cycles.
+const LARK_READY_KILL_GRACE_MS = 2_000;
+// Classified failure code for a child that stays alive but never reports the
+// ready marker (old lark-cli, renamed marker, or a hung setup). The bridge
+// supervisor keeps the daemon running in bounded backoff (rather than aborting)
+// so the Dashboard can surface this actionable message.
+export const LARK_CLI_READY_TIMEOUT_CODE = "LARK_CLI_TOO_OLD";
 
 export interface FeishuInboundEvent {
   type: "im.message.receive_v1";
@@ -335,15 +355,18 @@ export function parseFeishuBotOpenId(value: unknown): string {
 export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   private readonly profile?: string;
   private readonly runner: (args: string[]) => Promise<unknown>;
+  private readonly readyTimeoutMs: number;
   private botIdentityCache?: FeishuBotIdentity;
 
   constructor(options: {
     profile?: string;
     runner?: (args: string[]) => Promise<unknown>;
+    readyTimeoutMs?: number;
   } = {}) {
     if (options.profile !== undefined) larkCliCommandArgs([], options.profile);
     this.profile = options.profile;
     this.runner = options.runner ?? runLark;
+    this.readyTimeoutMs = options.readyTimeoutMs ?? LARK_READY_TIMEOUT_MS;
   }
 
   private commandArgs(args: string[]): string[] {
@@ -401,14 +424,49 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
       readyResolve = resolve;
       readyReject = reject;
     });
+    // Ready watchdog: if the child stays alive but never emits the ready marker
+    // within the window (an old lark-cli that predates the marker contract, a
+    // renamed marker, or a hung setup), fail ready with a classified, actionable
+    // error and kill the child so the supervisor's bounded backoff drives
+    // retries instead of hanging on 'starting' forever.
+    let readyTimedOut: Error | undefined;
+    let readyTimer: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearReadyTimer = () => {
+      if (readyTimer) { clearTimeout(readyTimer); readyTimer = undefined; }
+      if (killTimer) { clearTimeout(killTimer); killTimer = undefined; }
+    };
+    readyTimer = setTimeout(() => {
+      if (readyResolved) return;
+      const deadline = this.readyTimeoutMs >= 1000
+        ? `${Math.round(this.readyTimeoutMs / 1000)}s`
+        : `${this.readyTimeoutMs}ms`;
+      const error = new Error(
+        `lark-cli did not report readiness within ${deadline}. `
+        + `It may be too old to emit the ready event (need >= ${LARK_CLI_MIN_READY_VERSION}, verified). `
+        + "Run `lark-cli --version` and upgrade lark-cli.",
+      ) as Error & { code?: string };
+      error.code = LARK_CLI_READY_TIMEOUT_CODE;
+      readyTimedOut = error;
+      failReady(error);
+      try { child.kill("SIGTERM"); } catch {}
+      // Escalate if SIGTERM is ignored, so the child never leaks.
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+      }, LARK_READY_KILL_GRACE_MS);
+      killTimer.unref();
+    }, this.readyTimeoutMs);
+    readyTimer.unref();
     const markReady = () => {
       if (readyResolved) return;
       readyResolved = true;
+      clearReadyTimer();
       readyResolve();
     };
     const failReady = (error: Error) => {
       if (readyResolved) return;
       readyResolved = true;
+      clearReadyTimer();
       readyReject(error);
     };
 
@@ -433,11 +491,21 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
         // Spawn failure (e.g. ENOENT): the child never launched. Surface the
         // deterministic cause so the caller can distinguish it from a setup
         // failure of a child that did spawn.
+        clearReadyTimer();
         failReady(error);
         reject(error);
       });
       child.once("exit", (code, signal) => {
+        clearReadyTimer();
         void chain.finally(() => {
+          if (readyTimedOut) {
+            // The ready watchdog killed the child: surface the classified
+            // timeout error on `done` as well. The SIGTERM we sent would
+            // otherwise read as a graceful stop and overwrite the actionable
+            // health message with a generic "consumer exited".
+            reject(readyTimedOut);
+            return;
+          }
           const graceful = code === 0 || signal === "SIGTERM" || signal === "SIGINT";
           if (graceful) {
             // Exit before the ready marker (e.g. SIGTERM during startup) must
@@ -462,6 +530,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
       ready,
       done,
       stop() {
+        clearReadyTimer();
         try { child.kill("SIGTERM"); } catch {}
       },
     };
