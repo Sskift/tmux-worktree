@@ -10,6 +10,7 @@ export default defineConfig({
     "src/createTargetObservationV1.ts",
     "src/session.ts",
     "src/state.ts",
+    "src/stateFileArtifacts.ts",
     "src/twDashboardBootstrap.ts",
     "src/twDashboardCli.ts",
     "src/relayHost.ts",

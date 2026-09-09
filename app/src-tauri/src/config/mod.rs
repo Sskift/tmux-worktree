@@ -52,11 +52,26 @@ impl Drop for DashboardConfigFileLock {
 const DASHBOARD_CONFIG_LOCK_OWNER_FILE: &str = "owner.json";
 const DASHBOARD_CONFIG_LOCK_STALE_MS: u64 = 60_000;
 
+/// Lock-holder record written to `<lock>/owner.json`.
+///
+/// The on-disk shape is shared with the Node CLI/relay implementation:
+/// `src/state.ts` `ManagedStateLockOwnerRecord` and `src/hosts.ts`
+/// `ConfigLockOwnerRecord` write the same `owner` / `createdAt` /
+/// `pid` camelCase fields. `pid` defaults to absent so owner records
+/// written by older builds (every released version, including all Node
+/// versions before the pid gate) still deserialize.
+///
+/// If this lock format or the stale rules below ever change, the Node
+/// side MUST be updated in lockstep (see `managedStateLockIsStale` /
+/// `configLockIsStale`); mixed-version Dashboard and CLI processes
+/// contend for these same directories.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DashboardConfigLockOwner {
     pub(crate) owner: String,
     pub(crate) created_at: u64,
+    #[serde(default)]
+    pub(crate) pid: Option<u32>,
 }
 
 fn dashboard_config_lock_owner_path(path: &Path) -> PathBuf {
@@ -75,10 +90,28 @@ fn dashboard_config_lock_now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn dashboard_config_lock_is_stale(path: &Path) -> bool {
+/// Stale rules, mirrored verbatim from Node `managedStateLockIsStale`
+/// (src/state.ts) / `configLockIsStale` (src/hosts.ts):
+/// - A record younger than DASHBOARD_CONFIG_LOCK_STALE_MS is always held
+///   (the holder is inside the normal write window).
+/// - An older record carrying a live holder pid is NEVER reclaimed by age.
+///   On an NFS home or across sleep/resume a real holder can be stalled
+///   far past 60s; stealing its lock makes its pending write lost. ESRCH
+///   (dead pid) is the only age-independent reclaim trigger for new records.
+/// - An older pid-less record (all released builds) self-heals purely by
+///   age as before, so a SIGKILL/power-loss leftover lock cannot wedge
+///   every future writer until the directory is removed by hand.
+pub(crate) fn dashboard_config_lock_is_stale(path: &Path) -> bool {
     if let Some(record) = read_dashboard_config_lock_owner(path) {
-        return dashboard_config_lock_now_ms().saturating_sub(record.created_at)
-            > DASHBOARD_CONFIG_LOCK_STALE_MS;
+        if dashboard_config_lock_now_ms().saturating_sub(record.created_at)
+            <= DASHBOARD_CONFIG_LOCK_STALE_MS
+        {
+            return false;
+        }
+        return match record.pid {
+            Some(pid) => !crate::support::process_exists(pid),
+            None => true,
+        };
     }
     std::fs::metadata(path)
         .ok()
@@ -132,6 +165,7 @@ pub(crate) fn acquire_dashboard_file_lock(
                 let record = DashboardConfigLockOwner {
                     owner: owner.clone(),
                     created_at: dashboard_config_lock_now_ms(),
+                    pid: Some(std::process::id()),
                 };
                 if let Err(error) = write_dashboard_config_lock_owner(&path, &record) {
                     let _ = std::fs::remove_dir_all(&path);

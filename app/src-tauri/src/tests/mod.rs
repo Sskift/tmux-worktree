@@ -5,11 +5,11 @@ use super::{
     classify_dashboard_layout, cleanup_pending_worktrees, config_worktree_base,
     config_worktree_base_with_home, create_local_terminal_via_runtime,
     create_local_worktree_via_runtime, create_remote_terminal_via_tw_rpc, create_remote_worktree,
-    dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
-    delete_worktree_blocking, derive_session_name, ensure_terminal_session,
-    fetchable_project_paths, find_host, finish_git_fetch_target, git_fetch_args, git_graph_for,
-    git_graph_refs_for, hosts_from_config, install_host_tw_from_source,
-    invalidate_host_status_cache, is_git_worktree_dir,
+    dashboard_config_lock_is_stale, dashboard_layout_window_is_restorable, default_worktree_base,
+    delete_automation_from_list, delete_worktree_blocking, derive_session_name,
+    ensure_terminal_session, fetchable_project_paths, find_host, finish_git_fetch_target,
+    git_fetch_args, git_graph_for, git_graph_refs_for, hosts_from_config,
+    install_host_tw_from_source, invalidate_host_status_cache, is_git_worktree_dir,
     json_number_texts_semantically_equal_for_test, kill_legacy_plain_terminal, kill_legacy_session,
     layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
     list_orphaned_worktrees, load_automations_from_disk, load_hosts, load_layout_from_path,
@@ -22,18 +22,18 @@ use super::{
     restore_local_worktree_via_runtime, run_remote_tmux_check, run_remote_tw_check,
     save_automation, save_hosts_config, save_layout_to_path, save_pending_cleanup, save_terminals,
     scp_cli_command, select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
-    ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
-    trigger_automation_with_creator, try_cleanup_remote_worktree, try_cleanup_worktree,
-    tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
-    user_bin_search_paths, validate_ssh_host_fields, worktree_has_uncommitted_changes,
-    worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
-    AutomationRun, AutomationRunInFlight, AutomationStatus, AutomationTriggerType,
-    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
-    DashboardLayoutClassification, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
-    GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
-    LocalTwRpcRuntime, OrphanedWorktree, Project, RemoveMissingProjectArgs, RestoreArgs,
-    SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT,
-    GIT_FETCH_INTERVAL_SECONDS, REQUIRED_TW_RPC_CAPABILITIES,
+    ssh_host_candidates_from_config_text, stable_output_signature, sweep_state_file_artifacts,
+    test_host, tmux_session_exists, trigger_automation_with_creator, try_cleanup_remote_worktree,
+    try_cleanup_worktree, tw_rpc_capabilities_compatible, update_host_config,
+    upsert_automation_from_input, user_bin_search_paths, validate_ssh_host_fields,
+    worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs, AgentProbeResult,
+    Automation, AutomationOverlap, AutomationRun, AutomationRunInFlight, AutomationStatus,
+    AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
+    DashboardConfigLockOwner, DashboardLayoutClassification, DeleteWorktreeArgs,
+    EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind,
+    HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project,
+    RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
+    AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS, REQUIRED_TW_RPC_CAPABILITIES,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -3815,9 +3815,12 @@ fn stale_config_lock_owner_cannot_release_the_replacement_lock() {
 
     let first = acquire_dashboard_config_file_lock().expect("first config lock");
     let lock_path = first.path.clone();
+    // created_at=0 + no pid simulates a legacy pid-less lock left by
+    // a released build; the age gate still reclaims it.
     let stale_record = DashboardConfigLockOwner {
         owner: first.owner.clone(),
         created_at: 0,
+        pid: None,
     };
     fs::write(
         lock_path.join("owner.json"),
@@ -4723,4 +4726,258 @@ Host jump-proxy
         ids,
         vec!["remote-dev", "build-cloud", "ssh-host", "gpu-worker"]
     );
+}
+
+// ---------- state-file locks: pid stale gate + artifact sweep ----------
+
+#[cfg(unix)]
+fn set_mtime_seconds_ago(path: &Path, seconds_ago: i64) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        - seconds_ago;
+    let times = [
+        libc::timeval {
+            tv_sec: target,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: target,
+            tv_usec: 0,
+        },
+    ];
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("cstring path");
+    let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes {}", path.display());
+}
+
+#[cfg(unix)]
+fn write_lock_owner_record(lock: &Path, contents: &str) {
+    fs::create_dir_all(lock).expect("mkdir lock");
+    fs::write(lock.join("owner.json"), contents).expect("write owner.json");
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+}
+
+#[cfg(unix)]
+#[test]
+fn dashboard_lock_reads_legacy_pidless_and_new_pid_records() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let lock = temp.path().join("state.json.lock");
+
+    // Record written by every released build (no pid field) must parse.
+    write_lock_owner_record(&lock, r#"{"owner":"old-1","createdAt":1700000000000}"#);
+    let legacy = read_dashboard_config_lock_owner(&lock).expect("legacy record parses");
+    assert_eq!(legacy.owner, "old-1");
+    assert_eq!(legacy.created_at, 1_700_000_000_000);
+    assert_eq!(legacy.pid, None);
+
+    fs::remove_dir_all(&lock).expect("reset lock dir");
+    let new_record = DashboardConfigLockOwner {
+        owner: "new-1".to_string(),
+        created_at: 1_700_000_001_000,
+        pid: Some(4242),
+    };
+    let text = serde_json::to_string(&new_record).expect("serialize new record");
+    write_lock_owner_record(&lock, &text);
+    let parsed = read_dashboard_config_lock_owner(&lock).expect("new record parses");
+    assert_eq!(parsed.owner, "new-1");
+    assert_eq!(parsed.pid, Some(4242));
+}
+
+#[cfg(unix)]
+#[test]
+fn dashboard_lock_stale_gate_never_steals_from_live_pid() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let lock = temp.path().join("state.json.lock");
+    let old_ms = now_ms().saturating_sub(120_000);
+
+    // Live holder (this process), record older than the 60s age window:
+    // must NOT be stale. Pre-fix this returned stale purely on age and
+    // a contender would remove_dir_all a live holder's lock.
+    write_lock_owner_record(
+        &lock,
+        &format!(
+            r#"{{"owner":"live-old","createdAt":{old_ms},"pid":{}}}"#,
+            std::process::id()
+        ),
+    );
+    assert!(
+        !dashboard_config_lock_is_stale(&lock),
+        "live pid must block age-based reclaim even past 60s"
+    );
+
+    // Live holder, fresh record: not stale.
+    fs::remove_dir_all(&lock).expect("reset lock dir");
+    write_lock_owner_record(
+        &lock,
+        &format!(
+            r#"{{"owner":"live-fresh","createdAt":{},"pid":{}}}"#,
+            now_ms(),
+            std::process::id()
+        ),
+    );
+    assert!(!dashboard_config_lock_is_stale(&lock));
+
+    // Dead holder (a child that has already exited), old record: stale.
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .expect("spawn short-lived child");
+    let dead_pid = child.id();
+    child.wait().expect("child exits");
+    fs::remove_dir_all(&lock).expect("reset lock dir");
+    write_lock_owner_record(
+        &lock,
+        &format!(r#"{{"owner":"dead","createdAt":{old_ms},"pid":{dead_pid}}}"#),
+    );
+    assert!(
+        dashboard_config_lock_is_stale(&lock),
+        "dead pid must be reclaimable immediately"
+    );
+
+    // Legacy pid-less record, old: stale (historical self-heal).
+    fs::remove_dir_all(&lock).expect("reset lock dir");
+    write_lock_owner_record(
+        &lock,
+        &format!(r#"{{"owner":"legacy","createdAt":{old_ms}}}"#),
+    );
+    assert!(
+        dashboard_config_lock_is_stale(&lock),
+        "pid-less old records keep the age gate"
+    );
+
+    // Legacy pid-less record, fresh: not stale.
+    fs::remove_dir_all(&lock).expect("reset lock dir");
+    write_lock_owner_record(
+        &lock,
+        &format!(r#"{{"owner":"legacy-fresh","createdAt":{}}}"#, now_ms()),
+    );
+    assert!(!dashboard_config_lock_is_stale(&lock));
+}
+
+#[cfg(unix)]
+#[test]
+fn sweep_state_file_artifacts_deletes_only_aged_entries() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+    let base = ".tw-dashboard-automations.json";
+    let state = dir.join(base);
+    fs::write(&state, "[]\n").expect("seed state");
+
+    let aged_corrupt = dir.join(format!("{base}.corrupt-100"));
+    let fresh_corrupt = dir.join(format!("{base}.corrupt-200"));
+    let aged_node_tmp = dir.join(format!("{base}.111.aaaa.tmp"));
+    let fresh_node_tmp = dir.join(format!("{base}.222.bbbb.tmp"));
+    let aged_rust_tmp = dir.join(format!(".{base}.tmp-cccc"));
+    let fresh_rust_tmp = dir.join(format!(".{base}.tmp-dddd"));
+    for file in [
+        &aged_corrupt,
+        &fresh_corrupt,
+        &aged_node_tmp,
+        &fresh_node_tmp,
+        &aged_rust_tmp,
+        &fresh_rust_tmp,
+    ] {
+        fs::write(file, b"x").expect("seed artifact");
+    }
+    // Other state files' artifacts and live files must be untouched.
+    let other_corrupt = dir.join("feishu-bindings.json.corrupt-9");
+    let other_tmp = dir.join("feishu-event-dedup.json.1.2.tmp");
+    let lock_dir = dir.join(format!("{base}.lock"));
+    fs::write(&other_corrupt, b"x").expect("seed other corrupt");
+    fs::write(&other_tmp, b"x").expect("seed other tmp");
+    fs::create_dir_all(&lock_dir).expect("seed lock dir");
+
+    set_mtime_seconds_ago(&aged_corrupt, 8 * 24 * 60 * 60);
+    set_mtime_seconds_ago(&fresh_corrupt, 24 * 60 * 60);
+    set_mtime_seconds_ago(&aged_node_tmp, 2 * 60 * 60);
+    set_mtime_seconds_ago(&fresh_node_tmp, 10 * 60);
+    set_mtime_seconds_ago(&aged_rust_tmp, 2 * 60 * 60);
+    set_mtime_seconds_ago(&fresh_rust_tmp, 10 * 60);
+    set_mtime_seconds_ago(&other_corrupt, 8 * 24 * 60 * 60);
+    set_mtime_seconds_ago(&other_tmp, 2 * 60 * 60);
+
+    sweep_state_file_artifacts(&state);
+
+    assert!(!aged_corrupt.exists(), "8-day-old corrupt backup removed");
+    assert!(fresh_corrupt.exists(), "1-day-old corrupt backup kept");
+    assert!(!aged_node_tmp.exists(), "2-hour-old node tmp removed");
+    assert!(fresh_node_tmp.exists(), "10-minute-old node tmp kept");
+    assert!(!aged_rust_tmp.exists(), "2-hour-old rust tmp removed");
+    assert!(fresh_rust_tmp.exists(), "10-minute-old rust tmp kept");
+    assert!(
+        other_corrupt.exists(),
+        "other state file corrupt backup untouched"
+    );
+    assert!(other_tmp.exists(), "other state file tmp untouched");
+    assert!(lock_dir.exists(), "live lock directory untouched");
+    assert!(state.exists(), "live state file untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn automation_load_sweeps_orphans_only_after_successful_parse() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    unsafe {
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+    }
+
+    let state = temp.path().join(".tw-dashboard-automations.json");
+    let aged_corrupt = temp
+        .path()
+        .join(".tw-dashboard-automations.json.corrupt-aged");
+    let aged_tmp = temp.path().join(".tw-dashboard-automations.json.1.abc.tmp");
+
+    // Successful load: aged orphans next to a valid state file get swept.
+    fs::write(&state, "[]\n").expect("valid state");
+    fs::write(&aged_corrupt, b"x").expect("seed corrupt");
+    fs::write(&aged_tmp, b"x").expect("seed tmp");
+    set_mtime_seconds_ago(&aged_corrupt, 8 * 24 * 60 * 60);
+    set_mtime_seconds_ago(&aged_tmp, 2 * 60 * 60);
+    let loaded = load_automations_from_disk().expect("automations load");
+    assert!(loaded.is_empty());
+    assert!(!aged_corrupt.exists(), "sweep runs after successful parse");
+    assert!(
+        !aged_tmp.exists(),
+        "tmp orphan swept after successful parse"
+    );
+
+    // Failed parse: the state is quarantined but pre-existing aged
+    // siblings must NOT be deleted (they may be needed for recovery).
+    fs::write(&state, "{ not json\n").expect("corrupt state");
+    let sibling = temp
+        .path()
+        .join(".tw-dashboard-automations.json.corrupt-sibling");
+    fs::write(&sibling, b"x").expect("seed sibling");
+    set_mtime_seconds_ago(&sibling, 8 * 24 * 60 * 60);
+    let recovered = load_automations_from_disk().expect("corrupt load degrades to empty");
+    assert!(recovered.is_empty());
+    assert!(sibling.exists(), "no sweep on the failed-parse branch");
+    let quarantine_left = std::fs::read_dir(temp.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tw-dashboard-automations.json.corrupt-")
+        });
+    assert!(quarantine_left, "corrupt state was quarantined aside");
+
+    restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+    restore_env("HOME", original_home);
 }

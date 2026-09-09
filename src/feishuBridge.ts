@@ -19,6 +19,7 @@ import {
   FEISHU_REPLY_HISTORY_LIMIT,
   type FeishuActivityWatch,
   type FeishuBinding,
+  type FeishuBridgeStorageNotice,
   type FeishuHandoffRecord,
   type FeishuOutboundReply,
   type FeishuReplyMode,
@@ -86,6 +87,11 @@ export interface FeishuBridgeSnapshot {
     updatedAt: string;
     error?: string;
   };
+  // Corrupt-state quarantine events observed by the storage layer. The
+  // daemon's stderr is discarded when the Dashboard launches it, so
+  // this snapshot field is the only user-visible surface for "a state
+  // file was corrupt and got isolated to <quarantinePath>".
+  storageNotices: FeishuBridgeStorageNotice[];
 }
 
 function nowIso(now: () => number): string {
@@ -412,6 +418,7 @@ export class FeishuBridge {
           ...(reply.error ? { error: reply.error } : {}),
         })),
       eventConsumer: structuredClone(this.eventConsumer),
+      storageNotices: structuredClone(this.store.quarantineNotices),
     };
   }
 

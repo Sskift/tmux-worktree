@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ const {
   readAutomations,
   resolveAutomationTarget,
 } = await import("../dist/automation.js");
+const { sweepStateFileArtifacts } = await import("../dist/stateFileArtifacts.js");
 
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 
@@ -225,4 +226,91 @@ test("torn automations file is quarantined and commands recover (D001)", () => {
   const fresh = readAutomations(path);
   assert.equal(fresh.length, 1);
   assert.equal(fresh[0].instruction, "after recovery");
+});
+
+function ageFile(path, daysAgo = 0, hoursAgo = 0) {
+  const ms = Date.now() - (daysAgo * 24 * 60 * 60 + hoursAgo * 60 * 60) * 1_000;
+  const stamp = new Date(ms);
+  utimesSync(path, stamp, stamp);
+}
+
+test("sweepStateFileArtifacts removes aged corrupt backups and tmp orphans only", () => {
+  const root = tmpDir("tw-auto-sweep-");
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+  const base = ".tw-dashboard-automations.json";
+  const statePath = join(home, base);
+  writeFileSync(statePath, "[]\n");
+
+  const agedCorrupt = join(home, `${base}.corrupt-100`);
+  const freshCorrupt = join(home, `${base}.corrupt-200`);
+  const agedNodeTmp = join(home, `${base}.111.aaaa.tmp`);
+  const freshNodeTmp = join(home, `${base}.222.bbbb.tmp`);
+  const agedRustTmp = join(home, `.${base}.tmp-cccc`);
+  const freshRustTmp = join(home, `.${base}.tmp-dddd`);
+  for (const path of [agedCorrupt, freshCorrupt, agedNodeTmp, freshNodeTmp, agedRustTmp, freshRustTmp]) {
+    writeFileSync(path, "x");
+  }
+  // Sibling state files' artifacts are not in scope.
+  const otherCorrupt = join(home, "feishu-bindings.json.corrupt-9");
+  const otherTmp = join(home, "feishu-event-dedup.json.1.2.tmp");
+  writeFileSync(otherCorrupt, "x");
+  writeFileSync(otherTmp, "x");
+
+  ageFile(agedCorrupt, 8);
+  ageFile(freshCorrupt, 1);
+  ageFile(agedNodeTmp, 0, 2);
+  ageFile(freshNodeTmp, 0, 10 / 60);
+  ageFile(agedRustTmp, 0, 2);
+  ageFile(freshRustTmp, 0, 10 / 60);
+  ageFile(otherCorrupt, 8);
+  ageFile(otherTmp, 0, 2);
+
+  sweepStateFileArtifacts(statePath);
+
+  const entries = new Set(readdirSync(home));
+  assert.equal(entries.has(`${base}.corrupt-100`), false, "8-day corrupt backup removed");
+  assert.equal(entries.has(`${base}.corrupt-200`), true, "1-day corrupt backup kept");
+  assert.equal(entries.has(`${base}.111.aaaa.tmp`), false, "2-hour node tmp removed");
+  assert.equal(entries.has(`${base}.222.bbbb.tmp`), true, "10-minute node tmp kept");
+  assert.equal(entries.has(`.${base}.tmp-cccc`), false, "2-hour rust tmp removed");
+  assert.equal(entries.has(`.${base}.tmp-dddd`), true, "10-minute rust tmp kept");
+  assert.equal(entries.has("feishu-bindings.json.corrupt-9"), true, "other state corrupt untouched");
+  assert.equal(entries.has("feishu-event-dedup.json.1.2.tmp"), true, "other state tmp untouched");
+  assert.equal(entries.has(base), true, "live state file untouched");
+});
+
+test("readAutomations sweeps orphans after successful load but never on failed parse", () => {
+  const root = tmpDir("tw-auto-sweep-load-");
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+  const path = automationStatePath(home);
+  const base = ".tw-dashboard-automations.json";
+
+  // Successful load path: aged orphans next to a valid file go away.
+  writeFileSync(path, "[]\n");
+  const agedCorrupt = join(home, `${base}.corrupt-aged`);
+  const agedTmp = join(home, `${base}.1.abc.tmp`);
+  writeFileSync(agedCorrupt, "x");
+  writeFileSync(agedTmp, "x");
+  ageFile(agedCorrupt, 8);
+  ageFile(agedTmp, 0, 2);
+
+  assert.deepEqual(readAutomations(path), []);
+  const afterSuccess = new Set(readdirSync(home));
+  assert.equal(afterSuccess.has(`${base}.corrupt-aged`), false, "sweep after successful parse");
+  assert.equal(afterSuccess.has(`${base}.1.abc.tmp`), false, "tmp swept after successful parse");
+
+  // Failed parse path: quarantine happens but pre-existing aged siblings
+  // are retained (they may be needed for recovery).
+  writeFileSync(path, "{ broken json");
+  const sibling = join(home, `${base}.corrupt-sibling`);
+  writeFileSync(sibling, "x");
+  ageFile(sibling, 8);
+
+  assert.deepEqual(readAutomations(path), []);
+  const afterFailure = new Set(readdirSync(home));
+  assert.equal(afterFailure.has(`${base}.corrupt-sibling`), true, "no sweep on the failed-parse branch");
+  const quarantines = [...afterFailure].filter((entry) => entry.startsWith(`${base}.corrupt-`));
+  assert.equal(quarantines.length >= 1, true, `corrupt state was quarantined: ${quarantines}`);
 });
