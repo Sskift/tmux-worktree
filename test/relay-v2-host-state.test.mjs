@@ -2902,12 +2902,19 @@ test("A6: isRelayV2HostStateStorageFault classifies deterministic storage errno 
   const erofs = Object.assign(new Error("rofs"), { code: "EROFS" });
   const eperm = Object.assign(new Error("eperm"), { code: "EPERM" });
   const eio = Object.assign(new Error("eio"), { code: "EIO" });
+  const estale = Object.assign(new Error("stale nfs handle"), { code: "ESTALE" });
+  const edquot = Object.assign(new Error("disk quota exceeded"), { code: "EDQUOT" });
   const etimedout = Object.assign(new Error("net"), { code: "ETIMEDOUT" });
+  const ebusy = Object.assign(new Error("resource busy"), { code: "EBUSY" });
   const lockTimeout = new Error("timed out waiting for Relay v2 host state lock: /x/state-v1.lock");
-  for (const fault of [eacces, enospc, erofs, eperm, eio, lockTimeout]) {
+  for (const fault of [eacces, enospc, erofs, eperm, eio, estale, edquot, lockTimeout]) {
     assert.equal(hostState.isRelayV2HostStateStorageFault(fault), true, String(fault.code || fault.message));
   }
+  // ETIMEDOUT/EBUSY are not state/lock-fs specific enough: they can originate
+  // from unrelated network/resource operations, and lock contention against a
+  // live owner already surfaces through the bounded lock-wait timeout above.
   assert.equal(hostState.isRelayV2HostStateStorageFault(etimedout), false);
+  assert.equal(hostState.isRelayV2HostStateStorageFault(ebusy), false);
   assert.equal(
     hostState.isRelayV2HostStateStorageFault(new hostState.RelayV2HostStateCapacityError(1, 1)),
     false,
@@ -2918,4 +2925,58 @@ test("A6: isRelayV2HostStateStorageFault classifies deterministic storage errno 
     false,
     "commit uncertainty must not be treated as a clean pre-commit storage fault",
   );
+});
+
+// A deterministic environment fault (ESTALE on an NFS state dir replaced
+// underneath the daemon, EDQUOT once a user quota fills) lands before the
+// atomic rename, so the last durable commit and its H0 proof must survive:
+// the fault rejects as a classified, retryable storage error, a receipt
+// issued before the fault still validates during it, and new commits resume
+// on the same lineage once storage heals.
+test("A6: ESTALE/EDQUOT publish faults are retryable storage faults and keep the H0 proof alive", async () => {
+  for (const code of ["ESTALE", "EDQUOT"]) {
+    const h = harness();
+    let failStatePublishes = false;
+    let store;
+    try {
+      store = await hostState.RelayV2HostStateStore.open({
+        paths: h.paths,
+        renameFile: (source, destination) => {
+          if (failStatePublishes && destination === h.paths.state) {
+            throw Object.assign(new Error(`injected ${code} publish fault`), { code });
+          }
+          renameSync(source, destination);
+        },
+      });
+      const before = await store.read();
+      const port = store.h0ReadinessPort;
+      const issued = await port.issueReadinessReceipt();
+      assert.equal(typeof issued.receipt, "function", "H0 receipt issued while healthy");
+
+      failStatePublishes = true;
+      await assert.rejects(
+        store.transaction((transaction) => ({ eventSeq: transaction.allocateEventSeq() })),
+        (error) => hostState.isRelayV2HostStateStorageFault(error) === true,
+        `${code} publish fault must classify as a storage fault`,
+      );
+      const lease = port.consumeReadinessReceipt(
+        issued.receipt,
+        issued.binding,
+        { close() {} },
+      );
+      assert.ok(lease, `H0 proof must remain valid during a classified ${code} storage fault`);
+      assert.equal(port.releaseReadinessLease(lease), true);
+
+      failStatePublishes = false;
+      const healed = await store.read();
+      assert.equal(healed.hostEpoch, before.hostEpoch, `${code}: lineage survives the fault`);
+      const reissued = await port.issueReadinessReceipt();
+      assert.equal(typeof reissued.receipt, "function", `${code}: fresh H0 receipt after heal`);
+      port.discardReadinessReceipt(reissued.receipt);
+    } finally {
+      failStatePublishes = false;
+      store?.close();
+      h.cleanup();
+    }
+  }
 });

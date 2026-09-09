@@ -1600,6 +1600,109 @@ try {
       const faultMs = Date.now() - started;
       const hostAliveDuring = a6Topo.hostExitCode() === null;
 
+      // F2: while storage is still faulted, a command.query from the ALREADY
+      // welcomed route must answer with a structured retryable
+      // CAPABILITY_UNAVAILABLE error frame (not a 1011 route drop), and the
+      // route must stay open so the client can retry in place once storage
+      // heals.
+      const queryProbe = await (async () => {
+        const requestId = "req-a6-q-" + randomBytes(8).toString("hex");
+        let frame = null;
+        try {
+          frame = await client.request({
+            protocolVersion: 2,
+            kind: "request",
+            type: "command.query",
+            requestId,
+            hostId: client.hostId,
+            expectedHostEpoch: client.hostEpoch,
+            payload: { items: [{ commandId: "cmd-a6-query-probe", dedupeWindowId: client.dedupeWindowId }] },
+          }, 15_000);
+        } catch (error) {
+          return { settled: false, detail: error.message.slice(0, 120) };
+        }
+        return {
+          settled: true,
+          code: frame?.error?.code ?? frame?.type,
+          retryable: frame?.error?.retryable === true,
+          routeStillOpen: client.getCloseInfo() === null,
+        };
+      })();
+
+      // F2: a BRAND NEW client connecting during the storage fault must
+      // receive a structured retryable CAPABILITY_UNAVAILABLE error frame
+      // correlated to its client.hello before the route closes (old code
+      // tore the route down with a bare 1011 authority_failure and no
+      // frame, which the phone read as an unstructured SERVER_ERROR).
+      const helloProbe = await (async () => {
+        const socket = new WebSocket(a6Topo.clientRelayUrl, "tw-relay.v2", {
+          headers: { Authorization: `Bearer ${a6Topo.clientCreds.accessToken}` },
+          ca: a6Topo.tls.cert,
+          rejectUnauthorized: true,
+        });
+        clientSockets.add(socket);
+        const frames = [];
+        let closeInfo = null;
+        socket.on("message", (data) => {
+          try { frames.push(JSON.parse(data.toString())); } catch {}
+        });
+        socket.on("close", (code, reason) => {
+          closeInfo = { code, reason: reason?.toString() ?? "" };
+        });
+        try {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("probe ws open timeout")), 10_000);
+            socket.once("open", () => { clearTimeout(timer); resolve(); });
+            socket.once("error", (error) => { clearTimeout(timer); reject(error); });
+          });
+          // Wait for the broker's relay.welcome before sending client.hello.
+          await withTimeout(new Promise((resolve, reject) => {
+            const check = () => {
+              if (frames.some((f) => f.type === "relay.welcome")) return resolve();
+              if (socket.readyState !== WebSocket.OPEN && closeInfo) return reject(new Error("probe closed before relay.welcome"));
+              setTimeout(check, 50);
+            };
+            check();
+          }), 10_000, "probe relay.welcome");
+          const requestId = "hello-a6-" + randomBytes(8).toString("hex");
+          socket.send(JSON.stringify({
+            protocolVersion: 2,
+            kind: "request",
+            type: "client.hello",
+            requestId,
+            hostId: a6Topo.hostId,
+            payload: {
+              clientInstanceId: a6Topo.clientInstanceId,
+              capabilities: REQUIRED_CAPABILITIES,
+              requiredCapabilities: REQUIRED_CAPABILITIES,
+              resume: null,
+            },
+          }));
+          // Collect until the structured error frame arrives (or the socket
+          // closes first, which is the regression being guarded against).
+          await withTimeout(new Promise((resolve) => {
+            const check = () => {
+              if (frames.some((f) => f.type === "error" && f.requestId === requestId)) return resolve();
+              if (closeInfo) return resolve();
+              setTimeout(check, 50);
+            };
+            check();
+          }), 20_000, "probe hello result");
+          const errorFrame = frames.find((f) => f.type === "error" && f.requestId === requestId) ?? null;
+          return {
+            structuredError: errorFrame?.error?.code === "CAPABILITY_UNAVAILABLE"
+              && errorFrame?.error?.retryable === true,
+            closeCode: closeInfo?.code ?? null,
+            closed: closeInfo !== null,
+          };
+        } catch (error) {
+          return { structuredError: false, closeCode: null, closed: closeInfo !== null, detail: error.message.slice(0, 120) };
+        } finally {
+          try { closeWebSocket(socket); } catch {}
+          clientSockets.delete(socket);
+        }
+      })();
+
       // Restore permissions; give the lane time, then probe once.
       chmodSync(stateRoot, 0o700);
       chmodApplied = false;
@@ -1634,9 +1737,21 @@ try {
       );
       const bounded = faultOutcome.settled && faultMs <= 40_000;
 
-      const ok = ensured && hostAliveDuring && hostAliveAfter && faultSurfaced && bounded && recovered;
+      // F2 structured-error probes during the fault window.
+      const queryStructured = queryProbe.settled
+        && queryProbe.code === "CAPABILITY_UNAVAILABLE"
+        && queryProbe.retryable
+        && queryProbe.routeStillOpen;
+      const helloStructured = helloProbe.structuredError
+        // The structured frame drains first; the route then closes with the
+        // existing authority_failure code (no new close reason).
+        && (helloProbe.closeCode === 1011 || helloProbe.closed);
+      const f2 = queryStructured && helloStructured;
+
+      const ok = ensured && hostAliveDuring && hostAliveAfter && faultSurfaced && bounded
+        && f2 && recovered;
       record("A6 read-only state dir fails bounded and recovers (C002)", ok,
-        `isolatedTopology=true, stateRootExisted=${ensured}, fault=${faultOutcome.settled ? `settled(${faultOutcome.state ?? faultOutcome.error?.code})` : "TIMEOUT"} after ${faultMs}ms, hostAlive=${hostAliveDuring}/${hostAliveAfter}, recovered=${recovered}${recoverDetail ? ` (${recoverDetail})` : ""}`);
+        `isolatedTopology=true, stateRootExisted=${ensured}, fault=${faultOutcome.settled ? `settled(${faultOutcome.state ?? faultOutcome.error?.code})` : "TIMEOUT"} after ${faultMs}ms, hostAlive=${hostAliveDuring}/${hostAliveAfter}, queryStructured=${queryStructured}(${queryProbe.settled ? queryProbe.code : queryProbe.detail ?? "unsettled"}/open=${queryProbe.routeStillOpen}), helloStructured=${helloStructured}(err=${helloProbe.structuredError},close=${helloProbe.closeCode}${helloProbe.detail ? `,${helloProbe.detail}` : ""}), recovered=${recovered}${recoverDetail ? ` (${recoverDetail})` : ""}`);
 
       if (!ok) {
         // Persist logs for the product-bug report.

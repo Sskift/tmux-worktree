@@ -869,6 +869,50 @@ function daemonRestartIsIdle(state: ReturnType<typeof loadTerminalControlState>)
 }
 
 /**
+ * Compact, bounded labels for targets whose HELD ownership or in-flight
+ * operation blocks an idle-only daemon upgrade. The message rides the
+ * terminal-control wire (bounded to 512 bytes), so cap how many targets are
+ * named explicitly.
+ */
+function daemonUpgradeBlockingTargets(
+  state: ReturnType<typeof loadTerminalControlState>,
+): string[] {
+  const blocking = state.targets
+    .filter((target) => target.ownership.state !== "FREE" || target.inFlight !== undefined)
+    .map((target) => {
+      const label = target.managedSession?.name ?? target.controlTargetId;
+      const owner = target.ownership.state !== "FREE"
+        ? `${target.ownership.owner.kind}:${target.ownership.owner.instanceId}`
+        : target.inFlight?.ownerInstanceId;
+      return owner ? `${label} (held by ${owner})` : label;
+    });
+  const shown = blocking.slice(0, 3).join("; ");
+  if (blocking.length <= 3) return [shown].filter((value) => value.length > 0);
+  return [`${shown}; and ${blocking.length - 3} more`];
+}
+
+/**
+ * Structured, retryable rejection for an old terminal-control daemon that
+ * cannot be upgraded while terminal input is active. RESOURCE_EXHAUSTED maps
+ * to the retryable wire BUSY through the existing terminal-control failure
+ * path (controlFailure), so the client backs off and retries instead of
+ * treating the upgrade refusal as a permanent in-doubt authority fault.
+ */
+function daemonUpgradeBusyError(
+  state: ReturnType<typeof loadTerminalControlState>,
+): TerminalControlProtocolError {
+  const targets = daemonUpgradeBlockingTargets(state).join(", ") || "an active terminal";
+  return new TerminalControlProtocolError(
+    "RESOURCE_EXHAUSTED",
+    `An older tw terminal daemon still holds active terminal input (${targets}) from a `
+      + "`tw controlled-attach` or Feishu bridge session, so it cannot be upgraded yet. "
+      + "Detach it (Ctrl-]) or run `tw upgrade` / `pkill -f 'terminal-control serve'` "
+      + "on the host, then retry.",
+    true,
+  );
+}
+
+/**
  * Upgrades an already-running pre-compound terminal-control daemon in place.
  * The durable state lock fences new effects while the daemon is signalled,
  * and a restart is allowed only when every target is idle. Concurrent SSH
@@ -919,10 +963,9 @@ export async function ensureRelayV2RemoteExactCompoundDaemonV1(options: {
             "Relay v2 exact daemon ingress changed while its upgrade was being fenced",
           );
         }
-        if (!daemonRestartIsIdle(loadTerminalControlState(statePath))) {
-          throw new Error(
-            "Relay v2 exact daemon ingress needs an upgrade, but terminal input is currently active; retry when it is idle",
-          );
+        const busyState = loadTerminalControlState(statePath);
+        if (!daemonRestartIsIdle(busyState)) {
+          throw daemonUpgradeBusyError(busyState);
         }
         try {
           process.kill(observedPid, "SIGTERM");
@@ -1379,7 +1422,30 @@ async function proxyBoundedFrames(
 
 /** Hidden SSH child: bounded stdio-to-existing-daemon proxy, and nothing else. */
 export async function runRelayV2RemoteExactCompoundStdioV1(): Promise<void> {
-  await ensureRelayV2RemoteExactCompoundDaemonV1();
+  try {
+    await ensureRelayV2RemoteExactCompoundDaemonV1();
+  } catch (error) {
+    // A structured terminal-control rejection (retryable BUSY: an old daemon
+    // still holds active terminal input) must cross the stdio channel as a
+    // compound error frame: the host-side channel classifies a process exit
+    // or any stderr byte as the non-retryable PROCESS_FAILED. Emit the frame
+    // answering the caller's first in-flight request (preflight hello or
+    // prepare), then hold the process alive until the host closes stdin — it
+    // closes the channel immediately after receiving the rejection — so an
+    // EPIPE on the request write cannot race the frame out.
+    if (error instanceof TerminalControlProtocolError) {
+      const frame = Buffer.from(`${JSON.stringify(errorPayload(error))}\n`, "utf8");
+      await writeStdout(frame).catch(() => undefined);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 10_000);
+        timer.unref?.();
+        process.stdin.once("end", () => { clearTimeout(timer); resolve(); });
+        process.stdin.resume();
+      });
+      return;
+    }
+    throw error;
+  }
   const socket = await connectUnix(
     relayV2RemoteExactCompoundSocketPathV1(terminalControlSocketPath()),
   );

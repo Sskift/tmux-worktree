@@ -1164,6 +1164,43 @@ test("readiness withdrawal publishes 4406 before a synchronous H3 unbind failure
   assert.equal(h.state.calls.unbind.length, 1, "failed unbind must remain draining without retry");
 });
 
+// A6 F2: issuing the hello dedupe window hits the state store first. A
+// bounded local storage fault there must drain a retryable structured
+// CAPABILITY_UNAVAILABLE error correlated to the hello request and then
+// close the route (the client reconnects with the error's backoff), instead
+// of escaping as a raw error that lands as a silent 1011 authority_failure.
+test("hello dedupe-window storage fault drains structured CAPABILITY_UNAVAILABLE then closes", async () => {
+  const storageError = Object.assign(
+    new Error("EACCES: permission denied, open state"),
+    { code: "EACCES" },
+  );
+  const h = createHarness({
+    issueDedupeWindow: async () => {
+      throw storageError;
+    },
+  });
+  const routeBinding = binding();
+  h.runtime.onRouteBound(routeBinding);
+  const hello = fixture("client-hello-fresh");
+  hello.hostId = HOST_ID;
+  hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+  send(h.runtime, routeBinding, hello);
+  await settle(6);
+
+  const errorFrame = h.state.sent
+    .find(({ frame }) => frame.requestId === hello.requestId)?.frame;
+  assert.ok(errorFrame, JSON.stringify(h.state.sent));
+  assert.equal(errorFrame.type, "error");
+  assert.equal(errorFrame.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(errorFrame.error.retryable, true);
+  assert.equal(h.state.calls.hello.length, 0, "welcome linearization must not run");
+  assert.equal(
+    h.state.closes.some((close) => close.code === 1011 && close.reason === "authority_failure"),
+    true,
+    "the route closes with the existing authority_failure code after the structured frame drains",
+  );
+});
+
 test("readiness withdrawal during hello leaves no welcome or subscriber gap", async () => {
   let releaseWindow;
   const window = new Promise((resolve) => { releaseWindow = resolve; });

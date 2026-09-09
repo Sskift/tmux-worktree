@@ -2545,7 +2545,18 @@ export class RelayV2HostCommandPlane {
     }
     const query = parseQueryFrame(frame);
 
-    await this.compact();
+    // compact() reads and (when tombstones/windows are due) transacts the
+    // state store. A bounded local storage/IO fault there must not escape as a
+    // raw EACCES (the runtime turns that into a 1011 authority_failure drop):
+    // nothing about the query result changed, so answer with the same
+    // retryable structured admission error the execute lane uses and let the
+    // client retry once storage heals.
+    try {
+      await this.compact();
+    } catch (error) {
+      if (!isRelayV2HostStateStorageFault(error)) throw error;
+      return errorFrame(query, query.expectedHostEpoch, storageUnavailableAdmissionError());
+    }
     const now = this.now();
     const querySection = async (): Promise<RelayV2JsonObject> => {
       try {

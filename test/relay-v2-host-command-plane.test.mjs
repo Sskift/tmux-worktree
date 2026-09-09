@@ -1681,3 +1681,71 @@ test("A6: storage fault on pre-ledger reads returns bounded CAPABILITY_UNAVAILAB
     h.cleanup();
   }
 });
+
+// A6 F2: command.query runs compact() (store.read + a possible transaction)
+// before serializing the ledger section. A bounded storage fault there used
+// to escape as a raw EACCES that the runtime turned into a 1011
+// authority_failure route drop. It must settle with the same bounded
+// retryable CAPABILITY_UNAVAILABLE error frame the execute lane uses.
+test("A6: storage fault during query compaction returns bounded CAPABILITY_UNAVAILABLE", async () => {
+  const h = harness();
+  try {
+    const realStore = await hostState.RelayV2HostStateStore.open({ home: h.home });
+    const storageError = () => {
+      const error = new Error("EROFS: read-only file system");
+      error.code = "EROFS";
+      return error;
+    };
+    let compactFault = false;
+    const realRead = realStore.read.bind(realStore);
+    const realSerialize = realStore.serialize.bind(realStore);
+    const realTransaction = realStore.transaction.bind(realStore);
+    const flakyStore = {
+      ...realStore,
+      // compact() starts from a raw store.read() and only enters a
+      // transaction when tombstones/windows are due; fault both lanes.
+      read: (...args) => (compactFault ? Promise.reject(storageError()) : realRead(...args)),
+      serialize: (...args) => realSerialize(...args),
+      transaction: (mutation) => (compactFault
+        ? Promise.reject(storageError())
+        : realTransaction(mutation)),
+    };
+    const fake = fakeExecutor();
+    const resource = fakeResourceMutationOwner();
+    const plane = await commandPlane.RelayV2HostCommandPlane.open({
+      store: flakyStore,
+      hostId: HOST_ID,
+      executor: fake.executor,
+      resourceMutationOwner: resource.owner,
+      now: h.now,
+      recover: true,
+    });
+    const healthySnapshot = await realStore.read();
+    // Mint a real window while healthy so the healed query validates against
+    // an existing dedupe window (an unknown window would answer error too).
+    const healthyWindow = await plane.issueDedupeWindow();
+    const query = queryFrame(healthySnapshot.hostEpoch, [
+      { commandId: "cmd-a6-query", dedupeWindowId: healthyWindow.windowId },
+    ]);
+
+    compactFault = true;
+    const started = Date.now();
+    const response = await plane.query(auth(), query);
+    const elapsed = Date.now() - started;
+    assert.equal(response.type, "error", "query must return an error frame, not throw");
+    assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+    assert.equal(response.error.retryable, true);
+    assert.equal(response.error.commandDisposition, "not_accepted");
+    assert.ok(elapsed < 2_000, `bounded query failure took ${elapsed}ms`);
+
+    compactFault = false;
+    const healed = await plane.query(auth(), query);
+    assert.equal(
+      healed.type,
+      "command.statuses",
+      `healed query did not return statuses: ${JSON.stringify(healed).slice(0, 300)}`,
+    );
+  } finally {
+    h.cleanup();
+  }
+});
