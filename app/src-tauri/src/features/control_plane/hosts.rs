@@ -5,7 +5,8 @@ use crate::config::{
 };
 use crate::ipc::{tw_rpc_capabilities_compatible, HostStatus};
 use crate::remote::{
-    run_remote_cmd_check, run_remote_tmux_check, validate_ssh_host_fields, HostConfig,
+    run_remote_cmd_check, run_remote_cmd_check_with_timeout, run_remote_tmux_check,
+    validate_ssh_host_fields, HostConfig, REMOTE_CMD_REMOTE_INSTALL_TIMEOUT,
 };
 use crate::support::{expand_home_path, remote_path_expr, shell_quote};
 use std::collections::HashMap;
@@ -147,8 +148,15 @@ npm link --prefix "$HOME/.local"
         shell_quote(TW_GITHUB_REPO),
         shell_quote(&format!("v{}", env!("CARGO_PKG_VERSION")))
     );
-    run_remote_cmd_check(host, &["sh", "-lc", &script])
-        .map_err(|e| format!("install remote tw on {}: {e}", host.label))?;
+    // Clone + `npm install` (tsup/esbuild transitive deps) + `npm run build`
+    // routinely takes minutes on a fresh or loaded devbox, so this heavy
+    // callsite gets the install budget rather than the 120s probe default.
+    run_remote_cmd_check_with_timeout(
+        host,
+        &["sh", "-lc", &script],
+        REMOTE_CMD_REMOTE_INSTALL_TIMEOUT,
+    )
+    .map_err(|e| format!("install remote tw on {}: {e}", host.label))?;
     Ok(probe_host_status(host))
 }
 

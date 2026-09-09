@@ -1,5 +1,5 @@
 use crate::config::find_host;
-use crate::remote::run_remote_cmd_output;
+use crate::remote::{run_remote_cmd_output_with_timeout, REMOTE_CMD_REMOTE_GIT_TIMEOUT};
 use crate::support::git_bin;
 
 pub(super) fn run_git_output(
@@ -12,7 +12,10 @@ pub(super) fn run_git_output(
             let mut remote_cmd = Vec::with_capacity(git_args.len() + 1);
             remote_cmd.push("git");
             remote_cmd.extend_from_slice(git_args);
-            run_remote_cmd_output(&host, &remote_cmd)
+            // Remote git can walk a large repository on a loaded devbox; bound
+            // it with the long remote-git budget so a wedged host cannot park
+            // the deployment operation mutex forever.
+            run_remote_cmd_output_with_timeout(&host, &remote_cmd, REMOTE_CMD_REMOTE_GIT_TIMEOUT)
         }
         None => std::process::Command::new(git_bin())
             .args(git_args)
