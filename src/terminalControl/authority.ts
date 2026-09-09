@@ -1549,6 +1549,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         if (error instanceof TerminalControlProtocolError && error.code === "STALE_OUTPUT_CURSOR") {
           throw error;
         }
+        const goneWhileTailing = await this.tailGoneErrorWithReprobe(state, target, error);
+        if (goneWhileTailing) throw goneWhileTailing;
         markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError(
@@ -1784,6 +1786,73 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     target.updatedAt = isoNow(this.now);
     saveTerminalControlState(state, this.statePath);
     return true;
+  }
+
+  /**
+   * A tail runs after assertTargetCurrent, so a TARGET_GONE / TARGET_NOT_FOUND
+   * raised by the backend mid-read is a deterministic signal that the tmux
+   * lifecycle ended under the observer (kill_session / server exit landing in
+   * the read window), not an uncertain continuity fault. Retire the incarnation
+   * and re-surface TARGET_GONE so observers classify the close as a natural
+   * backend exit; returns null for any other (uncertain) error, which the
+   * caller keeps on the RECOVERY_REQUIRED path.
+   */
+  private tailGoneError(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+    error: unknown,
+  ): TerminalControlProtocolError | null {
+    if (
+      error instanceof TerminalControlProtocolError
+      && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+    ) {
+      invalidateTarget(target, this.now);
+      saveTerminalControlState(state, this.statePath);
+      return new TerminalControlProtocolError("TARGET_GONE", error.message);
+    }
+    return null;
+  }
+
+  /**
+   * Tail failures reach here after the tail already passed assertTargetCurrent,
+   * so the backend lifecycle either ended under the observer or continuity is
+   * genuinely uncertain. prepareOutput's show-options identity read, pane-pipe
+   * probe and segment scan do not all carry the exact "can't find session/pane |
+   * no server running" text tailGoneError recognises; a kill_session / server
+   * exit landing in one of those sub-calls therefore surfaced as
+   * RECOVERY_REQUIRED on a large share of kill events even though the lifecycle
+   * was deterministically over (the host then closed as backend_error instead
+   * of a natural backend_exit). After the direct gone check, run one bounded
+   * re-probe of the pinned incarnation: a gone/not-found result retires the
+   * target as a natural backend exit (TARGET_GONE); a confirmed-current target
+   * leaves the caller on the RECOVERY_REQUIRED path. The re-probe is a single
+   * bounded tmux round-trip on the error path only, so the success path is
+   * unchanged. Returns the error to surface, or null when the caller should
+   * mark OUTPUT_CONTINUITY_UNCERTAIN itself.
+   */
+  private async tailGoneErrorWithReprobe(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+    error: unknown,
+  ): Promise<TerminalControlProtocolError | null> {
+    const direct = this.tailGoneError(state, target, error);
+    if (direct) return direct;
+    try {
+      await this.assertTargetCurrent(state, target);
+    } catch (reprobe) {
+      // assertTargetCurrent already invalidated a gone incarnation (or marked
+      // recovery for an identity read it could not prove) and persisted it.
+      if (
+        reprobe instanceof TerminalControlProtocolError
+        && (reprobe.code === "TARGET_GONE" || reprobe.code === "TARGET_NOT_FOUND")
+      ) {
+        return new TerminalControlProtocolError("TARGET_GONE", reprobe.message);
+      }
+      if (reprobe instanceof TerminalControlProtocolError) {
+        return reprobe;
+      }
+    }
+    return null;
   }
 
   private async assertTargetCurrent(
@@ -2756,6 +2825,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         if (error instanceof TerminalControlProtocolError && error.code === "STALE_OUTPUT_CURSOR") {
           throw error;
         }
+        const goneWhileTailing = await this.tailGoneErrorWithReprobe(state, target, error);
+        if (goneWhileTailing) throw goneWhileTailing;
         markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError(

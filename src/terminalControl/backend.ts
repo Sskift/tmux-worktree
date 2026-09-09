@@ -405,7 +405,32 @@ function exactManagedSession(sessionName: string, home = homedir()): ManagedSess
 function tmuxSessionDefinitelyMissing(result: TmuxResult): boolean {
   if (result.exitCode === 0 && result.signal === null) return false;
   const detail = `${result.stderr}\n${result.stdout}`;
-  return /can't find session|no server running on/i.test(detail);
+  // tmux reports a vanished session two ways depending on the invocation:
+  // list-sessions/list-panes fail with "can't find session", while -t target
+  // resolution (show-options/display-message on a pinned $id) fails with
+  // "no such session"; a fully exited server reports "no server running". All
+  // three are deterministic lifecycle ends when the target was just proved to
+  // exist, never transient transport faults.
+  return /can't find session|no such session|no server running on/i.test(detail);
+}
+
+/**
+ * A pane-scoped probe (display-message -t %pane) that failed because the pane
+ * — and for a managed single-pane terminal, its session — no longer exists.
+ * "can't find pane/session" and "no such pane/session" are deterministic here:
+ * the pane id was just resolved by requirePane, so its disappearance means the
+ * tmux lifecycle ended under the observer (kill_session / server exit), never a
+ * transient transport fault.
+ */
+function tmuxPaneDefinitelyMissing(result: TmuxResult): boolean {
+  if (result.exitCode === 0 && result.signal === null) return false;
+  const detail = `${result.stderr}\n${result.stdout}`;
+  // A pane probe (pipe-pane / capture-pane / display-message) on a pane whose
+  // session was just killed reports either "can't find pane" (pane resolved
+  // then torn down) or the same session-gone wording ("can't find session" /
+  // "no such session" / "no server running"). All are deterministic lifecycle
+  // ends in this just-proved-to-exist context.
+  return /can't find (?:session|pane)|no such session|no server running on/i.test(detail);
 }
 
 async function requireTmuxSession(
@@ -456,6 +481,19 @@ async function currentTmuxInstanceId(sessionId: string): Promise<string | undefi
   );
   if (result.exitCode !== 0 || result.signal !== null) {
     const detail = `${result.stderr}\n${result.stdout}`.trim();
+    // show-options targets the pinned session id, which requireTmuxSession /
+    // requirePane proved existed a moment earlier. A "can't find session" /
+    // "no server running" detail here means kill_session / server exit landed
+    // in the read window between that probe and this one: a deterministic
+    // lifecycle end, not an unprovable identity. Surface TARGET_GONE so the
+    // authority retires the incarnation (natural backend_exit) instead of
+    // entering RECOVERY_REQUIRED recovery over a target that is already gone.
+    if (tmuxSessionDefinitelyMissing(result)) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "tmux backend lifecycle no longer exists",
+      );
+    }
     if (detail && !/(?:unknown|invalid) option/i.test(detail)) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
@@ -479,15 +517,35 @@ async function requirePane(
     );
   }
   const sessionId = await requireTmuxSession(sessionName, "TARGET_GONE");
-  const result = await runTmux([
+  const paneResult = await runTmux([
     "list-panes",
     "-s",
     "-t",
     sessionId,
     "-F",
     "#{pane_index}\u001f#{pane_id}",
-  ]);
-  const panes = result.stdout
+  ], { allowFailure: true });
+  if (paneResult.exitCode !== 0 || paneResult.signal !== null) {
+    // The session existed for list-sessions but vanished before this
+    // list-panes (kill_session landed in the gap between the two tmux
+    // invocations). This is the same deterministic lifecycle end
+    // requireTmuxSession classifies one call earlier, not an uncertain
+    // transport fault: surface TARGET_GONE so callers treat the backend as
+    // gone instead of entering RECOVERY_REQUIRED recovery.
+    if (tmuxSessionDefinitelyMissing(paneResult)) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "tmux backend lifecycle no longer exists",
+      );
+    }
+    const paneDetail = `${paneResult.stderr}\n${paneResult.stdout}`.trim()
+      || `exit ${String(paneResult.exitCode)}${paneResult.signal ? ` (${paneResult.signal})` : ""}`;
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      `could not enumerate the managed terminal pane: ${paneDetail}`,
+    );
+  }
+  const panes = paneResult.stdout
     .split("\n")
     .filter(Boolean)
     .map((line) => line.split("\u001f"));
@@ -1482,9 +1540,29 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       ["show-options", "-v", "-t", sessionId, OUTPUT_GENERATION_OPTION],
       { allowFailure: true },
     )).stdout.trim();
-    const pipeActive = (await runTmux(
+    const pipeProbe = await runTmux(
       ["display-message", "-p", "-t", target, "#{pane_pipe}"],
-    )).stdout.trim() === "1";
+      { allowFailure: true },
+    );
+    if (pipeProbe.exitCode !== 0 || pipeProbe.signal !== null) {
+      // requirePane proved the pane existed a moment ago; a non-zero probe here
+      // with a definite "session/pane gone" detail is kill_session landing in
+      // this read window — a deterministic lifecycle end, not an uncertain
+      // continuity fault. Surface TARGET_GONE; anything else stays uncertain.
+      if (tmuxPaneDefinitelyMissing(pipeProbe)) {
+        throw new TerminalControlProtocolError(
+          "TARGET_GONE",
+          "tmux backend lifecycle no longer exists",
+        );
+      }
+      const probeDetail = `${pipeProbe.stderr}\n${pipeProbe.stdout}`.trim()
+        || `exit ${String(pipeProbe.exitCode)}${pipeProbe.signal ? ` (${pipeProbe.signal})` : ""}`;
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `could not probe the managed terminal output pipe: ${probeDetail}`,
+      );
+    }
+    const pipeActive = pipeProbe.stdout.trim() === "1";
     if (generation && pipeActive && configured === generation) {
       const paths = outputCapturePaths(controlTargetId, generation);
       const segments = currentOutputSegments(paths);
