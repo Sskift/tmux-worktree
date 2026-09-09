@@ -12,6 +12,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { expandHomePath, loadConfigFile, type Config } from "./config.js";
 import { homeShort } from "./commands.js";
 import { acquireConfigFileLock, releaseConfigFileLock } from "./hosts.js";
+import { sweepStateFileArtifacts } from "./stateFileArtifacts.js";
 
 export type AutomationTriggerType = "manual" | "schedule";
 export type AutomationOverlap = "queue" | "skip";
@@ -278,7 +279,12 @@ function quarantineCorruptAutomations(path: string, error: unknown): void {
 }
 
 export function readAutomations(path = automationStatePath()): AutomationRecord[] {
-  if (!existsSync(path)) return [];
+  if (!existsSync(path)) {
+    // Prior crashes may have left quarantine backups or atomic-write
+    // orphans even with no live state file.
+    sweepStateFileArtifacts(path);
+    return [];
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf-8"));
@@ -290,6 +296,9 @@ export function readAutomations(path = automationStatePath()): AutomationRecord[
   if (!Array.isArray(parsed)) {
     throw new Error(`${path} must contain a JSON array`);
   }
+  // Only sweep after a successful parse: a failed parse may need the
+  // on-disk bytes (and the fresh quarantine backup) for recovery.
+  sweepStateFileArtifacts(path);
   return parsed as AutomationRecord[];
 }
 

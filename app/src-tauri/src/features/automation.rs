@@ -1,7 +1,9 @@
 use crate::config::{acquire_dashboard_file_lock, trimmed_non_empty_string};
 use crate::features::sessions::tmux_session_exists;
 use crate::ipc::CreateArgs;
-use crate::support::{app_home_dir_or_tmp, atomic_write_file, shell_quote};
+use crate::support::{
+    app_home_dir_or_tmp, atomic_write_file, shell_quote, sweep_state_file_artifacts,
+};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -578,11 +580,20 @@ fn load_state_array<T: serde::de::DeserializeOwned>(
     kind: &str,
 ) -> Result<Vec<T>, String> {
     if !path.exists() {
+        // Even with no live state file, prior crashes may have left
+        // quarantine backups or atomic-write orphans in this directory.
+        sweep_state_file_artifacts(path);
         return Ok(vec![]);
     }
     let text = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
     match serde_json::from_str::<Vec<T>>(&text) {
-        Ok(items) => Ok(items),
+        Ok(items) => {
+            // Only sweep after a successful parse: a failed parse may need
+            // the on-disk bytes (and the fresh quarantine backup) for
+            // recovery.
+            sweep_state_file_artifacts(path);
+            Ok(items)
+        }
         Err(error) => {
             quarantine_corrupt_state(path, kind, &error.to_string());
             Ok(vec![])

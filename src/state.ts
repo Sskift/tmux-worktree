@@ -85,6 +85,12 @@ export interface RecordManagedSessionDeps {
   saveManagedState?: (state: ManagedState, path: string) => void;
 }
 
+// On-disk `<lock>/owner.json` shape shared with the Rust Dashboard
+// (app/src-tauri/src/config/mod.rs `DashboardConfigLockOwner`,
+// camelCase owner/createdAt/pid). pid is optional only for reading
+// records written by older builds; new writes always include it. If this
+// lock format or the stale rules ever change, BOTH sides move in
+// lockstep — mixed-version processes contend for the same directory.
 interface ManagedStateLockOwnerRecord {
   owner: string;
   createdAt: number;

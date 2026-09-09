@@ -72,6 +72,13 @@ export interface ConfigFileLock {
   owner: string;
 }
 
+// On-disk `<lock>/owner.json` shape shared with the Rust Dashboard
+// (app/src-tauri/src/config/mod.rs `DashboardConfigLockOwner`,
+// camelCase owner/createdAt/pid). pid is optional only for reading
+// records written by older builds; new writes always include it. If this
+// lock format or the stale rules ever change, BOTH sides move in
+// lockstep — mixed-version CLI/Dashboard processes contend for the same
+// config lock directory.
 interface ConfigLockOwnerRecord {
   owner: string;
   createdAt: number;

@@ -16,10 +16,28 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { TerminalControlAgentSource } from "./terminalControl/protocol";
+import { sweepStateFileArtifacts } from "./stateFileArtifacts.js";
+
 export const FEISHU_BRIDGE_STORAGE_VERSION = 1;
 export const FEISHU_EVENT_DEDUP_LIMIT = 4096;
 export const FEISHU_TURN_HISTORY_LIMIT = 256;
 export const FEISHU_REPLY_HISTORY_LIMIT = 256;
+
+/// A corruption quarantine event the daemon observed. The Rust-launched
+/// feishu daemon runs with stdio wired to null, so its stderr
+/// quarantine lines never reach a user; surfacing the event on the
+/// bridge snapshot (consumed by `tw feishu-bridge status` and the
+/// Dashboard) is the only way it becomes visible. Kept per-store and
+/// capped; survives for the lifetime of the daemon only.
+export interface FeishuBridgeStorageNotice {
+  kind: "quarantined-corrupt-state";
+  path: string;
+  quarantinePath: string;
+  reason: string;
+  at: string;
+}
+
+const FEISHU_STORAGE_NOTICE_LIMIT = 20;
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 export type FeishuReplyMode = "topic" | "direct";
@@ -167,6 +185,11 @@ interface FeishuBridgeStorageLock {
   owner: string;
 }
 
+// On-disk `<lock>/owner.json` shape. This lock is Node-only (the
+// feishu daemon), but it mirrors the shared config/state lock
+// records in src/state.ts, src/hosts.ts and the Rust Dashboard
+// DashboardConfigLockOwner — keep the owner/createdAt/pid fields in
+// sync if the lock format ever changes.
 interface FeishuBridgeStorageLockOwner {
   owner: string;
   pid: number;
@@ -507,17 +530,35 @@ function isReply(value: unknown): value is FeishuOutboundReply {
     && (value.error === undefined || isSafeText(value.error, 4096));
 }
 
-function loadFile<T>(path: string, empty: T, validate: (value: unknown) => value is T): T {
-  if (!existsSync(path)) return empty;
+function loadFile<T>(
+  path: string,
+  empty: T,
+  validate: (value: unknown) => value is T,
+  onQuarantine?: (notice: FeishuBridgeStorageNotice) => void,
+): T {
+  if (!existsSync(path)) {
+    // Prior crashes may have left quarantine backups or atomic-write
+    // orphans even with no live state file.
+    sweepStateFileArtifacts(path);
+    return empty;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
-    return quarantineCorruptFile(path, empty, error);
+    return quarantineCorruptFile(path, empty, error, onQuarantine);
   }
   if (!validate(parsed)) {
-    return quarantineCorruptFile(path, empty, new Error("schema validation failed"));
+    return quarantineCorruptFile(
+      path,
+      empty,
+      new Error("schema validation failed"),
+      onQuarantine,
+    );
   }
+  // Only sweep after a successful load: a failed parse may need the
+  // on-disk bytes (and the fresh quarantine backup) for recovery.
+  sweepStateFileArtifacts(path);
   return parsed;
 }
 
@@ -527,7 +568,12 @@ function loadFile<T>(path: string, empty: T, validate: (value: unknown) => value
 // collections are unaffected. Runs under the storage lock (only called from
 // read()), so a concurrent writer cannot race the rename. If the quarantine
 // rename itself fails, stay fail-closed and surface the original error.
-function quarantineCorruptFile<T>(path: string, empty: T, cause: unknown): T {
+function quarantineCorruptFile<T>(
+  path: string,
+  empty: T,
+  cause: unknown,
+  onQuarantine?: (notice: FeishuBridgeStorageNotice) => void,
+): T {
   const reason = cause instanceof Error ? cause.message : String(cause);
   const quarantinePath = `${path}.corrupt-${process.pid}-${randomUUID()}`;
   try {
@@ -539,6 +585,13 @@ function quarantineCorruptFile<T>(path: string, empty: T, cause: unknown): T {
   process.stderr.write(
     `[feishu-bridge] quarantined corrupt state file ${path} -> ${quarantinePath} (${reason}); starting that collection empty\n`,
   );
+  onQuarantine?.({
+    kind: "quarantined-corrupt-state",
+    path,
+    quarantinePath,
+    reason,
+    at: new Date().toISOString(),
+  });
   return empty;
 }
 
@@ -595,6 +648,12 @@ type StorageRole = "bindings" | "dedup" | "turns" | "replies";
 export class FeishuBridgeStore {
   readonly paths: FeishuBridgePaths;
 
+  /// Corruption-quarantine events observed by reads of this store.
+  /// The daemon's stderr is null when launched by the Dashboard, so
+  /// these are surfaced through the bridge snapshot instead of dying in
+  /// a discarded pipe. Process-lifetime only; nothing persists.
+  readonly quarantineNotices: FeishuBridgeStorageNotice[] = [];
+
   // Serialized form of the last content written per collection. write()
   // skips files whose current serialization matches, so the poll-turn hot
   // path (which only appends turn output) rewrites just the turns file
@@ -607,6 +666,12 @@ export class FeishuBridgeStore {
     this.paths = paths;
   }
 
+  private recordQuarantineNotice(notice: FeishuBridgeStorageNotice): void {
+    if (this.quarantineNotices.some((existing) => existing.quarantinePath === notice.quarantinePath)) return;
+    if (this.quarantineNotices.length >= FEISHU_STORAGE_NOTICE_LIMIT) return;
+    this.quarantineNotices.push(notice);
+  }
+
   read(): {
     bindings: FeishuBinding[];
     eventIds: string[];
@@ -615,11 +680,13 @@ export class FeishuBridgeStore {
   } {
     const lock = acquireFeishuBridgeStorageLock(this.paths.lock);
     try {
+      const onQuarantine = (notice: FeishuBridgeStorageNotice): void => this.recordQuarantineNotice(notice);
       return {
         bindings: loadFile(
           this.paths.bindings,
           { version: 1, bindings: [] } as StoredBindingsFile,
           validateStoredBindings,
+          onQuarantine,
         ).bindings.map((binding): FeishuBinding => ({
           ...binding,
           options: {
@@ -627,9 +694,9 @@ export class FeishuBridgeStore {
             replyMode: binding.options.replyMode ?? "topic",
           },
         })),
-        eventIds: loadFile(this.paths.dedup, { version: 1, eventIds: [] } as DedupFile, validateDedup).eventIds,
-        turns: loadFile(this.paths.turns, { version: 1, turns: [] } as TurnsFile, validateTurns).turns,
-        replies: loadFile(this.paths.replies, { version: 1, replies: [] } as RepliesFile, validateReplies).replies,
+        eventIds: loadFile(this.paths.dedup, { version: 1, eventIds: [] } as DedupFile, validateDedup, onQuarantine).eventIds,
+        turns: loadFile(this.paths.turns, { version: 1, turns: [] } as TurnsFile, validateTurns, onQuarantine).turns,
+        replies: loadFile(this.paths.replies, { version: 1, replies: [] } as RepliesFile, validateReplies, onQuarantine).replies,
       };
     } finally {
       releaseFeishuBridgeStorageLock(lock);

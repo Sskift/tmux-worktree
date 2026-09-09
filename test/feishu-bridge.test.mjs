@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -4239,6 +4239,109 @@ test("store write skips collections whose serialized content did not change", ()
     assert.equal(second.bindings, first.bindings, "unchanged bindings file must be left alone");
     assert.equal(second.turns, first.turns, "unchanged turns file must be left alone");
     assert.equal(second.replies, first.replies, "unchanged replies file must be left alone");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function ageFileSeconds(path, secondsAgo) {
+  const stamp = new Date(Date.now() - secondsAgo * 1000);
+  utimesSync(path, stamp, stamp);
+}
+
+test("feishu store sweeps aged corrupt backups and tmp orphans on successful read", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-fb-sweep-"));
+  try {
+    const paths = feishuBridgePaths(root);
+    mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+    writeFileSync(paths.bindings, JSON.stringify({ version: 1, bindings: [] }) + "\n");
+
+    const base = "feishu-bindings.json";
+    const agedCorrupt = join(paths.root, `${base}.corrupt-aged`);
+    const freshCorrupt = join(paths.root, `${base}.corrupt-fresh`);
+    const agedTmp = join(paths.root, `${base}.111.aaaa.tmp`);
+    const freshTmp = join(paths.root, `${base}.222.bbbb.tmp`);
+    const agedRustTmp = join(paths.root, `.${base}.tmp-cccc`);
+    for (const path of [agedCorrupt, freshCorrupt, agedTmp, freshTmp, agedRustTmp]) {
+      writeFileSync(path, "x");
+    }
+    // A different collection's recent orphan is left alone; the read()
+    // sweeps all four collections, but the 1-hour tmp window protects
+    // files a live writer could still be using.
+    const otherTmp = join(paths.root, "feishu-event-dedup.json.1.2.tmp");
+    writeFileSync(otherTmp, "x");
+
+    ageFileSeconds(agedCorrupt, 8 * 24 * 60 * 60);
+    ageFileSeconds(freshCorrupt, 1 * 24 * 60 * 60);
+    ageFileSeconds(agedTmp, 2 * 60 * 60);
+    ageFileSeconds(freshTmp, 10 * 60);
+    ageFileSeconds(agedRustTmp, 2 * 60 * 60);
+    ageFileSeconds(otherTmp, 10 * 60);
+
+    const store = new FeishuBridgeStore(paths);
+    const state = store.read();
+    assert.deepEqual(state.bindings, []);
+
+    const entries = new Set(readdirSync(paths.root));
+    assert.equal(entries.has(`${base}.corrupt-aged`), false, "8-day corrupt backup removed");
+    assert.equal(entries.has(`${base}.corrupt-fresh`), true, "1-day corrupt backup kept");
+    assert.equal(entries.has(`${base}.111.aaaa.tmp`), false, "2-hour tmp removed");
+    assert.equal(entries.has(`${base}.222.bbbb.tmp`), true, "10-minute tmp kept");
+    assert.equal(entries.has(`.${base}.tmp-cccc`), false, "2-hour rust tmp removed");
+    assert.equal(entries.has("feishu-event-dedup.json.1.2.tmp"), true, "other collection tmp untouched");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("quarantined feishu state surfaces on the bridge snapshot and keeps recovery bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-fb-quarantine-"));
+  try {
+    const paths = feishuBridgePaths(root);
+    mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+    // Torn JSON mid-write.
+    writeFileSync(paths.bindings, `{"version":1,"bindings":[`);
+    // An aged sibling quarantine must survive the failed-load branch
+    // (bytes may be needed for recovery).
+    const sibling = join(paths.root, "feishu-bindings.json.corrupt-aged");
+    writeFileSync(sibling, "previous-bytes");
+    ageFileSeconds(sibling, 8 * 24 * 60 * 60);
+
+    const store = new FeishuBridgeStore(paths);
+    const bridge = new FeishuBridge({
+      control: new FakeControlClient(),
+      lark: new FakeLark(),
+      store,
+      instanceId: "daemon-quarantine",
+      botOpenId: "ou-bot",
+    });
+
+    // The constructor's read() is the failed load: it quarantines the
+    // corrupt bindings file, records the notice, and must NOT sweep aged
+    // siblings on that branch (they may be needed for recovery).
+    const entriesAfterQuarantine = new Set(readdirSync(paths.root));
+    assert.equal(
+      entriesAfterQuarantine.has("feishu-bindings.json.corrupt-aged"),
+      true,
+      "aged sibling quarantine kept on the failed-load branch",
+    );
+
+    const notices = bridge.snapshot().storageNotices;
+    assert.equal(notices.length, 1, `one quarantine notice: ${JSON.stringify(notices)}`);
+    assert.equal(notices[0].kind, "quarantined-corrupt-state");
+    assert.equal(notices[0].path, paths.bindings);
+    assert.ok(
+      notices[0].quarantinePath.includes("feishu-bindings.json.corrupt-"),
+      `notice names the quarantine path: ${notices[0].quarantinePath}`,
+    );
+    assert.ok(
+      existsSync(notices[0].quarantinePath),
+      "quarantined bytes preserved at the surfaced path",
+    );
+
+    // A later healthy read (collection now empty/missing) reports the same
+    // captured notice and the bridge state is usable.
+    assert.deepEqual(store.read().bindings, [], "corrupt collection degrades to empty");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
