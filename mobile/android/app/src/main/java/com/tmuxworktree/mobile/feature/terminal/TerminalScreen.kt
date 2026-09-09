@@ -321,7 +321,7 @@ private fun BoxScope.DisconnectedOverlay(
     onReconnect: () -> Unit,
 ) {
     val title = terminalDisconnectedTitle(status)
-    val detail = reason?.takeIf { it.isNotBlank() } ?: terminalDisconnectedDetail(status)
+    val detail = terminalDisconnectDetail(reason, status)
     val retryAvailable = status == ConnectionStatus.OFFLINE ||
         status == ConnectionStatus.PAUSED ||
         status == ConnectionStatus.RECOVERING ||
@@ -618,6 +618,80 @@ private fun terminalDisconnectedDetail(status: ConnectionStatus): String = when 
     ConnectionStatus.UNKNOWN -> "The terminal stream state could not be confirmed."
     ConnectionStatus.ONLINE -> "Terminal input is available."
 }
+
+/**
+ * User-facing copy for the internal reason token carried on TerminalStreamState.resetReason.
+ * That field holds protocol enum names (RelayV2TerminalCloseReason / RelayV2TerminalResetReason
+ * lowercased) and ViewModel-internal tokens; none of them may reach the user verbatim. Unknown
+ * tokens — including reasons a future host/relay might add — fall back to the status-level copy,
+ * so a newer backend can never leak a raw enum onto the screen.
+ */
+internal fun terminalDisconnectDetail(reason: String?, status: ConnectionStatus): String {
+    val token = reason?.trim()?.takeIf { it.isNotEmpty() }
+        ?: return terminalDisconnectedDetail(status)
+    val copy = TERMINAL_DISCONNECT_REASON_COPY[token]
+        ?: return terminalDisconnectedDetail(status)
+    // While the stream is actively re-opening, say so; the offline copy already pairs with the
+    // on-screen Reconnect button.
+    return if (status == ConnectionStatus.RECOVERING) {
+        "$copy Reconnecting automatically."
+    } else {
+        copy
+    }
+}
+
+private val TERMINAL_DISCONNECT_REASON_COPY: Map<String, String> = mapOf(
+    // RelayV2TerminalCloseReason — the session itself ended, no automatic resume.
+    "client_closed" to "The terminal session was closed.",
+    "backend_exit" to "Terminal session ended.",
+    "backend_error" to "Terminal stopped unexpectedly.",
+    // RelayV2TerminalResetReason — the stream resets and resumes on its own.
+    "missing_checkpoint" to
+        "No saved terminal state was found, so the stream is starting fresh.",
+    "missing_required_identity" to
+        "Terminal credentials are missing, so the stream must restart.",
+    "schema_incompatible" to
+        "The terminal stream version is incompatible. Update the app and reconnect.",
+    "identity_changed" to
+        "Terminal credentials changed, so the stream must restart.",
+    "parser_continuity_lost" to
+        "Terminal output continuity was interrupted; the stream is resuming.",
+    "checkpoint_invalid" to
+        "Saved terminal state could not be read, so the stream must restart.",
+    "checkpoint_limit_exceeded" to
+        "Saved terminal state grew past its limit, so the stream must restart.",
+    "stream_lost" to "Connection to the terminal stream was lost.",
+    "generation_stale" to
+        "The terminal stream fell behind; it is resuming from the latest output.",
+    "offset_expired" to
+        "Terminal output replay expired, so the stream must start fresh.",
+    "slow_consumer" to
+        "This device could not keep up with terminal output; the stream is resuming.",
+    "host_buffer_pressure" to
+        "The host is buffering too much terminal output; the stream is resuming.",
+    "parser_failure" to
+        "Terminal output could not be parsed; the stream is resuming.",
+    "protocol_order_conflict" to
+        "Terminal stream ordering conflict, so the stream must restart.",
+    // ViewModel-internal tokens (V2ViewModel) — already paired with an actionError notice;
+    // the overlay must still show prose rather than the raw token.
+    "terminal_open_timeout" to
+        "Opening the terminal timed out; tap Reconnect to retry.",
+    "terminal_auto_reconnect_paused" to
+        "Automatic reconnect reached its limit; tap Reconnect to retry.",
+    "detached_open_response" to
+        "Reconnecting after the terminal stream was interrupted.",
+    "terminal_retirement_failed" to
+        "The previous terminal stream could not be replaced; tap Reconnect to retry.",
+    "terminal_view_detach_failed" to
+        "Terminal recovery could not finish cleanly; tap Reconnect to retry.",
+    "renderer_recovery_exhausted" to
+        "Terminal renderer recovery is paused; tap Reconnect to retry.",
+    "terminal_attachment_unavailable" to
+        "The terminal stream is unavailable; tap Reconnect to retry.",
+    "renderer_crashed" to "The terminal renderer crashed; tap Reconnect to retry.",
+    "renderer_gone" to "The terminal renderer became unavailable; tap Reconnect to retry.",
+)
 
 @Preview(showBackground = true, backgroundColor = 0xFF020509, widthDp = 390, heightDp = 844)
 @Composable
