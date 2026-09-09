@@ -1123,6 +1123,8 @@ mod tests {
             last_state: "FREE".to_string(),
             last_owner_kind: None,
             last_error: None,
+            unresponsive_streak: 0,
+            unresponsive_since: None,
         }
     }
 
