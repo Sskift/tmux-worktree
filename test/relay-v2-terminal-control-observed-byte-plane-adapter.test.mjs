@@ -1240,3 +1240,175 @@ test("constructor snapshots options once and preserves the port receiver", async
   await handle.close();
   await bytePlane.close();
 });
+
+test("a TARGET_GONE tail is a natural backend_exit, not a backend_error", async () => {
+  let closeAttempts = 0;
+  const port = fakeExactPort({
+    label: "gone",
+    tail: () => {
+      throw new terminalControl.TerminalControlProtocolError(
+        "TARGET_GONE",
+        "tmux backend lifecycle no longer exists",
+      );
+    },
+    close: () => { closeAttempts += 1; },
+  });
+  const bytePlane = new bytePlaneModule.RelayV2TerminalControlObservedBytePlaneAdapterV1({
+    exactTargets: port,
+    idlePollMs: 2,
+  });
+  const events = [];
+  await bytePlane.open(
+    foreignTarget("gone"),
+    { maxChunkBytes: 64, displaySizeHint: { cols: 80, rows: 24 } },
+    {
+      async onBytes() { events.push({ kind: "bytes" }); },
+      async onClosed(result) { events.push({ kind: "closed", result: { ...result } }); },
+    },
+  );
+  await waitFor(
+    () => events.some((event) => event.kind === "closed"),
+    "a TARGET_GONE tail did not close the attachment",
+  );
+  // kill_session / server exit is a deterministic terminal lifecycle end: the
+  // client must treat it as a clean backend exit (non-null exitCode), not enter
+  // backend_error recovery/reconnect. tmux observes no exit status when it
+  // tears the pane down, so the conventional forced-termination status is used.
+  assert.deepEqual(events.map((event) => event.kind), ["closed"]);
+  assert.deepEqual(events[0].result, { reason: "backend_exit", exitCode: 143 });
+  await waitFor(() => closeAttempts === 1, "the gone observation was not cleaned up");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    events.filter((event) => event.kind === "closed").length,
+    1,
+    "onClosed is delivered exactly once",
+  );
+  await bytePlane.close();
+});
+
+test("a TARGET_GONE tail is not retried and never calls onResetRequired", async () => {
+  let tailCalls = 0;
+  const port = fakeExactPort({
+    label: "gone-no-retry",
+    tail: () => {
+      tailCalls += 1;
+      throw new terminalControl.TerminalControlProtocolError(
+        "TARGET_GONE",
+        "tmux backend lifecycle no longer exists",
+      );
+    },
+  });
+  const bytePlane = new bytePlaneModule.RelayV2TerminalControlObservedBytePlaneAdapterV1({
+    exactTargets: port,
+    idlePollMs: 2,
+  });
+  const events = [];
+  await bytePlane.open(
+    foreignTarget("gone-no-retry"),
+    { maxChunkBytes: 64, displaySizeHint: { cols: 80, rows: 24 } },
+    {
+      async onBytes() {},
+      async onClosed(result) { events.push({ kind: "closed", result: { ...result } }); },
+      async onResetRequired() { events.push({ kind: "reset" }); },
+    },
+  );
+  await waitFor(
+    () => events.some((event) => event.kind === "closed"),
+    "a TARGET_GONE tail did not close the attachment",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(tailCalls, 1, "a TARGET_GONE tail is never retried");
+  assert.equal(
+    events.some((event) => event.kind === "reset"),
+    false,
+    "TARGET_GONE is an exit, not a resettable cursor gap",
+  );
+  assert.deepEqual(events[0].result, { reason: "backend_exit", exitCode: 143 });
+  await bytePlane.close();
+});
+
+test("a STALE_OUTPUT_CURSOR tail signals reset (slow_consumer), not backend_error", async () => {
+  let closeAttempts = 0;
+  let tailCalls = 0;
+  const port = fakeExactPort({
+    label: "stale-reset",
+    tail: () => {
+      tailCalls += 1;
+      throw new terminalControl.TerminalControlProtocolError(
+        "STALE_OUTPUT_CURSOR",
+        "terminal output cursor was fenced by an ownership or controller generation change",
+      );
+    },
+    close: () => { closeAttempts += 1; },
+  });
+  const bytePlane = new bytePlaneModule.RelayV2TerminalControlObservedBytePlaneAdapterV1({
+    exactTargets: port,
+    idlePollMs: 2,
+  });
+  const events = [];
+  await bytePlane.open(
+    foreignTarget("stale-reset"),
+    { maxChunkBytes: 64, displaySizeHint: { cols: 80, rows: 24 } },
+    {
+      async onBytes() { events.push({ kind: "bytes" }); },
+      async onClosed(result) { events.push({ kind: "closed", result: { ...result } }); },
+      async onResetRequired(reset) { events.push({ kind: "reset", result: { ...reset } }); },
+    },
+  );
+  await waitFor(
+    () => events.some((event) => event.kind === "reset"),
+    "a stale cursor did not signal a reset",
+  );
+  // The detached reader fell behind the retained output window: the gap cannot
+  // be replayed, so the manager is asked to reset the stream (client reopens a
+  // fresh generation automatically) rather than closing with backend_error.
+  assert.deepEqual(events[0], { kind: "reset", result: { reason: "slow_consumer" } });
+  await waitFor(() => closeAttempts === 1, "the stale observation was not cleaned up");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    events.some((event) => event.kind === "closed"),
+    false,
+    "a stale cursor never delivers a backend_error close when reset is available",
+  );
+  assert.equal(tailCalls, 1, "a stale tail is never retried on the same observation");
+  assert.equal(
+    events.filter((event) => event.kind === "reset").length,
+    1,
+    "onResetRequired is delivered exactly once",
+  );
+  await bytePlane.close();
+});
+
+test("a STALE_OUTPUT_CURSOR tail falls back to backend_error without a reset hook", async () => {
+  const port = fakeExactPort({
+    label: "stale-no-hook",
+    tail: () => {
+      throw new terminalControl.TerminalControlProtocolError(
+        "STALE_OUTPUT_CURSOR",
+        "terminal output cursor was fenced",
+      );
+    },
+  });
+  const bytePlane = new bytePlaneModule.RelayV2TerminalControlObservedBytePlaneAdapterV1({
+    exactTargets: port,
+    idlePollMs: 2,
+  });
+  const events = [];
+  await bytePlane.open(
+    foreignTarget("stale-no-hook"),
+    { maxChunkBytes: 64, displaySizeHint: { cols: 80, rows: 24 } },
+    {
+      // No onResetRequired: an observer that cannot reset gets the legacy
+      // fail-closed backend_error so behavior is unchanged for it.
+      async onBytes() { events.push({ kind: "bytes" }); },
+      async onClosed(result) { events.push({ kind: "closed", result: { ...result } }); },
+    },
+  );
+  await waitFor(
+    () => events.some((event) => event.kind === "closed"),
+    "a stale cursor without a reset hook did not fail closed",
+  );
+  assert.deepEqual(events.map((event) => event.kind), ["closed"]);
+  assert.deepEqual(events[0].result, { reason: "backend_error", exitCode: null });
+  await bytePlane.close();
+});

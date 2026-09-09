@@ -12,6 +12,7 @@ import type {
 import type {
   RelayV2TerminalBackendClose,
   RelayV2TerminalBackendObserver,
+  RelayV2TerminalBackendReset,
   RelayV2TerminalByteBackend,
   RelayV2TerminalByteHandle,
   RelayV2TerminalCanonicalTargetBindingV1,
@@ -27,6 +28,34 @@ const DEFAULT_IDLE_POLL_MS = 25;
 const MAX_OBSERVED_CHUNK_BYTES = 384 * 1024;
 const MAX_HINT_COLS = 1_000;
 const MAX_HINT_ROWS = 500;
+
+/**
+ * Exit status reported for a backend whose tmux lifecycle was torn down
+ * externally (kill_session / server exit): tmux SIGTERMs the pane process and
+ * never observes its exit status, so the daemon can only prove the target is
+ * gone (TARGET_GONE), not why. 128 + SIGTERM(15) = 143 is the conventional
+ * shell status for "terminated by signal 15" — the same status a login shell
+ * surfaces when tmux tears down its pane — so the close is classified as a
+ * valid backend_exit (non-null exitCode) rather than an unrecoverable
+ * backend_error. It is intentionally not 0: that would imply a clean command
+ * success that did not happen.
+ */
+const TERMINAL_EXIT_FORCED_TERMINATION = 143;
+
+/**
+ * Reads a terminal-control error code without relying on `instanceof`: every
+ * tsup entry bundles its own inline copy of TerminalControlProtocolError, so an
+ * error raised on the compound channel (or a foreign module) is a different
+ * class instance than the one imported here. The wire code is the stable
+ * identity and is what the daemon attaches to every structured rejection.
+ */
+function terminalControlErrorCode(error: unknown): string | null {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return null;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
 
 function bounded(value: unknown, maxBytes = 128): string {
   if (typeof value !== "string"
@@ -240,6 +269,9 @@ interface CapturedObserver {
   readonly receiver: object;
   readonly onBytes: (data: Uint8Array) => unknown;
   readonly onClosed: (result: RelayV2TerminalBackendClose) => unknown;
+  readonly onResetRequired:
+    | ((reset: RelayV2TerminalBackendReset) => unknown)
+    | null;
 }
 
 interface CapturedPortMethod {
@@ -293,10 +325,16 @@ function capturePortMethod(value: unknown, key: string): CapturedPortMethod | nu
  * substitute a callback after open and `this` is never lost.
  */
 function captureObserver(value: unknown): CapturedObserver {
-  const snapshot = snapshotExactDataRecord(value, ["onBytes", "onClosed"]);
+  const snapshot = snapshotExactDataRecord(
+    value,
+    ["onBytes", "onClosed"],
+    ["onResetRequired"],
+  );
   if (snapshot === null
     || typeof snapshot.onBytes !== "function"
-    || typeof snapshot.onClosed !== "function") {
+    || typeof snapshot.onClosed !== "function"
+    || (snapshot.onResetRequired !== undefined
+      && typeof snapshot.onResetRequired !== "function")) {
     throw new TerminalControlProtocolError(
       "PERMISSION_DENIED",
       "observed byte plane observer is invalid",
@@ -306,6 +344,9 @@ function captureObserver(value: unknown): CapturedObserver {
     receiver: value as object,
     onBytes: snapshot.onBytes as (data: Uint8Array) => unknown,
     onClosed: snapshot.onClosed as (result: RelayV2TerminalBackendClose) => unknown,
+    onResetRequired: snapshot.onResetRequired === undefined
+      ? null
+      : (snapshot.onResetRequired as (reset: RelayV2TerminalBackendReset) => unknown),
   });
 }
 
@@ -617,6 +658,57 @@ implements RelayV2TerminalByteBackend {
   }
 
   /**
+   * The target daemon has deterministically confirmed the tmux session/pane
+   * lifecycle no longer exists (TARGET_GONE from kill_session / server exit):
+   * this is a natural backend termination, not an internal or transport fault.
+   * tmux tore the pane down externally and observes no exit status, so the
+   * conventional forced-termination status is reported (see
+   * TERMINAL_EXIT_FORCED_TERMINATION) and the close is delivered as
+   * backend_exit so the client treats it as a clean terminal exit instead of
+   * entering backend_error recovery/reconnect. Cleanup mirrors failClosed.
+   */
+  private async failBackendExit(record: ObservedHandleRecord, exitCode: number): Promise<void> {
+    if (!this.fenceRecord(record)) return;
+    try {
+      await Reflect.apply(record.observer.onClosed, record.observer.receiver, [
+        { reason: "backend_exit", exitCode },
+      ]);
+    } catch {
+      // A fenced observer rejection cannot reopen the attachment.
+    }
+    void this.ensureCleanup(record).catch(() => undefined);
+  }
+
+  /**
+   * The pinned output cursor rotated out of the daemon's retained output
+   * window (STALE_OUTPUT_CURSOR) — the gap cannot be replayed. This is the
+   * slow-consumer condition, never a terminal close: ask the observer (the
+   * manager) to reset the stream so the client reopens a fresh generation
+   * automatically (terminal.reset_required / mode=reset). When the observer
+   * provides no reset hook, fall back to the fail-closed backend_error path.
+   * Returns true when a reset was signalled.
+   */
+  private async failResetRequired(record: ObservedHandleRecord): Promise<boolean> {
+    const onResetRequired = record.observer.onResetRequired;
+    if (onResetRequired === null) {
+      await this.failClosed(record);
+      return false;
+    }
+    if (!this.fenceRecord(record)) return false;
+    try {
+      await Reflect.apply(onResetRequired, record.observer.receiver, [
+        { reason: "slow_consumer" },
+      ]);
+    } catch {
+      // The manager enqueues its reset task before this callback settles, so a
+      // rejection here only occurs on shutdown; the attachment is disposed
+      // either way and cleanup below retires the stale observation.
+    }
+    void this.ensureCleanup(record).catch(() => undefined);
+    return true;
+  }
+
+  /**
    * Fences the record from the manager serializer without awaiting the
    * observer: the observer re-enters that serializer, so awaiting it here
    * would deadlock the queue. Source order is preserved because every earlier
@@ -665,10 +757,34 @@ implements RelayV2TerminalByteBackend {
           record.inflightTail = inflight.then(() => undefined, () => undefined);
           try {
             chunkValue = await inflight;
-          } catch {
+          } catch (error) {
             record.inflightTail = null;
-            // The authority fenced or rejected this observation (including
-            // STALE_OUTPUT_CURSOR). Fail closed exactly once; never retry.
+            // Classify the authoritative tail rejection:
+            //  - TARGET_GONE is deterministic — the tmux session/pane
+            //    lifecycle is confirmed gone (kill_session / server exit), so
+            //    it is a natural backend_exit, never a backend_error.
+            //  - STALE_OUTPUT_CURSOR means this observation's cursor rotated
+            //    out of the retained output window (the detached/pumped reader
+            //    fell behind the 2 x 4 MiB retention). The gap cannot be
+            //    replayed; signal the manager to reset the stream so the
+            //    client auto-reopens a fresh generation (slow_consumer) rather
+            //    than receiving an unrecoverable backend_error close.
+            //  - RECOVERY_REQUIRED / INTERNAL / transport faults are
+            //    uncertain: continuity may or may not be intact, so they stay
+            //    on the fail-closed backend_error path and never retry.
+            // Classification reads the wire error code rather than instanceof
+            // because the compound channel bundles its own copy of the error
+            // class; TARGET_GONE / STALE_OUTPUT_CURSOR are specific structured
+            // codes that only the terminal-control authority attaches.
+            const errorCode = terminalControlErrorCode(error);
+            if (errorCode === "TARGET_GONE") {
+              await this.failBackendExit(record, TERMINAL_EXIT_FORCED_TERMINATION);
+              return;
+            }
+            if (errorCode === "STALE_OUTPUT_CURSOR") {
+              await this.failResetRequired(record);
+              return;
+            }
             await this.failClosed(record);
             return;
           }

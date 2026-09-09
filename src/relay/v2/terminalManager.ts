@@ -385,6 +385,16 @@ export interface RelayV2TerminalBackendClose {
   exitCode: number | null;
 }
 
+export interface RelayV2TerminalBackendReset {
+  /**
+   * The byte-plane observation fell behind the backend's retained output
+   * window: the gap is unrecoverable and the client must reopen a fresh
+   * generation to resume. This is the same slow-consumer condition the ring
+   * gap path resets for; it is never a terminal close.
+   */
+  reason: "slow_consumer";
+}
+
 export interface RelayV2TerminalBackendObserver {
   /**
    * The backend must await every callback in source order and deliver onClosed
@@ -394,6 +404,16 @@ export interface RelayV2TerminalBackendObserver {
    */
   onBytes(data: Uint8Array): Promise<void>;
   onClosed(result: RelayV2TerminalBackendClose): Promise<void>;
+  /**
+   * Optional. Invoked at most once when the byte-plane observation loses
+   * output continuity (its cursor rotated out of the backend's retained
+   * window while no reader could drain) and the gap cannot be replayed. The
+   * manager responds by resetting the stream (terminal.reset_required,
+   * slow_consumer) so the client reopens a fresh generation automatically
+   * instead of receiving an un-recoverable backend_error close. When the
+   * callback is absent the byte plane falls back to a backend_error close.
+   */
+  onResetRequired?(reset: RelayV2TerminalBackendReset): Promise<void>;
 }
 
 export interface RelayV2TerminalByteHandle {
@@ -3374,6 +3394,9 @@ export class RelayV2TerminalManager {
                 normalizeBackendClose(result),
               ));
             },
+            onResetRequired: async () => {
+              await this.enqueue(() => this.backendResetRequired(key, generation));
+            },
           },
         ),
         async (lateHandle) => {
@@ -5548,6 +5571,24 @@ export class RelayV2TerminalManager {
     const stream = this.streams.get(key);
     if (!stream || stream.generation !== generation || stream.status === "lost") return;
     await this.loseStream(stream, "stream_lost", true);
+  }
+
+  private async backendResetRequired(key: string, generation: string): Promise<void> {
+    const stream = this.streams.get(key);
+    if (!stream || stream.generation !== generation || stream.close || stream.status === "lost") {
+      return;
+    }
+    // The byte-plane observation lost output continuity: its tail cursor
+    // rotated out of the backend's retained output window (the daemon retains
+    // only the last 2 x 4 MiB) while the reader was detached or paused, so the
+    // gap cannot be replayed. This is the same slow-consumer condition the
+    // ring-gap path resets for; loseStream sends terminal.reset_required on a
+    // bound route (the client reopens a fresh generation automatically) and
+    // disposes this gap-dead attachment. On an unbound (still detached) stream
+    // the reset frame is skipped, but loseStream still retires the stream so a
+    // later terminal.open reconciles it as a reset rather than a backend_error.
+    await this.loseStream(stream, "slow_consumer", true);
+    await this.refreshBackpressure();
   }
 
   private async appendOutput(stream: TerminalStream, data: Uint8Array): Promise<boolean> {

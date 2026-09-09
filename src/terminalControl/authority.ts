@@ -1549,6 +1549,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         if (error instanceof TerminalControlProtocolError && error.code === "STALE_OUTPUT_CURSOR") {
           throw error;
         }
+        const goneWhileTailing = this.tailGoneError(state, target, error);
+        if (goneWhileTailing) throw goneWhileTailing;
         markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError(
@@ -1784,6 +1786,31 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     target.updatedAt = isoNow(this.now);
     saveTerminalControlState(state, this.statePath);
     return true;
+  }
+
+  /**
+   * A tail runs after assertTargetCurrent, so a TARGET_GONE / TARGET_NOT_FOUND
+   * raised by the backend mid-read is a deterministic signal that the tmux
+   * lifecycle ended under the observer (kill_session / server exit landing in
+   * the read window), not an uncertain continuity fault. Retire the incarnation
+   * and re-surface TARGET_GONE so observers classify the close as a natural
+   * backend exit; returns null for any other (uncertain) error, which the
+   * caller keeps on the RECOVERY_REQUIRED path.
+   */
+  private tailGoneError(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+    error: unknown,
+  ): TerminalControlProtocolError | null {
+    if (
+      error instanceof TerminalControlProtocolError
+      && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+    ) {
+      invalidateTarget(target, this.now);
+      saveTerminalControlState(state, this.statePath);
+      return new TerminalControlProtocolError("TARGET_GONE", error.message);
+    }
+    return null;
   }
 
   private async assertTargetCurrent(
@@ -2756,6 +2783,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         if (error instanceof TerminalControlProtocolError && error.code === "STALE_OUTPUT_CURSOR") {
           throw error;
         }
+        const goneWhileTailing = this.tailGoneError(state, target, error);
+        if (goneWhileTailing) throw goneWhileTailing;
         markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError(
