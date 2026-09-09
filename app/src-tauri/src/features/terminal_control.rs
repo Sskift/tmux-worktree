@@ -22,13 +22,30 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
 const REMOTE_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-// Liveness/status/ready probes must fail fast: the socket connecting but never
+// Liveness/ready probes must fail fast: the socket connecting but never
 // answering (wedged daemon: store lock stuck, reused pid, SIGKILLed mid-message)
 // must surface within a few seconds instead of blocking every 1s status poll
-// and keystroke for the full long-call window. 4s covers a live cold-starting
-// daemon (the bundled node daemon answers ping in ~100ms; probe calls are not
-// serialized behind the store lock) while bounding a non-answering socket.
-const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+// and keystroke for the full long-call window. ping is lock-free — the daemon
+// answers it straight from its request handler without taking the store lock
+// (a live cold-starting daemon answers in ~1ms) — so 4s is enough and gives
+// the fastest wedged-event-loop detection. This must stay SHORTER than the
+// lock-taking probe window below.
+const CONTROL_PING_TIMEOUT: Duration = Duration::from_secs(4);
+// Lock-taking observation probes (ownership.status / lease.renew) serialize
+// behind the daemon's single store lock just like input calls. When another
+// client holds the lock for a long cold-resume agent message, a busy-but-alive
+// daemon does NOT stay silent: its lock acquisition waits LOCK_WAIT_MS
+// (src/terminalControl/store.ts: `LOCK_WAIT_MS = 5_000`) and then answers with
+// a retryable RESOURCE_EXHAUSTED envelope (the C025 "alive but busy" signal).
+// This deadline MUST strictly exceed that lock wait so the answer is received
+// (unresponsive=false -> transient, lease kept, C025 preserved) instead of the
+// read timing out first and being misclassified as a wedged, non-answering
+// socket. 8s = 5s lock wait + ~3s scheduling/frame/scheduler margin; it is
+// still far under the 60s long-call window. Keep this coupled to the daemon's
+// LOCK_WAIT_MS — if that rises, raise this too. A truly wedged daemon (event
+// loop stuck, never processing) is still caught: it never answers ping either,
+// and the streak escalation below spans >90s regardless.
+const CONTROL_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 // Long input calls may queue behind the daemon's single store lock while a
 // cold-resume agent message serializes (up to ~45s; the daemon keeps the socket
 // to its 50s idle bound — C025). This window must stay 60s so those calls keep
@@ -812,12 +829,14 @@ fn request(kind: &str, fields: Value) -> Value {
     Value::Object(object)
 }
 
-/// A single ready probe. Uses the short probe deadline and returns its actual
-/// error so a connected-but-never-answering socket (a fully stuck daemon event
-/// loop) keeps the `unresponsive` marker that feeds the non-answering streak,
-/// while a refused connect (no daemon yet) stays `unresponsive: false`.
+/// A single ready probe. Uses the short ping deadline (ping is lock-free, so a
+/// live daemon answers in ~1ms even while another request holds the store lock)
+/// and returns its actual error so a connected-but-never-answering socket (a
+/// fully stuck daemon event loop) keeps the `unresponsive` marker that feeds the
+/// non-answering streak, while a refused connect (no daemon yet) stays
+/// `unresponsive: false`.
 fn server_ready_probe() -> Result<(), TerminalControlCallError> {
-    send_once(&request("ping", json!({})), CONTROL_PROBE_TIMEOUT).map(|_| ())
+    send_once(&request("ping", json!({})), CONTROL_PING_TIMEOUT).map(|_| ())
 }
 
 fn apply_local_runtime_namespace(command: &mut Command) -> Result<(), String> {
@@ -935,14 +954,19 @@ fn ensure_server(
     }
 }
 
-/// Per-call socket timeout. Liveness/observation probes use a short deadline so
-/// a non-answering daemon surfaces in seconds; input and ownership-mutation
+/// Per-call socket timeout. ping is lock-free and uses the short liveness
+/// deadline so a non-answering daemon surfaces in seconds. ownership.status and
+/// lease.renew are observation probes BUT take the daemon's store lock, so they
+/// use the lock-taking probe window: it must exceed the daemon's LOCK_WAIT_MS
+/// (5s) to receive a busy daemon's RESOURCE_EXHAUSTED answer instead of timing
+/// out and misreading lock contention as a wedge. Input and ownership-mutation
 /// calls may legitimately queue behind a long cold-resume agent message (up to
 /// ~45s; the daemon keeps the socket to its 50s idle bound — C025) and keep the
 /// full long-call window so they do not abandon an answer in flight.
 fn control_call_timeout(kind: &str) -> Duration {
     match kind {
-        "ping" | "ownership.status" | "lease.renew" => CONTROL_PROBE_TIMEOUT,
+        "ping" => CONTROL_PING_TIMEOUT,
+        "ownership.status" | "lease.renew" => CONTROL_LOCK_PROBE_TIMEOUT,
         _ => CONTROL_LONG_CALL_TIMEOUT,
     }
 }
@@ -1879,16 +1903,16 @@ mod tests {
 
         let first = request("ping", json!({}));
         assert_eq!(
-            send_once(&first, CONTROL_PROBE_TIMEOUT).unwrap()["authority"],
+            send_once(&first, control_call_timeout("ping")).unwrap()["authority"],
             "test"
         );
         let second = request("ownership.status", json!({ "controlTargetId": "target" }));
-        let error = send_once(&second, CONTROL_PROBE_TIMEOUT).unwrap_err();
+        let error = send_once(&second, control_call_timeout("ownership.status")).unwrap_err();
         assert_eq!(error.code, "PERMISSION_DENIED");
         assert_eq!(error.message, "owned by feishu");
         assert!(!error.unresponsive, "a daemon error envelope is responsive");
         let third = request("ping", json!({}));
-        let mismatch = send_once(&third, CONTROL_PROBE_TIMEOUT).unwrap_err();
+        let mismatch = send_once(&third, control_call_timeout("ping")).unwrap_err();
         assert_eq!(mismatch.code, "UNAVAILABLE");
         assert_eq!(
             mismatch.message,
@@ -2039,7 +2063,8 @@ mod tests {
         });
 
         let started = Instant::now();
-        let error = send_once(&request("ping", json!({})), CONTROL_PROBE_TIMEOUT).unwrap_err();
+        let error =
+            send_once(&request("ping", json!({})), control_call_timeout("ping")).unwrap_err();
         let elapsed = started.elapsed();
 
         server.join().unwrap();
@@ -2052,12 +2077,12 @@ mod tests {
             "a socket that connected but never answered must be marked unresponsive"
         );
         assert!(
-            elapsed >= CONTROL_PROBE_TIMEOUT,
-            "ping waited the full probe deadline, got {elapsed:?}"
+            elapsed >= CONTROL_PING_TIMEOUT,
+            "ping waited the full liveness deadline, got {elapsed:?}"
         );
         assert!(
-            elapsed < CONTROL_PROBE_TIMEOUT + Duration::from_secs(2),
-            "ping returned in {elapsed:?}, the short probe window, not the 60s long-call window"
+            elapsed < CONTROL_PING_TIMEOUT + Duration::from_secs(2),
+            "ping returned in {elapsed:?}, the short liveness window, not the 60s long-call window"
         );
         assert!(
             elapsed < CONTROL_LONG_CALL_TIMEOUT,
@@ -2066,13 +2091,28 @@ mod tests {
     }
 
     #[test]
-    fn probe_calls_use_the_short_timeout_and_input_calls_the_long_window() {
-        assert_eq!(control_call_timeout("ping"), CONTROL_PROBE_TIMEOUT);
+    fn probe_calls_use_graded_timeouts_and_input_calls_the_long_window() {
+        // ping is lock-free and uses the shortest liveness deadline.
+        assert_eq!(control_call_timeout("ping"), CONTROL_PING_TIMEOUT);
+        // ownership.status / lease.renew take the store lock and must out-wait
+        // the daemon's LOCK_WAIT_MS (5s) to receive a busy RESOURCE_EXHAUSTED.
         assert_eq!(
             control_call_timeout("ownership.status"),
-            CONTROL_PROBE_TIMEOUT
+            CONTROL_LOCK_PROBE_TIMEOUT
         );
-        assert_eq!(control_call_timeout("lease.renew"), CONTROL_PROBE_TIMEOUT);
+        assert_eq!(
+            control_call_timeout("lease.renew"),
+            CONTROL_LOCK_PROBE_TIMEOUT
+        );
+        // The lock-taking probe window strictly exceeds the daemon lock wait;
+        // ping stays faster. This is the C025 coupling: if it ever inverts, a
+        // busy daemon's answer becomes un-receivable and lock contention is
+        // misread as a wedge.
+        assert!(
+            CONTROL_LOCK_PROBE_TIMEOUT > Duration::from_secs(5),
+            "lock-taking probes must out-wait the daemon's 5s LOCK_WAIT_MS"
+        );
+        assert!(CONTROL_PING_TIMEOUT < CONTROL_LOCK_PROBE_TIMEOUT);
         assert_eq!(control_call_timeout("input.raw"), CONTROL_LONG_CALL_TIMEOUT);
         assert_eq!(
             control_call_timeout("input.agent-message"),
@@ -2189,6 +2229,128 @@ mod tests {
             );
         }
         assert_eq!(control.unresponsive_streak, 0);
+    }
+
+    #[test]
+    fn lock_waiting_busy_daemon_answer_is_received_not_misread_as_a_wedge() {
+        // C025 regression at the timing level: a busy-but-alive daemon holds the
+        // store lock for another client's long request. Its lock acquisition
+        // waits LOCK_WAIT_MS (5s, src/terminalControl/store.ts) and THEN answers
+        // ownership.status / lease.renew with a retryable RESOURCE_EXHAUSTED.
+        // The client's probe deadline must out-wait that 5s so the answer is
+        // received (unresponsive=false -> transient, lease kept, streak frozen)
+        // instead of the read timing out first and being misclassified as a
+        // wedged, non-answering socket. The fake daemon below replies at ~5s —
+        // after the old 4s probe deadline but inside the 8s lock-probe window.
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let path = PathBuf::from(format!(
+            "/tmp/tw-terminal-control-rust-busy-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("TW_TERMINAL_CONTROL_SOCKET", &path);
+
+        // Serve each accepted connection on its own thread: read the request,
+        // hold for the daemon's lock-wait duration, then send the busy answer.
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(line.trim()).unwrap();
+                    // Mirror the daemon: LOCK_WAIT_MS = 5s before answering busy.
+                    std::thread::sleep(Duration::from_secs(5));
+                    let response = json!({
+                        "protocolVersion": 1,
+                        "requestId": request["requestId"],
+                        "ok": false,
+                        "error": {
+                            "code": "RESOURCE_EXHAUSTED",
+                            "message": "timed out waiting for terminal-control state lock",
+                            "retryable": true,
+                        },
+                    });
+                    stream
+                        .write_all(format!("{response}\n").as_bytes())
+                        .unwrap();
+                });
+            }
+        });
+
+        // Issue both lock-taking probes concurrently (separate connections) so
+        // the wall-clock cost is one ~5s wait, not two.
+        let status = std::thread::spawn(|| {
+            let started = Instant::now();
+            let error = send_once(
+                &request(
+                    "ownership.status",
+                    json!({ "controlTargetId": "target-busy" }),
+                ),
+                control_call_timeout("ownership.status"),
+            )
+            .unwrap_err();
+            (started.elapsed(), error)
+        });
+        let renew = std::thread::spawn(|| {
+            let started = Instant::now();
+            let lease = json!({
+                "controlTargetId": "target-busy",
+                "controlEpoch": "epoch-busy",
+                "leaseId": "lease-busy",
+                "fence": "7",
+                "owner": { "kind": "dashboard", "instanceId": "dashboard:held" },
+                "expiresAt": "2026-09-09T00:00:00.000Z",
+            });
+            let error = send_once(
+                &request("lease.renew", json!({ "lease": lease })),
+                control_call_timeout("lease.renew"),
+            )
+            .unwrap_err();
+            (started.elapsed(), error)
+        });
+
+        let (status_elapsed, status_error) = status.join().unwrap();
+        let (renew_elapsed, renew_error) = renew.join().unwrap();
+        server.join().unwrap();
+        std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET");
+        let _ = std::fs::remove_file(path);
+
+        for (label, elapsed, error) in [
+            ("ownership.status", status_elapsed, status_error),
+            ("lease.renew", renew_elapsed, renew_error),
+        ] {
+            assert_eq!(
+                error.code, "RESOURCE_EXHAUSTED",
+                "{label}: the busy daemon's 5s answer must be received"
+            );
+            assert!(
+                !error.unresponsive,
+                "{label}: a RESOURCE_EXHAUSTED envelope is a daemon answer (C025), never a wedge"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(4_500),
+                "{label}: replied at {elapsed:?} — must be past the old 4s deadline that caused the false timeout"
+            );
+            assert!(
+                elapsed < CONTROL_LOCK_PROBE_TIMEOUT,
+                "{label}: received in {elapsed:?}, inside the {CONTROL_LOCK_PROBE_TIMEOUT:?} lock-probe window (not a timeout)"
+            );
+
+            // The received busy answer must not advance the non-answering
+            // streak and must keep the lease/HELD state.
+            let mut control = held_control();
+            let policy = short_streak_policy();
+            classify_control_error_with_policy(&mut control, &error, Instant::now(), &policy);
+            assert_eq!(
+                control.unresponsive_streak, 0,
+                "{label}: a busy answer must not accumulate an unresponsive streak"
+            );
+            assert!(control.lease.is_some(), "{label}: C025 keeps the lease");
+            assert_eq!(control.last_state, "HELD", "{label}: C025 never escalates");
+        }
     }
 
     #[test]
