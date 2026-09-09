@@ -34,6 +34,14 @@ pub(crate) const REMOTE_CMD_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_sec
 pub(crate) const REMOTE_CMD_REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Remote worktree `find` scan and `git worktree remove` over a large base.
 pub(crate) const REMOTE_CMD_REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Remote source install of tw (`git clone` + `npm install` + `npm run build`
+/// + `npm link`) on a fresh or loaded devbox.
+///
+/// A cold clone plus the tsup/esbuild dependency tree and a full build
+/// routinely take 2–10 minutes, so the 120s probe budget would deterministically
+/// kill a slow-but-successful install. 15 minutes matches the other heavy
+/// remote-op budgets while still bounding a genuinely wedged install.
+pub(crate) const REMOTE_CMD_REMOTE_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn ssh_control_directory_in(home: &Path, namespace: &str) -> Result<PathBuf, String> {
     let directory = home.join(".tmux-worktree").join(namespace);
@@ -777,7 +785,18 @@ pub(crate) fn run_remote_cmd_check(
     host: &HostConfig,
     remote_cmd: &[&str],
 ) -> Result<String, String> {
-    let output = run_remote_cmd_output(host, remote_cmd)?;
+    run_remote_cmd_check_with_timeout(host, remote_cmd, REMOTE_CMD_CHECK_TIMEOUT)
+}
+
+/// Same as [`run_remote_cmd_check`] with an explicit hard-timeout budget for
+/// long-running remote operations (e.g. source install: clone + npm install +
+/// build).
+pub(crate) fn run_remote_cmd_check_with_timeout(
+    host: &HostConfig,
+    remote_cmd: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let output = run_remote_cmd_output_with_timeout(host, remote_cmd, timeout)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ssh on {} failed: {}", host.label, stderr.trim()));
@@ -884,7 +903,8 @@ mod tests {
         ssh_command_with_control_path, ssh_control_path_in, take_proxy_read_outcome,
         terminal_control_ssh_bind_path_len, terminal_control_ssh_digest,
         terminal_control_ssh_fingerprint, terminal_control_ssh_path_for_directory,
-        terminal_control_ssh_path_in, TerminalControlProxyReadState,
+        terminal_control_ssh_path_in, TerminalControlProxyReadState, REMOTE_CMD_CHECK_TIMEOUT,
+        REMOTE_CMD_REMOTE_INSTALL_TIMEOUT,
     };
     use crate::remote::HostConfig;
     use std::os::unix::net::UnixListener;
@@ -1217,5 +1237,19 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "piped-bytes"
         );
+    }
+
+    #[test]
+    fn remote_source_install_budget_dwarfs_the_probe_default() {
+        // install_host_tw_from_source runs git clone + npm install + npm run
+        // build on the remote host (2-10 min cold/loaded); it must never ride
+        // the 120s probe/check default or a slow-but-successful install is
+        // killed deterministically.
+        assert!(
+            REMOTE_CMD_REMOTE_INSTALL_TIMEOUT >= Duration::from_secs(10 * 60),
+            "remote source-install budget must be minutes, got {:?}",
+            REMOTE_CMD_REMOTE_INSTALL_TIMEOUT
+        );
+        assert!(REMOTE_CMD_REMOTE_INSTALL_TIMEOUT > REMOTE_CMD_CHECK_TIMEOUT);
     }
 }
