@@ -846,6 +846,7 @@ test("remote exact child never restarts a legacy daemon with active input owners
       }],
     }, statePath);
 
+    let rejection;
     await assert.rejects(
       compound.ensureRelayV2RemoteExactCompoundDaemonV1({
         daemonSocketPath: socketPath,
@@ -857,7 +858,25 @@ test("remote exact child never restarts a legacy daemon with active input owners
           idleExitMs: 30_000,
         },
       }),
-      /terminal input is currently active/,
+      // The compound entry is an independently bundled ESM module, so its
+      // TerminalControlProtocolError constructor is a different identity than
+      // the one exported by dist/terminalControl/index.js (the same
+      // cross-bundle caveat the compound server's authorityProtocolError
+      // already handles); check the strict structural shape instead.
+      (error) => {
+        rejection = error;
+        return error?.name === "TerminalControlProtocolError"
+          && error?.code === "RESOURCE_EXHAUSTED"
+          && error?.retryable === true
+          && /busy-session/.test(error.message)
+          && /busy-owner/.test(error.message);
+      },
+      "a HELD target must surface a structured retryable BUSY naming the blocked target and owner",
+    );
+    assert.match(
+      rejection.message,
+      /older tw terminal daemon|terminal-control serve|tw upgrade/,
+      "the rejection must tell the user how to clear the old daemon",
     );
     assert.equal(
       terminalControl.terminalControlStoreLockOwnerProcessId(serverLockPath),
@@ -865,6 +884,121 @@ test("remote exact child never restarts a legacy daemon with active input owners
     );
     assert.equal(existsSync(compoundSocketPath), false);
   } finally {
+    if (legacy.exitCode === null && legacy.signalCode === null) {
+      try { legacy.kill("SIGTERM"); } catch {}
+    }
+    await waitForLong(
+      () => !existsSync(serverLockPath),
+      "busy legacy terminal-control daemon did not stop",
+    ).catch(() => undefined);
+    rmSync(socketPath, { force: true });
+    rmSync(compoundSocketPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The hidden SSH child (tw rpc-v2-remote-exact-v1) is how a remote phone
+// actually reaches the daemon. When the incumbent daemon cannot be upgraded
+// due to active terminal input, the child must emit the structured BUSY
+// compound error frame on stdout (instead of dying with stderr/non-zero exit,
+// which the host channel would classify as the non-retryable
+// PROCESS_FAILED), then exit cleanly once the host closes stdin.
+test("remote exact stdio child emits a structured retryable BUSY frame for a busy legacy daemon", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tw-relay-v2-busy-stdio-")));
+  const statePath = join(root, "terminal-control-state-v1.json");
+  const socketPath = join(tmpdir(), `twv2s-${process.pid}-${root.slice(-6)}.sock`);
+  const compoundSocketPath = compound.relayV2RemoteExactCompoundSocketPathV1(socketPath);
+  const serverLockPath = `${socketPath}.server.lock`;
+  terminalControl.saveTerminalControlState({
+    version: 1,
+    controlEpoch: "pre-busy-stdio-epoch",
+    targets: [],
+  }, statePath);
+  const legacy = spawn(process.execPath, [legacyDaemonFixture, socketPath, statePath], {
+    stdio: "ignore",
+  });
+  let child;
+  try {
+    await waitForLong(
+      () => existsSync(socketPath) && existsSync(serverLockPath),
+      "busy legacy terminal-control daemon did not start",
+    );
+    // Seed the HELD target BEFORE the stdio child starts so its first
+    // upgrade check observes a live, busy daemon (no auto-start race).
+    terminalControl.saveTerminalControlState({
+      version: 1,
+      controlEpoch: "busy-stdio-epoch",
+      targets: [{
+        controlTargetId: "busy-stdio-control-target",
+        lifecycle: "ACTIVE",
+        managedSession: {
+          name: "busy-stdio-session",
+          kind: "terminal",
+          createdAt: "2026-08-13T00:00:00.000Z",
+        },
+        backend: { kind: "tmux", tmuxInstanceId: "busy-stdio-tmux" },
+        outputGeneration: "busy-stdio-generation",
+        ownership: {
+          state: "HELD",
+          fence: "1",
+          owner: { kind: "local-cli", instanceId: "busy-stdio-owner" },
+          leaseId: "busy-stdio-lease",
+          leaseExpiresAt: "2099-08-13T00:00:00.000Z",
+        },
+        revision: "1",
+        completedOperations: [],
+        updatedAt: "2026-08-13T00:00:00.000Z",
+      }],
+    }, statePath);
+
+    child = spawn(process.execPath, [terminalControlCli, "rpc-v2-remote-exact-v1"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        TW_TERMINAL_CONTROL_SOCKET: socketPath,
+        TW_TERMINAL_CONTROL_STATE: statePath,
+      },
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+
+    const frameText = await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("stdio child did not emit a compound frame within 15s")),
+        15_000,
+      );
+      const onData = () => {
+        const text = Buffer.concat(stdoutChunks).toString("utf8");
+        if (text.includes("\n")) {
+          clearTimeout(timer);
+          resolve(text.slice(0, text.indexOf("\n") + 1));
+        }
+      };
+      child.stdout.on("data", onData);
+      onData();
+    });
+    const frame = JSON.parse(frameText);
+    assert.equal(frame.protocolVersion, 1);
+    assert.equal(frame.ok, false);
+    assert.equal(frame.error.code, "RESOURCE_EXHAUSTED");
+    assert.equal(frame.error.retryable, true);
+    assert.match(frame.error.message, /busy-stdio-session/);
+    assert.match(frame.error.message, /busy-stdio-owner/);
+    assert.match(frame.error.message, /terminal-control serve|tw upgrade/);
+    assert.equal(existsSync(compoundSocketPath), false, "the busy daemon must not have been restarted");
+
+    // The host closes the channel immediately after the rejection; ending
+    // stdin lets the child exit cleanly (no stderr, exit code 0).
+    child.stdin.end();
+    const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(exitCode, 0, `child exited non-zero; stderr=${Buffer.concat(stderrChunks).toString().slice(0, 300)}`);
+    assert.equal(Buffer.concat(stderrChunks).length, 0);
+  } finally {
+    if (child.exitCode === null) {
+      try { child.kill("SIGTERM"); } catch {}
+    }
     if (legacy.exitCode === null && legacy.signalCode === null) {
       try { legacy.kill("SIGTERM"); } catch {}
     }

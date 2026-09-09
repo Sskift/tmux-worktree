@@ -36,13 +36,25 @@ const MAX_CONTINUITY_BYTES = 16 * 1024;
  * committed state and its H0 proof remain authoritative. Callers fast-fail
  * with a retryable structured error and keep the host registered instead of
  * tearing readiness down.
+ *
+ * ESTALE (stale NFS file handle after the state dir was replaced on a network
+ * mount) and EDQUOT (disk quota exceeded) are environmental faults with the
+ * same pre-commit, nothing-landed semantics as EIO/ENOSPC. ETIMEDOUT and EBUSY
+ * are deliberately NOT classified by errno alone: ETIMEDOUT normally
+ * originates from network sockets rather than state/lock fs operations, and an
+ * EBUSY errno carries no provenance tying it to the state directory; lock
+ * contention against a live owner already surfaces through the bounded 5s
+ * lock-wait timeout message below, so adding those codes globally would risk
+ * fast-failing unrelated transient errors as storage faults.
  */
 const RELAY_V2_HOST_STATE_STORAGE_FAULT_CODES: ReadonlySet<string> = new Set([
   "EACCES",
   "EPERM",
   "EROFS",
   "ENOSPC",
+  "EDQUOT",
   "EIO",
+  "ESTALE",
 ]);
 
 export type RelayV2MaterializedReadinessFenceReason =

@@ -21,6 +21,7 @@ import type {
 import type {
   RelayV2HostStateStore,
 } from "./hostState.js";
+import { isRelayV2HostStateStorageFault } from "./hostState.js";
 import {
   isRelayV2MaterializedStateError,
   RelayV2MaterializedStateError,
@@ -1692,7 +1693,32 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       return;
     }
 
-    const commandDedupeWindow = await this.options.commands.issueDedupeWindow();
+    let commandDedupeWindow: RelayV2CommandDedupeWindow;
+    try {
+      commandDedupeWindow = await this.options.commands.issueDedupeWindow();
+    } catch (error) {
+      // Issuing the dedupe window only appends a materialized window record.
+      // A bounded local storage/IO fault (read-only/permission/full-disk
+      // state dir) lands before that commit, so nothing about the welcome
+      // result changed and the H0 proof remains authoritative. Drain a
+      // retryable structured CAPABILITY_UNAVAILABLE correlated to the hello
+      // request, then close with the existing authority_failure code (no new
+      // close reason): the client applies its structured-error backoff and
+      // reconnects once storage heals instead of reading a raw EACCES as an
+      // unstructured server fault.
+      if (isRelayV2HostStateStorageFault(error)) {
+        this.drainLocalError(
+          route,
+          pending,
+          "CAPABILITY_UNAVAILABLE",
+          "Relay v2 host persistent storage is temporarily unavailable; retry after reconnecting",
+          true,
+          { code: 1011, reason: "authority_failure" },
+        );
+        return;
+      }
+      throw error;
+    }
     const afterWindow = await this.verifyCurrentIdentity(route, pending, true);
     if (!afterWindow || afterWindow.hostEpoch !== identity.hostEpoch) return;
     if (!this.isAdmitted(route)) return;
