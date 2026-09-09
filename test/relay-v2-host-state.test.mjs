@@ -2841,3 +2841,81 @@ test("HostState terminal nested corrupt and future schemas fail closed without r
     });
   }
 });
+
+// A6: a state directory made temporarily unwritable (read-only mount,
+// chmod by security software) must (1) report a deterministic storage fault,
+// and (2) not leave a state lock behind that wedges every subsequent
+// acquisition after storage heals.
+test("A6: unwritable state dir reports a storage fault and reclaims its orphaned lock after storage heals", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const before = await store.read();
+    const stateRoot = dirname(h.paths.lock);
+
+    // Hold a lock "live" from this process to seed the active-lock registry,
+    // then simulate a state turn whose release could not remove the on-disk
+    // lock because the directory was read-only: leave the owner.json on disk
+    // but drop the in-memory active registration (mirrors releaseStoreLock on
+    // EACCES). First perform a serialize while read-only so the orphan's
+    // release path is exercised end to end.
+    const { chmodSync, mkdirSync, writeFileSync, readdirSync } = await import("node:fs");
+    chmodSync(stateRoot, 0o000);
+    // Read during fault must reject with a classified storage fault.
+    await assert.rejects(
+      store.read(),
+      (error) => hostState.isRelayV2HostStateStorageFault(error) === true,
+    );
+    chmodSync(stateRoot, 0o700);
+
+    // Now leave an orphaned owner.json owned by THIS process (the residue of a
+    // release that could not unlink under chmod 000).
+    mkdirSync(h.paths.lock, { mode: 0o700 });
+    writeFileSync(
+      join(h.paths.lock, "owner.json"),
+      `${JSON.stringify({ owner: `${process.pid}-a6-orphan`, pid: process.pid, createdAt: Date.now() })}\n`,
+      { mode: 0o600 },
+    );
+
+    // The orphan must be reclaimed immediately (no 60s stale window, since the
+    // pid is live) so reads succeed promptly once storage is writable again.
+    const started = Date.now();
+    const after = await store.read();
+    const elapsed = Date.now() - started;
+    assert.equal(after.hostEpoch, before.hostEpoch, "lineage must survive the storage fault");
+    assert.ok(elapsed < 2_000, `orphan reclaim must not wait out LOCK_WAIT (took ${elapsed}ms)`);
+    assert.deepEqual(readdirSync(stateRoot).filter((e) => e === "state-v1.lock"), []);
+  } finally {
+    // Ensure permissions are restored so cleanup can remove the home dir.
+    try {
+      const { chmodSync } = await import("node:fs");
+      chmodSync(h.paths.lock, 0o700);
+      chmodSync(dirname(h.paths.lock), 0o700);
+    } catch {}
+    h.cleanup();
+  }
+});
+
+test("A6: isRelayV2HostStateStorageFault classifies deterministic storage errno but not commit uncertainty", async () => {
+  const eacces = Object.assign(new Error("eacces"), { code: "EACCES" });
+  const enospc = Object.assign(new Error("enospc"), { code: "ENOSPC" });
+  const erofs = Object.assign(new Error("rofs"), { code: "EROFS" });
+  const eperm = Object.assign(new Error("eperm"), { code: "EPERM" });
+  const eio = Object.assign(new Error("eio"), { code: "EIO" });
+  const etimedout = Object.assign(new Error("net"), { code: "ETIMEDOUT" });
+  const lockTimeout = new Error("timed out waiting for Relay v2 host state lock: /x/state-v1.lock");
+  for (const fault of [eacces, enospc, erofs, eperm, eio, lockTimeout]) {
+    assert.equal(hostState.isRelayV2HostStateStorageFault(fault), true, String(fault.code || fault.message));
+  }
+  assert.equal(hostState.isRelayV2HostStateStorageFault(etimedout), false);
+  assert.equal(
+    hostState.isRelayV2HostStateStorageFault(new hostState.RelayV2HostStateCapacityError(1, 1)),
+    false,
+    "capacity budget fencing is handled by its own readiness-fence path",
+  );
+  assert.equal(
+    hostState.isRelayV2HostStateStorageFault(new hostState.RelayV2HostStateCommitUncertainError("x")),
+    false,
+    "commit uncertainty must not be treated as a clean pre-commit storage fault",
+  );
+});
