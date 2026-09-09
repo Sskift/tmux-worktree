@@ -22,6 +22,51 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
 const REMOTE_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+// Liveness/ready probes must fail fast: the socket connecting but never
+// answering (wedged daemon: store lock stuck, reused pid, SIGKILLed mid-message)
+// must surface within a few seconds instead of blocking every 1s status poll
+// and keystroke for the full long-call window. ping is lock-free — the daemon
+// answers it straight from its request handler without taking the store lock
+// (a live cold-starting daemon answers in ~1ms) — so 4s is enough and gives
+// the fastest wedged-event-loop detection. This must stay SHORTER than the
+// lock-taking probe window below.
+const CONTROL_PING_TIMEOUT: Duration = Duration::from_secs(4);
+// Lock-taking observation probes (ownership.status / lease.renew) serialize
+// behind the daemon's single store lock just like input calls. When another
+// client holds the lock for a long cold-resume agent message, a busy-but-alive
+// daemon does NOT stay silent: its lock acquisition waits LOCK_WAIT_MS
+// (src/terminalControl/store.ts: `LOCK_WAIT_MS = 5_000`) and then answers with
+// a retryable RESOURCE_EXHAUSTED envelope (the C025 "alive but busy" signal).
+// This deadline MUST strictly exceed that lock wait so the answer is received
+// (unresponsive=false -> transient, lease kept, C025 preserved) instead of the
+// read timing out first and being misclassified as a wedged, non-answering
+// socket. 8s = 5s lock wait + ~3s scheduling/frame/scheduler margin; it is
+// still far under the 60s long-call window. Keep this coupled to the daemon's
+// LOCK_WAIT_MS — if that rises, raise this too. A truly wedged daemon (event
+// loop stuck, never processing) is still caught: it never answers ping either,
+// and the streak escalation below spans >90s regardless.
+const CONTROL_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+// Long input calls may queue behind the daemon's single store lock while a
+// cold-resume agent message serializes (up to ~45s; the daemon keeps the socket
+// to its 50s idle bound — C025). This window must stay 60s so those calls keep
+// their lease instead of abandoning an answer the daemon is about to send.
+const CONTROL_LONG_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+// The ensure_server ready loop has one overall budget rather than up to 80
+// probes times the per-probe timeout (which could be 80 minutes against a
+// wedged daemon). A healthy daemon answers in ~100-140ms; 10s gives a slow
+// cold machine headroom and still beats the user's tolerance.
+const ENSURE_SERVER_READY_BUDGET: Duration = Duration::from_secs(10);
+const ENSURE_SERVER_PROBE_SLEEP: Duration = Duration::from_millis(25);
+// Escalate a non-answering local control socket to RECOVERY_REQUIRED only
+// after a sustained streak, so a single slow poll (GC pause, cold filesystem,
+// the daemon briefly busy in one synchronous event-loop turn) never flaps the
+// Dashboard. Three consecutive unresponsive probes spanning more than 90s
+// match the ~1s poll cadence (3 misses alone could cluster in seconds, so the
+// 90s span requires the wedge to persist across the full status-refresh
+// window). Any success or any daemon answer resets the streak. Thresholds are
+// test-tunable via [`UnresponsiveStreakPolicy`].
+const UNRESPONSIVE_STREAK_REQUIRED: u32 = 3;
+const UNRESPONSIVE_STREAK_MIN_SPAN: Duration = Duration::from_secs(90);
 // A daemon spawned by the Dashboard self-terminates after this long with no
 // socket activity, so a Dashboard that was SIGKILLed/crashed leaves an orphan
 // that reclaims its socket and server lock within ~10 minutes instead of
@@ -109,6 +154,15 @@ impl TerminalControlState {
 pub(crate) struct TerminalControlCallError {
     pub(crate) code: String,
     pub(crate) message: String,
+    /// `true` when this UNAVAILABLE was proven to be a non-answering local
+    /// control socket: the socket connected (so a daemon holds it) but the read
+    /// deadline expired (or the connect/setup path timed out). Distinguished
+    /// from ordinary UNAVAILABLE/RESOURCE_EXHAUSTED — the latter cover a daemon
+    /// that IS answering but is serializing a long request behind its store
+    /// lock (C025). The unresponsive streak escalates to RECOVERY_REQUIRED;
+    /// answering-but-busy transient errors keep the lease forever. Never set
+    /// for daemon-returned error envelopes (a wedged daemon never sends one).
+    pub(crate) unresponsive: bool,
 }
 
 impl std::fmt::Display for TerminalControlCallError {
@@ -132,6 +186,14 @@ pub(crate) struct PtyControl {
     pub(crate) last_state: String,
     pub(crate) last_owner_kind: Option<String>,
     pub(crate) last_error: Option<String>,
+    /// Consecutive calls whose socket connected but never produced an answer
+    /// (a wedged, non-processing daemon), with the timestamp of the first one.
+    /// Any daemon answer resets the streak. Escalates to RECOVERY_REQUIRED only
+    /// after a sustained streak (see [`UnresponsiveStreakPolicy`]) so a busy
+    /// daemon serializing a long request (C025) — which answers with a
+    /// retryable error instead of timing out — never triggers recovery.
+    pub(crate) unresponsive_streak: u32,
+    pub(crate) unresponsive_since: Option<Instant>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -188,6 +250,7 @@ fn validated_dashboard_lease(
     let lease: TerminalControlLeaseWire =
         serde_json::from_value(value.clone()).map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: format!("terminal-control returned an invalid lease: {error}"),
         })?;
     let expected_instance = expected_owner
@@ -206,11 +269,13 @@ fn validated_dashboard_lease(
     {
         return Err(TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: "terminal-control returned a mismatched dashboard lease".to_string(),
         });
     }
     serde_json::to_value(lease).map_err(|error| TerminalControlCallError {
         code: "INTERNAL".to_string(),
+        unresponsive: false,
         message: format!("normalize terminal-control lease: {error}"),
     })
 }
@@ -222,6 +287,7 @@ fn dashboard_lease_from_result(
 ) -> Result<Value, TerminalControlCallError> {
     let lease = value.get("lease").ok_or_else(|| TerminalControlCallError {
         code: "UNAVAILABLE".to_string(),
+        unresponsive: false,
         message: "terminal-control returned no lease".to_string(),
     })?;
     validated_dashboard_lease(lease, expected_target_id, expected_owner)
@@ -335,7 +401,95 @@ impl PtyControl {
         self.last_state = "HELD".to_string();
         self.last_owner_kind = Some("dashboard".to_string());
         self.last_error = None;
+        self.note_control_responsive();
         Ok(())
+    }
+
+    /// A daemon answer (success or any error envelope) proves the socket is
+    /// processing; the non-answering streak, if any, is over.
+    fn note_control_responsive(&mut self) {
+        self.unresponsive_streak = 0;
+        self.unresponsive_since = None;
+    }
+
+    /// Records one connected-but-never-answered call. Returns `true` once the
+    /// streak is sustained: at least `policy.required` consecutive
+    /// non-answers spanning at least `policy.min_span` since the first. The
+    /// span gate means a single slow window (GC pause, cold filesystem, or a
+    /// sub-90s long request) never reaches escalation even if several probes
+    /// time out inside it.
+    fn note_control_unresponsive(
+        &mut self,
+        policy: &UnresponsiveStreakPolicy,
+        now: Instant,
+    ) -> bool {
+        if self.unresponsive_streak == 0 {
+            self.unresponsive_since = Some(now);
+        }
+        self.unresponsive_streak = self.unresponsive_streak.saturating_add(1);
+        let span = self
+            .unresponsive_since
+            .map(|first| now.saturating_duration_since(first))
+            .unwrap_or(Duration::ZERO);
+        self.unresponsive_streak >= policy.required && span >= policy.min_span
+    }
+}
+
+/// Tunable thresholds for the non-answering-socket escalation. Production uses
+/// [`UnresponsiveStreakPolicy::default`]; tests shrink them to exercise the
+/// count and span gates without waiting 90s.
+#[derive(Clone, Copy, Debug)]
+struct UnresponsiveStreakPolicy {
+    required: u32,
+    min_span: Duration,
+}
+
+impl Default for UnresponsiveStreakPolicy {
+    fn default() -> Self {
+        Self {
+            required: UNRESPONSIVE_STREAK_REQUIRED,
+            min_span: UNRESPONSIVE_STREAK_MIN_SPAN,
+        }
+    }
+}
+
+/// Routes a call error through the non-answering-socket streak. Returns `true`
+/// when the streak just escalated to RECOVERY_REQUIRED (caller must not apply
+/// any further classification). On a daemon answer (even an error) or a refused
+/// connect the streak resets and the caller applies normal classification.
+fn note_unresponsive_streak(
+    control: &mut PtyControl,
+    error: &TerminalControlCallError,
+    now: Instant,
+    policy: &UnresponsiveStreakPolicy,
+) -> bool {
+    if !error.unresponsive {
+        control.note_control_responsive();
+        return false;
+    }
+    if control.note_control_unresponsive(policy, now) {
+        let streak = control.unresponsive_streak;
+        // Sustained non-answering socket: force the existing recovery flow.
+        // Clearing the lease and setting RECOVERY_REQUIRED makes the Dashboard
+        // show the "Recover local input" action (handoff.force) instead of an
+        // indefinite HELD with no signal. Reset the streak so a failed recovery
+        // can re-escalate after another sustained window.
+        control.lease = None;
+        control.applied_size = None;
+        control.pending_handoff_id = None;
+        control.last_state = "RECOVERY_REQUIRED".to_string();
+        control.last_owner_kind = None;
+        control.last_error = Some(format!(
+            "terminal-control socket connected but stopped responding after {streak} consecutive attempts over {}s; use \"Recover local input\" to re-establish control",
+            policy.min_span.as_secs()
+        ));
+        control.note_control_responsive();
+        true
+    } else {
+        // Not yet sustained: keep the lease and last state (the next 1s poll
+        // reconciles if the daemon recovers), but surface the transport error.
+        control.last_error = Some(error.to_string());
+        false
     }
 }
 
@@ -367,6 +521,7 @@ fn decode_response_envelope(
     let decoded: Value =
         serde_json::from_slice(response).map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: format!("decode terminal-control response: {error}"),
         })?;
     let object = decoded.as_object();
@@ -394,6 +549,7 @@ fn decode_response_envelope(
     {
         return Err(TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: "terminal-control response envelope mismatch".to_string(),
         });
     }
@@ -414,6 +570,7 @@ fn decode_response_result(decoded: &Value) -> Result<Value, TerminalControlCallE
                 .and_then(Value::as_str)
                 .unwrap_or("terminal-control rejected the request")
                 .to_string(),
+            unresponsive: false,
         });
     }
     decoded
@@ -421,6 +578,7 @@ fn decode_response_result(decoded: &Value) -> Result<Value, TerminalControlCallE
         .cloned()
         .ok_or_else(|| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: "terminal-control response has no result".to_string(),
         })
 }
@@ -430,44 +588,64 @@ fn decode_response(body: &Value, response: &[u8]) -> Result<Value, TerminalContr
     decode_response_result(&decoded)
 }
 
-fn send_once(body: &Value) -> Result<Value, TerminalControlCallError> {
+/// Returns `true` for an IO deadline miss: the socket connected (a daemon
+/// holds it) but the daemon never drained the write or produced an answer.
+/// That is the "socket live but never answers" wedge (stuck store lock,
+/// reused pid, SIGKILLed mid-message) — distinct from a refused connect (no
+/// daemon) and from a daemon that answers with RESOURCE_EXHAUSTED/UNAVAILABLE
+/// (busy serializing a long request, C025).
+fn is_socket_deadline_miss(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn send_once(body: &Value, timeout: Duration) -> Result<Value, TerminalControlCallError> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|error| TerminalControlCallError {
         code: "UNAVAILABLE".to_string(),
+        unresponsive: false,
         message: format!("connect terminal-control {}: {error}", path.display()),
     })?;
     stream
-        // The daemon serializes one request at a time behind its store lock; a
-        // cold-resume agent message legitimately occupies it for up to ~45s
-        // (the daemon keeps the socket to its 50s idle bound). A 10s read
-        // timeout would abandon a queued request that the daemon is about to
-        // answer, surfacing as a dropped keystroke. Read/write waits cover that
-        // window; a dead connection still fails fast at connect instead.
-        .set_read_timeout(Some(Duration::from_secs(60)))
+        // Probe calls (ping/status/ready) pass a short deadline so a wedged,
+        // never-answering daemon surfaces in seconds; long input calls pass the
+        // full 60s window that covers a cold-resume agent message serialized
+        // behind the store lock (the daemon keeps the socket to its 50s idle
+        // bound — C025). A dead connection still fails fast at connect.
+        .set_read_timeout(Some(timeout))
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: format!("configure terminal-control read timeout: {error}"),
         })?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(60)))
+        .set_write_timeout(Some(timeout))
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: format!("configure terminal-control write timeout: {error}"),
         })?;
     let frame = serde_json::to_vec(body).map_err(|error| TerminalControlCallError {
         code: "INTERNAL".to_string(),
+        unresponsive: false,
         message: format!("encode terminal-control request: {error}"),
     })?;
     stream
         .write_all(&frame)
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            // The daemon connected but never drained the request frame: its
+            // event loop is wedged.
+            unresponsive: is_socket_deadline_miss(&error),
             message: format!("write terminal-control request: {error}"),
         })?;
     stream
         .write_all(b"\n")
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: is_socket_deadline_miss(&error),
             message: format!("finish terminal-control request: {error}"),
         })?;
     let mut reader = BufReader::new(stream);
@@ -478,11 +656,15 @@ fn send_once(body: &Value) -> Result<Value, TerminalControlCallError> {
         .read_until(b'\n', &mut response)
         .map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            // Connected but no answer before the deadline: the live socket is
+            // not processing requests. This is the streak-escalation signal.
+            unresponsive: is_socket_deadline_miss(&error),
             message: format!("read terminal-control response: {error}"),
         })?;
     if response.len() > MAX_RESPONSE_BYTES || !response.ends_with(b"\n") {
         return Err(TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: "terminal-control response is missing or too large".to_string(),
         });
     }
@@ -516,6 +698,7 @@ fn lock_remote_proxy_slot_until<'a>(
             Err(TryLockError::Poisoned(_)) => {
                 return Err(TerminalControlCallError {
                     code: "INTERNAL".to_string(),
+                    unresponsive: false,
                     message: "remote terminal-control proxy lane is poisoned".to_string(),
                 });
             }
@@ -524,6 +707,7 @@ fn lock_remote_proxy_slot_until<'a>(
                 if remaining.is_zero() {
                     return Err(TerminalControlCallError {
                         code: "UNAVAILABLE".to_string(),
+                        unresponsive: false,
                         message: format!(
                             "remote terminal-control hard timeout after {} ms waiting for the host lane",
                             REMOTE_PROXY_REQUEST_TIMEOUT.as_millis()
@@ -547,16 +731,19 @@ fn send_remote(
         .and_then(Value::as_str)
         .ok_or_else(|| TerminalControlCallError {
             code: "INTERNAL".to_string(),
+            unresponsive: false,
             message: "terminal-control request has no requestId".to_string(),
         })?;
     let mut frame = serde_json::to_vec(body).map_err(|error| TerminalControlCallError {
         code: "INTERNAL".to_string(),
+        unresponsive: false,
         message: format!("encode terminal-control request: {error}"),
     })?;
     frame.push(b'\n');
     if frame.len() > MAX_RESPONSE_BYTES {
         return Err(TerminalControlCallError {
             code: "INTERNAL".to_string(),
+            unresponsive: false,
             message: "terminal-control request exceeds the frame limit".to_string(),
         });
     }
@@ -568,6 +755,7 @@ fn send_remote(
     // endpoint snapshot after it finally reaches the head of the queue.
     let host = find_host(host_id).map_err(|message| TerminalControlCallError {
         code: "UNAVAILABLE".to_string(),
+        unresponsive: false,
         message,
     })?;
     let fingerprint = RemoteTerminalControlFingerprint::from(&host);
@@ -584,6 +772,7 @@ fn send_remote(
             spawn_remote_terminal_control_proxy(&host, &["sh", "-c", &command], MAX_RESPONSE_BYTES)
                 .map_err(|message| TerminalControlCallError {
                     code: "UNAVAILABLE".to_string(),
+                    unresponsive: false,
                     message: format!(
                         "start remote terminal-control proxy on {}: {message}",
                         host.label
@@ -596,6 +785,7 @@ fn send_remote(
         slot.proxy.take();
         return Err(TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
+            unresponsive: false,
             message: format!(
                 "remote terminal-control hard timeout after {} ms",
                 REMOTE_PROXY_REQUEST_TIMEOUT.as_millis()
@@ -613,6 +803,7 @@ fn send_remote(
             slot.proxy.take();
             return Err(TerminalControlCallError {
                 code: "UNAVAILABLE".to_string(),
+                unresponsive: false,
                 message: format!("remote terminal-control on {}: {message}", host.label),
             });
         }
@@ -638,8 +829,14 @@ fn request(kind: &str, fields: Value) -> Value {
     Value::Object(object)
 }
 
-fn server_is_ready() -> bool {
-    send_once(&request("ping", json!({}))).is_ok()
+/// A single ready probe. Uses the short ping deadline (ping is lock-free, so a
+/// live daemon answers in ~1ms even while another request holds the store lock)
+/// and returns its actual error so a connected-but-never-answering socket (a
+/// fully stuck daemon event loop) keeps the `unresponsive` marker that feeds the
+/// non-answering streak, while a refused connect (no daemon yet) stays
+/// `unresponsive: false`.
+fn server_ready_probe() -> Result<(), TerminalControlCallError> {
+    send_once(&request("ping", json!({})), CONTROL_PING_TIMEOUT).map(|_| ())
 }
 
 fn apply_local_runtime_namespace(command: &mut Command) -> Result<(), String> {
@@ -716,42 +913,62 @@ fn ensure_server(
     app: &tauri::AppHandle,
     state: &TerminalControlState,
 ) -> Result<(), TerminalControlCallError> {
-    if server_is_ready() {
+    if server_ready_probe().is_ok() {
         return Ok(());
     }
     let mut process = state.process.lock().unwrap();
-    if let Some(child) = process.as_mut() {
-        if matches!(child.try_wait(), Ok(None)) {
-            drop(process);
-            for _ in 0..80 {
-                if server_is_ready() {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            return Err(TerminalControlCallError {
-                code: "UNAVAILABLE".to_string(),
-                message: "terminal-control process did not become ready".to_string(),
-            });
-        }
-    }
-    *process = Some(
-        spawn_server(app).map_err(|message| TerminalControlCallError {
-            code: "UNAVAILABLE".to_string(),
-            message,
-        })?,
+    let already_running = matches!(
+        process.as_mut().map(|child| child.try_wait()),
+        Some(Ok(None))
     );
-    drop(process);
-    for _ in 0..80 {
-        if server_is_ready() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    if !already_running {
+        *process = Some(
+            spawn_server(app).map_err(|message| TerminalControlCallError {
+                code: "UNAVAILABLE".to_string(),
+                unresponsive: false,
+                message,
+            })?,
+        );
     }
-    Err(TerminalControlCallError {
-        code: "UNAVAILABLE".to_string(),
-        message: "terminal-control process did not become ready".to_string(),
-    })
+    drop(process);
+    // One overall ready budget rather than a fixed probe count times the
+    // per-probe timeout: against a wedged, never-answering daemon this returns
+    // after ~10s instead of up to 80 probes each blocking for the long-call
+    // window. A healthy daemon answers ping within ~100-140ms of spawning.
+    let deadline = Instant::now() + ENSURE_SERVER_READY_BUDGET;
+    loop {
+        match server_ready_probe() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Return the most recent probe error once the budget elapses.
+                // A connected-but-never-answering daemon keeps `unresponsive =
+                // true` so the caller's streak can eventually escalate; a
+                // refused connect (daemon still starting) reports the readiness
+                // failure without escalating.
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+        std::thread::sleep(ENSURE_SERVER_PROBE_SLEEP);
+    }
+}
+
+/// Per-call socket timeout. ping is lock-free and uses the short liveness
+/// deadline so a non-answering daemon surfaces in seconds. ownership.status and
+/// lease.renew are observation probes BUT take the daemon's store lock, so they
+/// use the lock-taking probe window: it must exceed the daemon's LOCK_WAIT_MS
+/// (5s) to receive a busy daemon's RESOURCE_EXHAUSTED answer instead of timing
+/// out and misreading lock contention as a wedge. Input and ownership-mutation
+/// calls may legitimately queue behind a long cold-resume agent message (up to
+/// ~45s; the daemon keeps the socket to its 50s idle bound — C025) and keep the
+/// full long-call window so they do not abandon an answer in flight.
+fn control_call_timeout(kind: &str) -> Duration {
+    match kind {
+        "ping" => CONTROL_PING_TIMEOUT,
+        "ownership.status" | "lease.renew" => CONTROL_LOCK_PROBE_TIMEOUT,
+        _ => CONTROL_LONG_CALL_TIMEOUT,
+    }
 }
 
 pub(crate) fn call_terminal_control(
@@ -766,7 +983,7 @@ pub(crate) fn call_terminal_control(
         return send_remote(state, host_id, &body);
     }
     ensure_server(app, state)?;
-    send_once(&body)
+    send_once(&body, control_call_timeout(kind))
 }
 
 fn ownership_fields(value: &Value) -> (String, Option<String>) {
@@ -804,6 +1021,7 @@ pub(crate) fn resolve_pty_control_target(
         .map(str::to_string)
         .ok_or_else(|| TerminalControlCallError {
             code: "RECOVERY_REQUIRED".to_string(),
+            unresponsive: false,
             message: "terminal-control resolve returned no target ID".to_string(),
         })
 }
@@ -830,6 +1048,8 @@ pub(crate) fn open_pty_control(
         last_state: "RECOVERY_REQUIRED".to_string(),
         last_owner_kind: None,
         last_error: None,
+        unresponsive_streak: 0,
+        unresponsive_since: None,
     };
     let resolved = match call_terminal_control(
         app,
@@ -884,6 +1104,7 @@ pub(crate) fn acquire_pty_control(
         .clone()
         .ok_or_else(|| TerminalControlCallError {
             code: "RECOVERY_REQUIRED".to_string(),
+            unresponsive: false,
             message: control
                 .last_error
                 .clone()
@@ -994,6 +1215,26 @@ fn is_transient_control_error(error: &TerminalControlCallError) -> bool {
 /// on ownership/handoff failures, mark recovery-required states, and record
 /// the last error for observers.
 fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallError) {
+    classify_control_error_with_policy(
+        control,
+        error,
+        Instant::now(),
+        &UnresponsiveStreakPolicy::default(),
+    );
+}
+
+fn classify_control_error_with_policy(
+    control: &mut PtyControl,
+    error: &TerminalControlCallError,
+    now: Instant,
+    policy: &UnresponsiveStreakPolicy,
+) {
+    if note_unresponsive_streak(control, error, now, policy) {
+        // A sustained non-answering socket: note_unresponsive_streak already
+        // cleared the lease and set RECOVERY_REQUIRED so the Dashboard surfaces
+        // the existing "Recover local input" action.
+        return;
+    }
     if is_transient_control_error(error) {
         // Keep the lease and state: the keystroke is dropped but the next write
         // reuses the cached lease and the next status poll reconciles.
@@ -1059,6 +1300,7 @@ pub(crate) fn scroll_pty_control(
     if !matches!(direction, "up" | "down") || !(1..=100).contains(&lines) {
         return Err(TerminalControlCallError {
             code: "INVALID_REQUEST".to_string(),
+            unresponsive: false,
             message: "terminal scroll input is invalid".to_string(),
         });
     }
@@ -1212,6 +1454,9 @@ pub(crate) fn refresh_pty_control_status(
     };
     match refreshed {
         Ok(value) => {
+            // The daemon produced an answer (success or a validatable error):
+            // any non-answering streak is over.
+            control.note_control_responsive();
             if let Some(control_epoch) = value
                 .get("controlEpoch")
                 .and_then(Value::as_str)
@@ -1247,22 +1492,32 @@ pub(crate) fn refresh_pty_control_status(
             }
         }
         Err(error) => {
-            control.last_error = Some(error.to_string());
+            let policy = UnresponsiveStreakPolicy::default();
             if error.code == "TARGET_GONE" {
+                control.note_control_responsive();
+                control.last_error = Some(error.to_string());
                 control.last_state = "TARGET_GONE".to_string();
                 control.last_owner_kind = None;
                 control.lease = None;
                 control.applied_size = None;
+            } else if note_unresponsive_streak(control, &error, Instant::now(), &policy) {
+                // A sustained non-answering socket: RECOVERY_REQUIRED and a
+                // cleared lease were set so the Dashboard shows the recovery
+                // action; nothing else to apply.
             } else if is_transient_control_error(&error) {
                 // Lock contention or a queued read timeout while a long agent
                 // message serializes. Preserve the lease and last state: the
                 // next 1s poll reconciles after the store lock frees, so the
                 // Dashboard never shows a recovery prompt it cannot heal.
+                // (A below-threshold non-answering streak also lands here and
+                // is tolerated until it becomes sustained.)
+                control.last_error = Some(error.to_string());
             } else {
                 control.last_state = "RECOVERY_REQUIRED".to_string();
                 control.last_owner_kind = None;
                 control.lease = None;
                 control.applied_size = None;
+                control.last_error = Some(error.to_string());
             }
         }
     }
@@ -1647,13 +1902,17 @@ mod tests {
         });
 
         let first = request("ping", json!({}));
-        assert_eq!(send_once(&first).unwrap()["authority"], "test");
+        assert_eq!(
+            send_once(&first, control_call_timeout("ping")).unwrap()["authority"],
+            "test"
+        );
         let second = request("ownership.status", json!({ "controlTargetId": "target" }));
-        let error = send_once(&second).unwrap_err();
+        let error = send_once(&second, control_call_timeout("ownership.status")).unwrap_err();
         assert_eq!(error.code, "PERMISSION_DENIED");
         assert_eq!(error.message, "owned by feishu");
+        assert!(!error.unresponsive, "a daemon error envelope is responsive");
         let third = request("ping", json!({}));
-        let mismatch = send_once(&third).unwrap_err();
+        let mismatch = send_once(&third, control_call_timeout("ping")).unwrap_err();
         assert_eq!(mismatch.code, "UNAVAILABLE");
         assert_eq!(
             mismatch.message,
@@ -1693,6 +1952,8 @@ mod tests {
             last_state: "FREE".to_string(),
             last_owner_kind: None,
             last_error: None,
+            unresponsive_streak: 0,
+            unresponsive_since: None,
         };
 
         control.ensure_local_transfer_target("tw-term-one").unwrap();
@@ -1730,12 +1991,15 @@ mod tests {
             last_state: "HELD".to_string(),
             last_owner_kind: Some("dashboard".to_string()),
             last_error: None,
+            unresponsive_streak: 0,
+            unresponsive_since: None,
         }
     }
 
     fn call_error(code: &str) -> TerminalControlCallError {
         TerminalControlCallError {
             code: code.to_string(),
+            unresponsive: false,
             message: format!("synthetic {code}"),
         }
     }
@@ -1762,5 +2026,381 @@ mod tests {
             control.lease.is_none(),
             "PERMISSION_DENIED must clear the lease"
         );
+    }
+
+    fn unresponsive_call_error() -> TerminalControlCallError {
+        // Mirrors send_once's classification of a connected-but-never-answered
+        // socket: UNAVAILABLE with unresponsive set.
+        TerminalControlCallError {
+            code: "UNAVAILABLE".to_string(),
+            unresponsive: true,
+            message: "read terminal-control response: Resource temporarily unavailable".to_string(),
+        }
+    }
+
+    fn short_streak_policy() -> UnresponsiveStreakPolicy {
+        // Threshold count preserved, span shrunk so escalation needs no 90s wait.
+        UnresponsiveStreakPolicy {
+            required: UNRESPONSIVE_STREAK_REQUIRED,
+            min_span: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn non_answering_socket_ping_returns_within_the_probe_window() {
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let path = PathBuf::from(format!(
+            "/tmp/tw-terminal-control-rust-wedge-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("TW_TERMINAL_CONTROL_SOCKET", &path);
+        // Accept the connection but never write a response: a wedged daemon
+        // whose socket is live while its event loop is stuck.
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+
+        let started = Instant::now();
+        let error =
+            send_once(&request("ping", json!({})), control_call_timeout("ping")).unwrap_err();
+        let elapsed = started.elapsed();
+
+        server.join().unwrap();
+        std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(error.code, "UNAVAILABLE");
+        assert!(
+            error.unresponsive,
+            "a socket that connected but never answered must be marked unresponsive"
+        );
+        assert!(
+            elapsed >= CONTROL_PING_TIMEOUT,
+            "ping waited the full liveness deadline, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < CONTROL_PING_TIMEOUT + Duration::from_secs(2),
+            "ping returned in {elapsed:?}, the short liveness window, not the 60s long-call window"
+        );
+        assert!(
+            elapsed < CONTROL_LONG_CALL_TIMEOUT,
+            "ping must never block for the 60s long-call window"
+        );
+    }
+
+    #[test]
+    fn probe_calls_use_graded_timeouts_and_input_calls_the_long_window() {
+        // ping is lock-free and uses the shortest liveness deadline.
+        assert_eq!(control_call_timeout("ping"), CONTROL_PING_TIMEOUT);
+        // ownership.status / lease.renew take the store lock and must out-wait
+        // the daemon's LOCK_WAIT_MS (5s) to receive a busy RESOURCE_EXHAUSTED.
+        assert_eq!(
+            control_call_timeout("ownership.status"),
+            CONTROL_LOCK_PROBE_TIMEOUT
+        );
+        assert_eq!(
+            control_call_timeout("lease.renew"),
+            CONTROL_LOCK_PROBE_TIMEOUT
+        );
+        // The lock-taking probe window strictly exceeds the daemon lock wait;
+        // ping stays faster. This is the C025 coupling: if it ever inverts, a
+        // busy daemon's answer becomes un-receivable and lock contention is
+        // misread as a wedge.
+        assert!(
+            CONTROL_LOCK_PROBE_TIMEOUT > Duration::from_secs(5),
+            "lock-taking probes must out-wait the daemon's 5s LOCK_WAIT_MS"
+        );
+        assert!(CONTROL_PING_TIMEOUT < CONTROL_LOCK_PROBE_TIMEOUT);
+        assert_eq!(control_call_timeout("input.raw"), CONTROL_LONG_CALL_TIMEOUT);
+        assert_eq!(
+            control_call_timeout("input.agent-message"),
+            CONTROL_LONG_CALL_TIMEOUT
+        );
+        assert_eq!(
+            control_call_timeout("input.resize"),
+            CONTROL_LONG_CALL_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn sustained_unresponsive_socket_escalates_to_recovery_and_clears_lease() {
+        let mut control = held_control();
+        let policy = short_streak_policy();
+        let t0 = Instant::now();
+
+        classify_control_error_with_policy(&mut control, &unresponsive_call_error(), t0, &policy);
+        assert!(control.lease.is_some(), "first miss keeps the lease");
+        assert_eq!(control.last_state, "HELD");
+
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(30),
+            &policy,
+        );
+        assert!(
+            control.lease.is_some(),
+            "second miss (span still under threshold) keeps the lease"
+        );
+
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(60),
+            &policy,
+        );
+        assert!(
+            control.lease.is_none(),
+            "a sustained non-answering streak must clear the lease"
+        );
+        assert_eq!(
+            control.last_state, "RECOVERY_REQUIRED",
+            "sustained wedge must surface the recovery action"
+        );
+        assert!(control.last_owner_kind.is_none());
+        assert!(
+            control
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("stopped responding")),
+            "recovery message should explain the non-answering socket"
+        );
+    }
+
+    #[test]
+    fn unresponsive_streak_requires_both_count_and_span() {
+        let mut control = held_control();
+        let policy = short_streak_policy();
+        let t0 = Instant::now();
+
+        // Three misses clustered within 2ms meet the count but not the span:
+        // they must not escalate (a single slow window must not flap recovery).
+        for offset_ms in 0..3u64 {
+            classify_control_error_with_policy(
+                &mut control,
+                &unresponsive_call_error(),
+                t0 + Duration::from_millis(offset_ms),
+                &policy,
+            );
+        }
+        assert!(
+            control.lease.is_some(),
+            "three clustered misses must not escalate (span gate)"
+        );
+        assert_eq!(control.last_state, "HELD");
+
+        // A later miss that pushes the span past the threshold escalates using
+        // the streak already accumulated.
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(60),
+            &policy,
+        );
+        assert!(control.lease.is_none());
+        assert_eq!(control.last_state, "RECOVERY_REQUIRED");
+    }
+
+    #[test]
+    fn resource_exhausted_never_escalates_even_when_repeated_for_a_long_window() {
+        let mut control = held_control();
+        let policy = short_streak_policy();
+        let t0 = Instant::now();
+        // RESOURCE_EXHAUSTED is a daemon *answer* (lock-wait retry, C025): the
+        // socket is processing, so it must neither accumulate nor escalate no
+        // matter how often it recurs.
+        for i in 0..10u64 {
+            let error = call_error("RESOURCE_EXHAUSTED");
+            classify_control_error_with_policy(
+                &mut control,
+                &error,
+                t0 + Duration::from_secs(30 * i),
+                &policy,
+            );
+            assert!(
+                control.lease.is_some(),
+                "RESOURCE_EXHAUSTED must keep the lease (C025)"
+            );
+            assert_eq!(
+                control.last_state, "HELD",
+                "RESOURCE_EXHAUSTED must never flap into recovery"
+            );
+        }
+        assert_eq!(control.unresponsive_streak, 0);
+    }
+
+    #[test]
+    fn lock_waiting_busy_daemon_answer_is_received_not_misread_as_a_wedge() {
+        // C025 regression at the timing level: a busy-but-alive daemon holds the
+        // store lock for another client's long request. Its lock acquisition
+        // waits LOCK_WAIT_MS (5s, src/terminalControl/store.ts) and THEN answers
+        // ownership.status / lease.renew with a retryable RESOURCE_EXHAUSTED.
+        // The client's probe deadline must out-wait that 5s so the answer is
+        // received (unresponsive=false -> transient, lease kept, streak frozen)
+        // instead of the read timing out first and being misclassified as a
+        // wedged, non-answering socket. The fake daemon below replies at ~5s —
+        // after the old 4s probe deadline but inside the 8s lock-probe window.
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let path = PathBuf::from(format!(
+            "/tmp/tw-terminal-control-rust-busy-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("TW_TERMINAL_CONTROL_SOCKET", &path);
+
+        // Serve each accepted connection on its own thread: read the request,
+        // hold for the daemon's lock-wait duration, then send the busy answer.
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(line.trim()).unwrap();
+                    // Mirror the daemon: LOCK_WAIT_MS = 5s before answering busy.
+                    std::thread::sleep(Duration::from_secs(5));
+                    let response = json!({
+                        "protocolVersion": 1,
+                        "requestId": request["requestId"],
+                        "ok": false,
+                        "error": {
+                            "code": "RESOURCE_EXHAUSTED",
+                            "message": "timed out waiting for terminal-control state lock",
+                            "retryable": true,
+                        },
+                    });
+                    stream
+                        .write_all(format!("{response}\n").as_bytes())
+                        .unwrap();
+                });
+            }
+        });
+
+        // Issue both lock-taking probes concurrently (separate connections) so
+        // the wall-clock cost is one ~5s wait, not two.
+        let status = std::thread::spawn(|| {
+            let started = Instant::now();
+            let error = send_once(
+                &request(
+                    "ownership.status",
+                    json!({ "controlTargetId": "target-busy" }),
+                ),
+                control_call_timeout("ownership.status"),
+            )
+            .unwrap_err();
+            (started.elapsed(), error)
+        });
+        let renew = std::thread::spawn(|| {
+            let started = Instant::now();
+            let lease = json!({
+                "controlTargetId": "target-busy",
+                "controlEpoch": "epoch-busy",
+                "leaseId": "lease-busy",
+                "fence": "7",
+                "owner": { "kind": "dashboard", "instanceId": "dashboard:held" },
+                "expiresAt": "2026-09-09T00:00:00.000Z",
+            });
+            let error = send_once(
+                &request("lease.renew", json!({ "lease": lease })),
+                control_call_timeout("lease.renew"),
+            )
+            .unwrap_err();
+            (started.elapsed(), error)
+        });
+
+        let (status_elapsed, status_error) = status.join().unwrap();
+        let (renew_elapsed, renew_error) = renew.join().unwrap();
+        server.join().unwrap();
+        std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET");
+        let _ = std::fs::remove_file(path);
+
+        for (label, elapsed, error) in [
+            ("ownership.status", status_elapsed, status_error),
+            ("lease.renew", renew_elapsed, renew_error),
+        ] {
+            assert_eq!(
+                error.code, "RESOURCE_EXHAUSTED",
+                "{label}: the busy daemon's 5s answer must be received"
+            );
+            assert!(
+                !error.unresponsive,
+                "{label}: a RESOURCE_EXHAUSTED envelope is a daemon answer (C025), never a wedge"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(4_500),
+                "{label}: replied at {elapsed:?} — must be past the old 4s deadline that caused the false timeout"
+            );
+            assert!(
+                elapsed < CONTROL_LOCK_PROBE_TIMEOUT,
+                "{label}: received in {elapsed:?}, inside the {CONTROL_LOCK_PROBE_TIMEOUT:?} lock-probe window (not a timeout)"
+            );
+
+            // The received busy answer must not advance the non-answering
+            // streak and must keep the lease/HELD state.
+            let mut control = held_control();
+            let policy = short_streak_policy();
+            classify_control_error_with_policy(&mut control, &error, Instant::now(), &policy);
+            assert_eq!(
+                control.unresponsive_streak, 0,
+                "{label}: a busy answer must not accumulate an unresponsive streak"
+            );
+            assert!(control.lease.is_some(), "{label}: C025 keeps the lease");
+            assert_eq!(control.last_state, "HELD", "{label}: C025 never escalates");
+        }
+    }
+
+    #[test]
+    fn any_daemon_answer_resets_the_unresponsive_streak() {
+        let mut control = held_control();
+        let policy = short_streak_policy();
+        let t0 = Instant::now();
+
+        classify_control_error_with_policy(&mut control, &unresponsive_call_error(), t0, &policy);
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(30),
+            &policy,
+        );
+        assert_eq!(control.unresponsive_streak, 2);
+
+        // A retryable daemon answer proves the socket is live again.
+        let answered = call_error("RESOURCE_EXHAUSTED");
+        classify_control_error_with_policy(
+            &mut control,
+            &answered,
+            t0 + Duration::from_millis(40),
+            &policy,
+        );
+        assert_eq!(
+            control.unresponsive_streak, 0,
+            "a daemon answer resets the streak"
+        );
+        assert!(control.lease.is_some());
+
+        // Two more wedged probes restart the count from zero instead of
+        // continuing to four (which would escalate).
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(45),
+            &policy,
+        );
+        classify_control_error_with_policy(
+            &mut control,
+            &unresponsive_call_error(),
+            t0 + Duration::from_millis(46),
+            &policy,
+        );
+        assert_eq!(control.unresponsive_streak, 2);
+        assert!(
+            control.lease.is_some(),
+            "streak restarts from zero after a daemon answer"
+        );
+        assert_eq!(control.last_state, "HELD");
     }
 }
