@@ -2,7 +2,8 @@ use crate::config::{config_worktree_base, config_worktree_base_with_home, remote
 use crate::features::sessions::{derive_session_name, is_git_worktree_dir};
 use crate::ipc::OrphanedWorktree;
 use crate::remote::{
-    remote_home_dir_for_host, run_remote_cmd_output, run_remote_tmux_output, HostConfig,
+    remote_home_dir_for_host, run_remote_cmd_output_with_timeout, run_remote_tmux_output,
+    HostConfig, REMOTE_CMD_REMOTE_CLEANUP_TIMEOUT,
 };
 use crate::support::{
     app_home_dir, app_home_dir_or_tmp, default_worktree_base, expand_home_path_with_home, git_bin,
@@ -278,7 +279,7 @@ pub(crate) fn remote_orphaned_worktrees(
     host: &HostConfig,
 ) -> Result<Vec<OrphanedWorktree>, String> {
     let base = remote_worktree_base(host)?;
-    let output = run_remote_cmd_output(
+    let output = run_remote_cmd_output_with_timeout(
         host,
         &[
             "sh",
@@ -301,6 +302,7 @@ find "$base" -mindepth 2 -maxdepth 2 -type d -exec sh -c '
             "sh",
             &base,
         ],
+        REMOTE_CMD_REMOTE_CLEANUP_TIMEOUT,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -359,7 +361,7 @@ pub(crate) fn try_cleanup_remote_worktree(
     }
     let base = remote_worktree_base(host)?;
     let force_flag = if force { "1" } else { "0" };
-    let output = run_remote_cmd_output(
+    let output = run_remote_cmd_output_with_timeout(
         host,
         &[
             "sh",
@@ -448,6 +450,7 @@ fi
             &base,
             force_flag,
         ],
+        REMOTE_CMD_REMOTE_CLEANUP_TIMEOUT,
     )?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);

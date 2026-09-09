@@ -1,4 +1,7 @@
-use crate::remote::{apply_ssh_multiplex_options, validate_ssh_host_fields, HostConfig};
+use crate::remote::{
+    apply_ssh_multiplex_options, run_bounded, validate_ssh_host_fields, HostConfig,
+    REMOTE_CMD_FILE_TRANSFER_TIMEOUT,
+};
 use std::path::Path;
 
 fn scp_remote_target(host: &HostConfig, remote_path: &str) -> String {
@@ -60,9 +63,10 @@ pub(crate) fn scp_cli_to_host(
     cli: &Path,
     remote_path: &str,
 ) -> Result<(), String> {
-    let output = scp_cli_command(host, cli, remote_path)?
-        .output()
-        .map_err(|e| format!("scp spawn: {e}"))?;
+    let output = run_bounded(
+        scp_cli_command(host, cli, remote_path)?,
+        REMOTE_CMD_FILE_TRANSFER_TIMEOUT,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("scp to {} failed: {}", host.label, stderr.trim()));
@@ -81,9 +85,10 @@ pub(crate) fn scp_directory_to_host(
             directory.display()
         ));
     }
-    let output = scp_path_command(host, directory, remote_path, true)?
-        .output()
-        .map_err(|e| format!("scp spawn: {e}"))?;
+    let output = run_bounded(
+        scp_path_command(host, directory, remote_path, true)?,
+        REMOTE_CMD_FILE_TRANSFER_TIMEOUT,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("scp to {} failed: {}", host.label, stderr.trim()));

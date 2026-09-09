@@ -5,11 +5,35 @@ use crate::support::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Hard wall-clock budgets for one-shot remote commands.
+///
+/// SSH's `ServerAliveInterval`/`ServerAliveCountMax` only detect an sshd that
+/// stops answering keepalives; they do NOT bound "host reachable but the
+/// command never returns" — a bootstrap blocked on remote fs/tmux, a stalled
+/// scp mid-transfer, or a full remote disk. Without a hard wall-clock bound the
+/// deployment operation `std::Mutex` parks forever on `.output()` /
+/// `wait_with_output()`, and a JS-side invoke timeout cannot release the Rust
+/// lock (the only escape is force-killing the Dashboard). Budgets are sized per
+/// call class so the normal path is unaffected while a wedged command fails fast
+/// with a structured error that propagates to the UI and releases the lock.
+///
+/// Quick probes / tmux checks / TLS validation / small stdin profile publish:
+/// single fast round-trips; 120s is far beyond a healthy devbox round-trip.
+pub(crate) const REMOTE_CMD_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+/// scp of the ~10MB CLI bundle (plus package.json) over a slow/high-latency
+/// link; 15 minutes is far beyond a healthy transfer but bounds a stall.
+pub(crate) const REMOTE_CMD_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Remote git (status/fetch) can walk a large repository on a loaded devbox.
+pub(crate) const REMOTE_CMD_REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Remote worktree `find` scan and `git worktree remove` over a large base.
+pub(crate) const REMOTE_CMD_REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn ssh_control_directory_in(home: &Path, namespace: &str) -> Result<PathBuf, String> {
     let directory = home.join(".tmux-worktree").join(namespace);
@@ -192,14 +216,173 @@ fn has_custom_tw_path(host: &HostConfig) -> bool {
         .is_some_and(|path| !path.trim().is_empty())
 }
 
-/// Run a command on a remote host and return stdout.
+/// Short, bounded human description of a spawned command for timeout/error
+/// messages. For ssh/scp the actionable part is the trailing remote command or
+/// destination; it is truncated so a large deploy script cannot flood the UI.
+fn command_summary(command: &Command) -> String {
+    let program = command
+        .get_program()
+        .to_string_lossy()
+        .rsplit('/')
+        .next()
+        .unwrap_or("remote command")
+        .to_string();
+    if let Some(tail) = command.get_args().last() {
+        let tail = tail.to_string_lossy();
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            let chars = tail.chars().count();
+            let mut truncated = tail.chars().take(120).collect::<String>();
+            if chars > 120 {
+                truncated.push('…');
+            }
+            return format!("{program} … {truncated}");
+        }
+    }
+    program
+}
+
+fn format_hard_timeout(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else if secs > 0 {
+        format!("{secs}s")
+    } else {
+        format!("{}ms", timeout.subsec_millis().max(1))
+    }
+}
+
+/// Wait for an already-spawned child with a hard wall-clock timeout. The child
+/// runs in its own process group (configured by the callers); on timeout the
+/// whole local group is SIGKILLed (scp forks an ssh child) and the detached
+/// waiter thread — which owns the child — reaps it via `wait_with_output()` as
+/// soon as it exits, so there is neither a zombie nor a leaked thread.
+fn wait_child_bounded(
+    child: Child,
+    timeout: Duration,
+    summary: String,
+) -> Result<std::process::Output, String> {
+    let pid = child.id() as i32;
+    let (result_tx, result_rx) = mpsc::channel();
+    // The waiter owns the child and always reaps it: wait_with_output returns as
+    // soon as the child exits (including after our SIGKILL on timeout), so the
+    // detached thread terminates promptly. We deliberately do not join it — on
+    // success it has already sent and is exiting; on timeout it exits once the
+    // killed child has been reaped.
+    let spawned = thread::Builder::new()
+        .name("tw-remote-cmd-wait".to_string())
+        .spawn(move || {
+            let _ = result_tx.send(child.wait_with_output());
+        });
+    if let Err(error) = spawned {
+        // Practically impossible (thread creation failure); reap by group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        return Err(format!(
+            "start remote command waiter for {summary}: {error}"
+        ));
+    }
+    match result_rx.recv_timeout(timeout) {
+        Ok(output_result) => output_result.map_err(|error| format!("wait for {summary}: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The remote-side command may keep running under a ControlPersist
+            // mux master after the local client is killed; deploy stages use a
+            // unique `.bundle-stage-<uuid>` name plus atomic mv, so a timeout
+            // only abandons one stage directory (see package residuals).
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            Err(format!(
+                "remote command hard timeout after {}: {summary}",
+                format_hard_timeout(timeout)
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            Err(format!("remote command waiter disconnected: {summary}"))
+        }
+    }
+}
+
+/// Run `command` to completion bounded by `timeout`. The child is placed in a
+/// fresh process group so a timeout SIGKILLs the entire local process tree.
+/// std-only (no tokio/async); stdout/stderr are piped and stdin is null,
+/// matching `Command::output()`.
+pub(crate) fn run_bounded(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let summary = command_summary(&command);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("spawn {summary}: {error}"))?;
+    wait_child_bounded(child, timeout, summary)
+}
+
+/// Like [`run_bounded`] but pipes stdin and writes `input` before entering the
+/// bounded wait. The stdin handle is dropped (EOF) immediately after writing.
+pub(crate) fn run_bounded_with_input(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.process_group(0);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let summary = command_summary(&command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn {summary}: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{summary}: stdin unavailable"))
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(input)
+                .map_err(|error| format!("write {summary} stdin: {error}"))
+        });
+    if let Err(error) = write_result {
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return Err(error);
+    }
+    // The taken stdin handle was dropped at the end of the closure above, so
+    // the remote process sees EOF before we wait.
+    wait_child_bounded(child, timeout, summary)
+}
+
+/// Run a command on a remote host and return stdout, bounded by the default
+/// probe/check budget.
 pub(crate) fn run_remote_cmd_output(
     host: &HostConfig,
     remote_cmd: &[&str],
 ) -> Result<std::process::Output, String> {
-    ssh_command(host, remote_cmd)?
-        .output()
-        .map_err(|error| format!("ssh spawn: {error}"))
+    run_remote_cmd_output_with_timeout(host, remote_cmd, REMOTE_CMD_CHECK_TIMEOUT)
+}
+
+/// Same as [`run_remote_cmd_output`] with an explicit hard-timeout budget for
+/// long-running remote operations (remote git, worktree cleanup).
+pub(crate) fn run_remote_cmd_output_with_timeout(
+    host: &HostConfig,
+    remote_cmd: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    run_bounded(ssh_command(host, remote_cmd)?, timeout)
 }
 
 pub(crate) fn run_remote_cmd_with_input(
@@ -207,31 +390,11 @@ pub(crate) fn run_remote_cmd_with_input(
     remote_cmd: &[&str],
     input: &[u8],
 ) -> Result<std::process::Output, String> {
-    let mut child = ssh_command(host, remote_cmd)?
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("ssh spawn: {error}"))?;
-
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ssh stdin unavailable".to_string())
-        .and_then(|mut stdin| {
-            stdin
-                .write_all(input)
-                .map_err(|error| format!("write ssh stdin: {error}"))
-        });
-    if let Err(error) = write_result {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-
-    child
-        .wait_with_output()
-        .map_err(|error| format!("wait for ssh: {error}"))
+    run_bounded_with_input(
+        ssh_command(host, remote_cmd)?,
+        input,
+        REMOTE_CMD_CHECK_TIMEOUT,
+    )
 }
 
 struct TerminalControlProxyWriteRequest {
@@ -717,8 +880,9 @@ pub(crate) fn remote_home_dir_for_host(host: &HostConfig) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        spawn_terminal_control_proxy, ssh_command_with_control_path, ssh_control_path_in,
-        take_proxy_read_outcome, terminal_control_ssh_bind_path_len, terminal_control_ssh_digest,
+        run_bounded, run_bounded_with_input, spawn_terminal_control_proxy,
+        ssh_command_with_control_path, ssh_control_path_in, take_proxy_read_outcome,
+        terminal_control_ssh_bind_path_len, terminal_control_ssh_digest,
         terminal_control_ssh_fingerprint, terminal_control_ssh_path_for_directory,
         terminal_control_ssh_path_in, TerminalControlProxyReadState,
     };
@@ -983,6 +1147,75 @@ mod tests {
                 .request(&request, "stderr-request", Duration::from_secs(2))
                 .expect("discarded stderr must not block the response"),
             b"{\"requestId\":\"stderr-request\",\"ok\":true}\n"
+        );
+    }
+
+    #[test]
+    fn run_bounded_hard_timeout_kills_the_child_process_group() {
+        // The command records its own pid (group leader) then execs a long
+        // sleep. A 200ms budget must return a hard-timeout error promptly and
+        // SIGKILL the whole process group — verifiable because the leader is
+        // reaped (kill -0 -> ESRCH) shortly afterwards.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("child.pid");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "echo $$ > \"$1\"; exec sleep 1000",
+            "sh",
+            pid_file.to_str().expect("pid file path"),
+        ]);
+        let started = Instant::now();
+        let error = run_bounded(command, Duration::from_millis(200))
+            .expect_err("a wedged remote command must time out");
+        let elapsed = started.elapsed();
+        assert!(error.contains("hard timeout"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout did not fire near the budget: {elapsed:?}"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file written before sleep")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let gone = unsafe { libc::kill(pid, 0) } != 0;
+            if gone {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed-out child process group {pid} was not killed and reaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn run_bounded_returns_output_for_a_fast_command() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo hello-bounded"]);
+        let output = run_bounded(command, Duration::from_secs(5)).expect("echo must succeed");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello-bounded"
+        );
+    }
+
+    #[test]
+    fn run_bounded_with_input_writes_stdin_then_returns_output() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat"]);
+        let output = run_bounded_with_input(command, b"piped-bytes", Duration::from_secs(5))
+            .expect("cat must succeed");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "piped-bytes"
         );
     }
 }
