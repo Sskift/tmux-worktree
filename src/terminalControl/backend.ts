@@ -405,20 +405,32 @@ function exactManagedSession(sessionName: string, home = homedir()): ManagedSess
 function tmuxSessionDefinitelyMissing(result: TmuxResult): boolean {
   if (result.exitCode === 0 && result.signal === null) return false;
   const detail = `${result.stderr}\n${result.stdout}`;
-  return /can't find session|no server running on/i.test(detail);
+  // tmux reports a vanished session two ways depending on the invocation:
+  // list-sessions/list-panes fail with "can't find session", while -t target
+  // resolution (show-options/display-message on a pinned $id) fails with
+  // "no such session"; a fully exited server reports "no server running". All
+  // three are deterministic lifecycle ends when the target was just proved to
+  // exist, never transient transport faults.
+  return /can't find session|no such session|no server running on/i.test(detail);
 }
 
 /**
  * A pane-scoped probe (display-message -t %pane) that failed because the pane
  * — and for a managed single-pane terminal, its session — no longer exists.
- * "can't find pane" is deterministic here: the pane id was just resolved by
- * requirePane, so its disappearance means the tmux lifecycle ended under the
- * observer (kill_session / server exit), never a transient transport fault.
+ * "can't find pane/session" and "no such pane/session" are deterministic here:
+ * the pane id was just resolved by requirePane, so its disappearance means the
+ * tmux lifecycle ended under the observer (kill_session / server exit), never a
+ * transient transport fault.
  */
 function tmuxPaneDefinitelyMissing(result: TmuxResult): boolean {
   if (result.exitCode === 0 && result.signal === null) return false;
   const detail = `${result.stderr}\n${result.stdout}`;
-  return /can't find session|can't find pane|no server running on/i.test(detail);
+  // A pane probe (pipe-pane / capture-pane / display-message) on a pane whose
+  // session was just killed reports either "can't find pane" (pane resolved
+  // then torn down) or the same session-gone wording ("can't find session" /
+  // "no such session" / "no server running"). All are deterministic lifecycle
+  // ends in this just-proved-to-exist context.
+  return /can't find (?:session|pane)|no such session|no server running on/i.test(detail);
 }
 
 async function requireTmuxSession(
@@ -469,6 +481,19 @@ async function currentTmuxInstanceId(sessionId: string): Promise<string | undefi
   );
   if (result.exitCode !== 0 || result.signal !== null) {
     const detail = `${result.stderr}\n${result.stdout}`.trim();
+    // show-options targets the pinned session id, which requireTmuxSession /
+    // requirePane proved existed a moment earlier. A "can't find session" /
+    // "no server running" detail here means kill_session / server exit landed
+    // in the read window between that probe and this one: a deterministic
+    // lifecycle end, not an unprovable identity. Surface TARGET_GONE so the
+    // authority retires the incarnation (natural backend_exit) instead of
+    // entering RECOVERY_REQUIRED recovery over a target that is already gone.
+    if (tmuxSessionDefinitelyMissing(result)) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "tmux backend lifecycle no longer exists",
+      );
+    }
     if (detail && !/(?:unknown|invalid) option/i.test(detail)) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",

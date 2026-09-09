@@ -1009,6 +1009,76 @@ test("a tail on a backend that deterministically gone mid-read surfaces TARGET_G
   }
 });
 
+test("a tail whose uncovered tmux sub-call fails RECOVERY_REQUIRED while the incarnation is actually gone re-probes to TARGET_GONE", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"E".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-tail-reprobe-gone",
+    scopeId: "scope-tail-reprobe-gone",
+    sessionId: "session-tail-reprobe-gone",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-tail-reprobe-gone",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:tail-reprobe-gone" },
+  };
+  try {
+    const target = await resolved(authority);
+    backend.appendOutput(target.controlTargetId, "seed\n");
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    const opened = await authority.consumeRelayV2ExactObservation(
+      preparation.claim,
+      exactInput,
+      preparation.identity,
+    );
+    // kill_session lands between the tail's assertTargetCurrent and one of
+    // prepareOutput's uncovered sub-calls (the show-options identity read, the
+    // stopped pane_pipe check, or the no-generation segment scan). That tmux
+    // invocation does not carry the exact "can't find session/pane" text, so it
+    // surfaces as RECOVERY_REQUIRED even though the lifecycle is deterministically
+    // over. The authority's bounded re-probe then proves the incarnation is gone
+    // and must retire it as TARGET_GONE (natural backend_exit), not leave it
+    // RECOVERY_REQUIRED (which the host closes as backend_error).
+    backend.tailOutput = async () => {
+      backend.current = false;
+      throw new terminalControl.TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output capture stopped before the authority could prove continuity",
+      );
+    };
+    await assert.rejects(
+      authority.tailRelayV2ExactObservation(opened.observation, opened.binding.outputCursor),
+      (error) => error.code === "TARGET_GONE",
+    );
+    const persisted = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(persisted.lifecycle, "TARGET_GONE");
+    assert.equal(persisted.ownership.state, "FREE");
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
 test("a tail with a genuinely uncertain mid-read failure stays RECOVERY_REQUIRED", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
