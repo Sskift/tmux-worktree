@@ -102,4 +102,60 @@ class TerminalDisconnectReasonPresentationTest {
         val copy = terminalDisconnectDetail("backend_exit", ConnectionStatus.OFFLINE)
         assertTrue(copy, copy.contains("ended", ignoreCase = true))
     }
+
+    @Test
+    fun actionableOpenRejectionProseRendersVerbatim() {
+        // These are the exact app-authored messages placed in resetReason/actionError by
+        // openRejected / detachedOpenRejected / clearFailedRelayV2Terminal in V2ViewModel.
+        // Deterministic open failures must keep their specific, actionable reason on screen.
+        listOf(
+            "Terminal input is busy on another client",
+            // resolveRelayV2TerminalOpenRejection wraps the host's TERMINAL_STREAM_CONFLICT
+            // message (hostRuntime.ts: "Relay v2 terminal stream conflicts with retained
+            // state") with the Reconnect hint.
+            "Relay v2 terminal stream conflicts with retained state; tap Reconnect to retry",
+            "Relay v2 terminal could not be opened",
+            "Relay v2 terminal attachment is stale",
+            "Terminal replacement could not retire its previous owner",
+        ).forEach { prose ->
+            val copy = terminalDisconnectDetail(prose, ConnectionStatus.OFFLINE)
+            assertEquals("actionable prose was replaced: $prose", prose, copy)
+        }
+    }
+
+    @Test
+    fun actionableProseInRecoveringKeepsReasonAndNotesAutoReconnect() {
+        val prose = "Terminal input is busy on another client; waiting to retry"
+        val copy = terminalDisconnectDetail(prose, ConnectionStatus.RECOVERING)
+        assertTrue("reason lost: $copy", copy.startsWith(prose))
+        assertTrue(copy, copy.contains("automatically", ignoreCase = true))
+    }
+
+    @Test
+    fun tokenLikeStringsStillFallBackEvenWhenUnknown() {
+        // Unknown snake_case tokens and bare codes (no whitespace) must never render.
+        assertEquals(
+            offlineFallback,
+            terminalDisconnectDetail("some_future_reason", ConnectionStatus.OFFLINE),
+        )
+        assertEquals(
+            offlineFallback,
+            terminalDisconnectDetail("BUSY", ConnectionStatus.OFFLINE),
+        )
+        // Defensive: a message that mixes prose with an underscore looks token-ish, so the
+        // raw-enum guard wins over passthrough.
+        assertEquals(
+            offlineFallback,
+            terminalDisconnectDetail("terminal failed with bad_state now", ConnectionStatus.OFFLINE),
+        )
+    }
+
+    @Test
+    fun prosePassthroughTrimsSurroundingWhitespace() {
+        val copy = terminalDisconnectDetail(
+            "  Relay v2 terminal could not be opened  ",
+            ConnectionStatus.OFFLINE,
+        )
+        assertEquals("Relay v2 terminal could not be opened", copy)
+    }
 }

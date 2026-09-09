@@ -620,24 +620,39 @@ private fun terminalDisconnectedDetail(status: ConnectionStatus): String = when 
 }
 
 /**
- * User-facing copy for the internal reason token carried on TerminalStreamState.resetReason.
+ * User-facing copy for the reason carried on TerminalStreamState.resetReason / actionError.
  * That field holds protocol enum names (RelayV2TerminalCloseReason / RelayV2TerminalResetReason
- * lowercased) and ViewModel-internal tokens; none of them may reach the user verbatim. Unknown
- * tokens — including reasons a future host/relay might add — fall back to the status-level copy,
- * so a newer backend can never leak a raw enum onto the screen.
+ * lowercased) and ViewModel-internal snake_case tokens; none of them may reach the user verbatim.
+ * Deterministic open/attach failures (openRejected, detachedOpenRejected,
+ * clearFailedRelayV2Terminal) instead put app-authored human prose there — e.g. "Terminal input
+ * is busy on another client" or "<host message>; tap Reconnect to retry" — and that prose must
+ * stay visible alongside the Reconnect button. Every protocol enum and internal token is
+ * snake_case with no whitespace (all map keys below), and unknown wire enums hard-error at
+ * decode, so a token containing whitespace and no '_' is necessarily human copy: pass it
+ * through verbatim. Anything else — blank, unknown, or token-shaped — falls back to the
+ * status-level copy, so a newer backend can never leak a raw enum onto the screen.
  */
 internal fun terminalDisconnectDetail(reason: String?, status: ConnectionStatus): String {
     val token = reason?.trim()?.takeIf { it.isNotEmpty() }
         ?: return terminalDisconnectedDetail(status)
-    val copy = TERMINAL_DISCONNECT_REASON_COPY[token]
-        ?: return terminalDisconnectedDetail(status)
-    // While the stream is actively re-opening, say so; the offline copy already pairs with the
-    // on-screen Reconnect button.
-    return if (status == ConnectionStatus.RECOVERING) {
-        "$copy Reconnecting automatically."
-    } else {
-        copy
+    val mapped = TERMINAL_DISCONNECT_REASON_COPY[token]
+    if (mapped != null) {
+        // While the stream is actively re-opening, say so; the offline copy already pairs with
+        // the on-screen Reconnect button.
+        return if (status == ConnectionStatus.RECOVERING) {
+            "$mapped Reconnecting automatically."
+        } else {
+            mapped
+        }
     }
+    if (token.any { it.isWhitespace() } && '_' !in token) {
+        return if (status == ConnectionStatus.RECOVERING) {
+            "$token Reconnecting automatically."
+        } else {
+            token
+        }
+    }
+    return terminalDisconnectedDetail(status)
 }
 
 private val TERMINAL_DISCONNECT_REASON_COPY: Map<String, String> = mapOf(
@@ -673,8 +688,7 @@ private val TERMINAL_DISCONNECT_REASON_COPY: Map<String, String> = mapOf(
         "Terminal output could not be parsed; the stream is resuming.",
     "protocol_order_conflict" to
         "Terminal stream ordering conflict, so the stream must restart.",
-    // ViewModel-internal tokens (V2ViewModel) — already paired with an actionError notice;
-    // the overlay must still show prose rather than the raw token.
+    // ViewModel-internal tokens (V2ViewModel) — snake_case sentinels, never user copy.
     "terminal_open_timeout" to
         "Opening the terminal timed out; tap Reconnect to retry.",
     "terminal_auto_reconnect_paused" to
