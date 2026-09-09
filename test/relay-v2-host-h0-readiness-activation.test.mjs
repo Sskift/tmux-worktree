@@ -760,3 +760,57 @@ test("receipt and lease protocol errors withdraw before propagating", async (t) 
     }
   });
 });
+
+// A6: a bounded local storage/IO fault on the runtime H0 read must NOT tear
+// the readiness source down. The last verified lineage is still authoritative
+// (no durable commit crossed), so runtime reads serve cached identity and the
+// readiness sink is kept open until storage heals. A non-storage error still
+// fails closed.
+test("A6: bounded storage fault on runtime H0 read serves cached lineage and keeps readiness", async () => {
+  const h = harness();
+  let store = null;
+  let activation = null;
+  try {
+    store = await h.open();
+    const readiness = readinessSink();
+    const identity = await store.read();
+    activation = compositionModule.createRelayV2HostH0ReadinessActivation({
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: identity.hostInstanceId,
+      h0Port: store.h0ReadinessPort,
+      readinessSink: readiness.sink,
+    });
+    assert.equal(await activation.lifecycle.activate(), true);
+    const healthy = await activation.runtimeH0.read();
+
+    // Make the state directory unwritable (read-only mount / chmod fault).
+    const { chmodSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    const stateRoot = dirname(h.paths.lock);
+    chmodSync(stateRoot, 0o000);
+    try {
+      const closesBefore = readiness.closes();
+      // The storage-fault read is served from the cached lineage, not rejected.
+      const served = await activation.runtimeH0.read();
+      assert.equal(served.hostEpoch, healthy.hostEpoch);
+      assert.equal(served.hostInstanceId, healthy.hostInstanceId);
+      assert.equal(readiness.closes(), closesBefore, "storage fault must not withdraw H0 readiness");
+    } finally {
+      chmodSync(stateRoot, 0o700);
+    }
+
+    // After storage heals, reads re-validate against durable state and still
+    // match the cached lineage (no epoch roll / readiness re-issuance needed).
+    const afterHeal = await activation.runtimeH0.read();
+    assert.equal(afterHeal.hostEpoch, healthy.hostEpoch);
+  } finally {
+    try {
+      const { chmodSync } = await import("node:fs");
+      chmodSync(h.paths.lock, 0o700);
+      chmodSync(dirname(h.paths.lock), 0o700);
+    } catch {}
+    activation?.dispose();
+    store?.close();
+    h.cleanup();
+  }
+});

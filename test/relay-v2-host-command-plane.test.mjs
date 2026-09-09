@@ -1608,3 +1608,76 @@ test("C002: persistent capacity/IO failures in claimAccepted reject instead of l
     h.cleanup();
   }
 });
+
+// A6: a deterministic local storage/IO fault (read-only/permission) on the
+// command plane's pre-ledger reads must surface a bounded retryable
+// CAPABILITY_UNAVAILABLE error frame immediately (not a 40s hang / dropped
+// route), and the SAME plane must accept the command again once storage heals.
+test("A6: storage fault on pre-ledger reads returns bounded CAPABILITY_UNAVAILABLE then recovers", async () => {
+  const h = harness();
+  try {
+    const realStore = await hostState.RelayV2HostStateStore.open({ home: h.home });
+    let readsFail = false;
+    const storageError = () => {
+      const error = new Error("EACCES: permission denied, mkdir");
+      error.code = "EACCES";
+      return error;
+    };
+    const flakyStore = {
+      ...realStore,
+      read: (...args) => (readsFail
+        ? Promise.reject(storageError())
+        : realStore.read(...args)),
+      serialize: (...args) => (readsFail
+        ? Promise.reject(storageError())
+        : realStore.serialize(...args)),
+      transaction: (mutation) => (readsFail
+        ? Promise.reject(storageError())
+        : realStore.transaction(mutation)),
+    };
+    const fake = fakeExecutor();
+    const resource = fakeResourceMutationOwner();
+    const plane = await commandPlane.RelayV2HostCommandPlane.open({
+      store: flakyStore,
+      hostId: HOST_ID,
+      executor: fake.executor,
+      resourceMutationOwner: resource.owner,
+      now: h.now,
+      recover: true,
+    });
+    // Housekeeping (window mint) happens while storage is healthy.
+    const goodWindow = await plane.issueDedupeWindow();
+    const healthySnapshot = await realStore.read();
+    const frame = commandFrame(
+      "command-execute-kill-session",
+      healthySnapshot.hostEpoch,
+      goodWindow.windowId,
+    );
+
+    // Storage goes read-only/permission-denied: execute must settle fast with
+    // a structured retryable error, never livelock or pin the serial lane.
+    readsFail = true;
+    const started = Date.now();
+    const response = await plane.execute(auth(), frame);
+    const elapsed = Date.now() - started;
+    assert.equal(response.type, "error");
+    assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+    assert.equal(response.error.retryable, true);
+    assert.equal(response.error.commandDisposition, "not_accepted");
+    assert.ok(elapsed < 2_000, `bounded failure took ${elapsed}ms`);
+    assert.equal(fake.calls.resolve.length, 0, "no side-effect resolution while storage is faulted");
+
+    // Storage heals: the same command plane accepts and runs the command. The
+    // faulted attempt never reached the ledger, so the command id is re-admitted.
+    readsFail = false;
+    const healedResponse = await plane.execute(auth(), frame);
+    assert.notEqual(
+      healedResponse.type,
+      "error",
+      `healed execute errored: ${JSON.stringify(healedResponse.error).slice(0, 200)}`,
+    );
+    assert.ok(fake.calls.resolve.length >= 1, "executor resolves once storage has healed");
+  } finally {
+    h.cleanup();
+  }
+});
