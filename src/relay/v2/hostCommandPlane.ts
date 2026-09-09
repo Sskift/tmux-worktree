@@ -2881,12 +2881,13 @@ export class RelayV2HostCommandPlane {
           return { claimed: false, record: observed };
         }
         // Deterministic persistence faults (capacity budget exceeded, ENOSPC,
-        // EIO) are not commit-uncertain: the accepted->running claim did not
-        // cross any side-effect boundary, so retrying the write forever only
-        // livelocks the serializer and pins the runner. Surface the error;
-        // the durable accepted record is re-claimed idempotently by the next
-        // execute/query ensureRunner or by restart recovery once storage heals.
-        if (isHostStateCapacityError(error)) throw error;
+        // EIO, and EACCES/EPERM/EROFS storage faults) are not commit-uncertain:
+        // the accepted->running claim did not cross any side-effect boundary,
+        // so retrying the write forever only livelocks the serializer and pins
+        // the runner. Surface the error; the durable accepted record is
+        // re-claimed idempotently by the next execute/query ensureRunner or by
+        // restart recovery once storage heals.
+        if (isHostStateCapacityError(error) || isRelayV2HostStateStorageFault(error)) throw error;
         if (!isHostStateCommitUncertain(error)) {
           retryAttempts += 1;
           if (retryAttempts >= CLAIM_ACCEPTED_MAX_RETRY_ATTEMPTS) throw error;
