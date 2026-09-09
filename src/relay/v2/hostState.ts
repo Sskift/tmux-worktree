@@ -28,6 +28,23 @@ export const RELAY_V2_HOST_STATE_MAX_PERSISTED_BYTES = 512 * 1024 * 1024;
 const MATERIALIZED_READINESS_FENCE_RESERVE_BYTES = 1_024;
 const MAX_CONTINUITY_BYTES = 16 * 1024;
 
+/**
+ * Deterministic local storage/IO fault errno codes. These model a read-only
+ * mount, a directory whose permissions were changed, a full disk, or an I/O
+ * error: the environment is temporarily unable to persist, but no durable
+ * commit landed (the atomic publish never reached its rename), so the last
+ * committed state and its H0 proof remain authoritative. Callers fast-fail
+ * with a retryable structured error and keep the host registered instead of
+ * tearing readiness down.
+ */
+const RELAY_V2_HOST_STATE_STORAGE_FAULT_CODES: ReadonlySet<string> = new Set([
+  "EACCES",
+  "EPERM",
+  "EROFS",
+  "ENOSPC",
+  "EIO",
+]);
+
 export type RelayV2MaterializedReadinessFenceReason =
   | "persisted_capacity_exceeded"
   | "reconcile_generation_conflict"
@@ -519,6 +536,45 @@ export class RelayV2HostStateCapacityError extends Error {
   }
 }
 
+function storageFaultCodeOf(error: unknown): string | null {
+  if (error !== null && typeof error === "object") {
+    const direct = (error as NodeJS.ErrnoException).code;
+    if (typeof direct === "string") return direct;
+    // AtomicPublishError carries the underlying fs failure as `.original`.
+    const original = (error as { original?: unknown }).original;
+    if (original !== null && typeof original === "object") {
+      const nested = (original as NodeJS.ErrnoException).code;
+      if (typeof nested === "string") return nested;
+    }
+  }
+  return null;
+}
+
+/**
+ * True for a deterministic local storage/IO fault that provably landed before
+ * the atomic commit point (permission/read-only/full-disk/IO failure while
+ * acquiring the lock, loading state, or writing the temporary file). Such a
+ * fault (a) fast-fails with a retryable structured error and (b) leaves the
+ * last durable commit and its H0 proof intact, so readiness must not be
+ * revoked. An atomic publish that DID reach its rename is reported as a
+ * {@link RelayV2HostStateCommitUncertainError} instead and is deliberately not
+ * classified here.
+ */
+export function isRelayV2HostStateStorageFault(error: unknown): boolean {
+  if (error instanceof RelayV2HostStateCommitUncertainError) return false;
+  if (error instanceof RelayV2HostStateCapacityError) return false;
+  if (error instanceof AtomicPublishError && error.published) return false;
+  const code = storageFaultCodeOf(error);
+  if (code !== null && RELAY_V2_HOST_STATE_STORAGE_FAULT_CODES.has(code)) return true;
+  // Failing to acquire the state lock within the wait window is a bounded
+  // storage/lock fault; the committed state it guards is unchanged.
+  if (error instanceof Error
+    && error.message.startsWith("timed out waiting for Relay v2 host state lock")) {
+    return true;
+  }
+  return false;
+}
+
 export function relayV2HostStatePaths(home = homedir()): RelayV2HostStatePaths {
   const twHome = join(home, ".tmux-worktree");
   const stateRoot = join(twHome, "relay-v2-host-state");
@@ -915,6 +971,15 @@ function lockOwnerPath(path: string): string {
   return join(path, LOCK_OWNER_FILE);
 }
 
+/**
+ * Owner ids of state locks THIS process currently holds. Every state
+ * critical section is funneled through a single per-store serializer tail, so
+ * a live owner.json whose id is absent from this set is an orphan left behind
+ * by a prior turn whose release failed (e.g. the state directory was
+ * read-only at release time). It is safe to reclaim immediately.
+ */
+const activeStoreLockOwners = new Set<string>();
+
 function readLockOwner(path: string): StoreLockOwner | undefined {
   try {
     const value = JSON.parse(readFileSync(lockOwnerPath(path), "utf8")) as unknown;
@@ -941,7 +1006,15 @@ function processExists(pid: number): boolean {
 
 function lockIsStale(path: string): boolean {
   const owner = readLockOwner(path);
-  if (owner) return Date.now() - owner.createdAt > LOCK_STALE_MS && !processExists(owner.pid);
+  if (owner) {
+    // A lock held by THIS process but not present in the active-lock registry
+    // is an orphan: all in-process state turns are serialized, so no live turn
+    // owns it. Reclaim it without waiting out the stale window.
+    if (owner.pid === process.pid && !activeStoreLockOwners.has(owner.owner)) {
+      return true;
+    }
+    return Date.now() - owner.createdAt > LOCK_STALE_MS && !processExists(owner.pid);
+  }
   try {
     return Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS;
   } catch {
@@ -986,9 +1059,18 @@ async function acquireStoreLock(path: string): Promise<StoreLock> {
           createdAt: Date.now(),
         } satisfies StoreLockOwner)}\n`, { flag: "wx", mode: 0o600 });
       } catch (error) {
-        rmSync(path, { recursive: true, force: true });
+        // An existing owner file means the lock is held (or orphaned). Leave it
+        // for the stale/orphan detector below: removing the directory here and
+        // rethrowing would surface a raw EEXIST to the caller even when the
+        // lock was a reclaimable orphan. Other write failures (e.g. the state
+        // dir is read-only) find the directory still present, so the bounded
+        // lock-wait path applies.
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          rmSync(path, { recursive: true, force: true });
+        }
         throw error;
       }
+      activeStoreLockOwners.add(owner);
       return { path, owner };
     } catch (error) {
       if (!existsSync(path)) throw error;
@@ -1005,8 +1087,28 @@ async function acquireStoreLock(path: string): Promise<StoreLock> {
 }
 
 function releaseStoreLock(lock: StoreLock): void {
-  if (readLockOwner(lock.path)?.owner !== lock.owner) return;
-  rmSync(lock.path, { recursive: true, force: true });
+  // Drop the in-memory claim first: this turn is over regardless of whether the
+  // on-disk owner can be removed right now. If the directory removal fails
+  // (e.g. the state dir was read-only at release time), the now-unregistered
+  // owner.json is reclaimed as a same-process orphan by the next acquisition
+  // once storage heals, instead of wedging every future lock acquisition.
+  activeStoreLockOwners.delete(lock.owner);
+  let onDiskOwner: string | undefined;
+  try {
+    onDiskOwner = readLockOwner(lock.path)?.owner;
+  } catch {
+    // The owner file cannot be read (e.g. read-only dir). Leave the directory
+    // in place; orphan reclaim removes it after storage recovers.
+    return;
+  }
+  // Only remove a lock that this turn still owns; never clobber a successor.
+  if (onDiskOwner === lock.owner) {
+    try {
+      rmSync(lock.path, { recursive: true, force: true });
+    } catch {
+      // Best effort; the orphan reclaim path cleans it up later.
+    }
+  }
 }
 
 function freshState(previousEpochs: Iterable<string> = []): PersistedHostState {
@@ -1350,10 +1452,17 @@ export class RelayV2HostStateStore {
       );
       return await operation(section);
     } catch (error) {
-      // Any owner-critical-section failure makes a live H0 proof unusable.
-      // Normal successful transactions do not revoke H0; fatal load,
-      // publication, or owner-operation failures always do.
-      invalidateH0ProofsFor(this);
+      // A bounded local storage/IO fault (permission/read-only/full-disk/IO on
+      // lock acquisition, state load, or a pre-commit temp-file write) never
+      // reached the atomic rename, so the last durable commit — and the H0
+      // proof built on it — remains authoritative. Keep the proof so the host
+      // stays registered and can answer with a retryable error; it will
+      // re-issue a fresh proof on the next activation once storage heals.
+      // Anything else (commit uncertainty, lineage break, capacity fence, a
+      // closed owner) still invalidates H0 as before.
+      if (!isRelayV2HostStateStorageFault(error)) {
+        invalidateH0ProofsFor(this);
+      }
       throw error;
     } finally {
       if (lock) releaseStoreLock(lock);

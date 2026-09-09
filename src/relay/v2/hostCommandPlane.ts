@@ -16,6 +16,7 @@ import {
   type RelayV2HostStateTransaction,
   RelayV2HostStateCommitUncertainError,
   RelayV2HostStateStore,
+  isRelayV2HostStateStorageFault,
 } from "./hostState.js";
 
 export const RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION = 1 as const;
@@ -648,6 +649,22 @@ function isHostStateCommitUncertain(error: unknown): boolean {
 function isHostStateCapacityError(error: unknown): boolean {
   return isRecord(error)
     && error.code === "RELAY_V2_HOST_STATE_CAPACITY_EXCEEDED";
+}
+
+/**
+ * Structured pre-ledger rejection for a bounded local storage/IO fault
+ * (read-only/permission/full-disk state dir). The command never reached a
+ * durable accepted record or any side effect, so it is safe to reject as
+ * not_accepted and let the client retry once storage recovers.
+ */
+function storageUnavailableAdmissionError(): RelayV2CommandStructuredError {
+  return {
+    code: "CAPABILITY_UNAVAILABLE",
+    message: "Relay v2 host persistent storage is temporarily unavailable",
+    retryable: true,
+    commandDisposition: "not_accepted",
+    details: null,
+  };
 }
 
 function assertJson(value: unknown, seen = new Set<object>()): asserts value is RelayV2HostJson {
@@ -2152,11 +2169,38 @@ export class RelayV2HostCommandPlane {
         details: null,
       });
     }
-    const initialEpoch = await this.readEpoch();
+    // A bounded local storage/IO fault on the first ledger read means nothing
+    // is durably admitted and no side effect runs. Surface a fully-correlated
+    // retryable structured error (the client retries once storage heals)
+    // instead of throwing a raw EACCES that the runtime would turn into a
+    // dropped route. This uses the raw frame's owner fields only — full frame
+    // validation happens after the epoch check below.
+    const rawStorageFaultFrame = (): RelayV2JsonObject =>
+      errorFrame(
+        {
+          requestId: route.requestId,
+          hostId: route.hostId,
+          expectedHostEpoch: route.expectedHostEpoch,
+          commandId: typeof frame.commandId === "string" ? frame.commandId : null,
+          scopeId: typeof frame.scopeId === "string" ? frame.scopeId : null,
+          sessionId: typeof frame.sessionId === "string" ? frame.sessionId : null,
+        } as NormalizedCommand,
+        route.expectedHostEpoch,
+        storageUnavailableAdmissionError(),
+      );
+    const initialEpoch = await this.readEpoch().catch((error: unknown) => {
+      if (isRelayV2HostStateStorageFault(error)) return null;
+      throw error;
+    });
+    if (initialEpoch === null) {
+      return rawStorageFaultFrame();
+    }
     if (route.expectedHostEpoch !== initialEpoch) {
       return epochMismatchFrame(route, initialEpoch);
     }
     const command = parseExecuteFrame(frame);
+    const storageFaultFrame = (): RelayV2JsonObject =>
+      errorFrame(command, command.expectedHostEpoch, storageUnavailableAdmissionError());
 
     const fingerprint = commandFingerprint(command);
     const identity: CommandIdentity = {
@@ -2165,17 +2209,29 @@ export class RelayV2HostCommandPlane {
       hostId: command.hostId,
       commandId: command.commandId,
     };
-    const first = await this.store.serialize((section) => {
-      const snapshot = section.read();
-      if (snapshot.hostEpoch !== command.expectedHostEpoch) {
-        return { actualHostEpoch: snapshot.hostEpoch } as const;
+    let first: {
+      actualHostEpoch?: string;
+      existing?: StoredCommand;
+      window?: unknown;
+    };
+    try {
+      first = await this.store.serialize((section) => {
+        const snapshot = section.read();
+        if (snapshot.hostEpoch !== command.expectedHostEpoch) {
+          return { actualHostEpoch: snapshot.hostEpoch } as const;
+        }
+        const existing = readCommand(snapshot, identity);
+        const window = existing === undefined
+          ? readWindow(snapshot, snapshot.hostEpoch, command.dedupeWindowId)
+          : undefined;
+        return { existing, window } as const;
+      });
+    } catch (error) {
+      if (isRelayV2HostStateStorageFault(error)) {
+        return storageFaultFrame();
       }
-      const existing = readCommand(snapshot, identity);
-      const window = existing === undefined
-        ? readWindow(snapshot, snapshot.hostEpoch, command.dedupeWindowId)
-        : undefined;
-      return { existing, window } as const;
-    });
+      throw error;
+    }
     if ("actualHostEpoch" in first && first.actualHostEpoch !== undefined) {
       return epochMismatchFrame(command, first.actualHostEpoch);
     }
@@ -2414,6 +2470,16 @@ export class RelayV2HostCommandPlane {
           );
         }
         admitted = { kind: "inserted", record: observed };
+      } else if (isRelayV2HostStateStorageFault(error)) {
+        // Lock acquisition, state load, or a pre-commit write hit a bounded
+        // local storage/IO fault (read-only/permission/full-disk). Nothing was
+        // durably admitted and no side effect ran; reject with a bounded
+        // retryable error instead of pinning the serial lane or leaking a raw
+        // EACCES that the runtime would treat as an authority failure.
+        admitted = {
+          kind: "resource_rejected",
+          error: storageUnavailableAdmissionError(),
+        };
       } else {
         throw error;
       }
@@ -2459,7 +2525,21 @@ export class RelayV2HostCommandPlane {
         details: null,
       });
     }
-    const initialEpoch = await this.readEpoch();
+    const initialEpoch = await this.readEpoch().catch((error: unknown) => {
+      if (isRelayV2HostStateStorageFault(error)) return null;
+      throw error;
+    });
+    if (initialEpoch === null) {
+      return errorFrame(
+        {
+          requestId: route.requestId,
+          hostId: route.hostId,
+          expectedHostEpoch: route.expectedHostEpoch,
+        } as NormalizedCommand,
+        route.expectedHostEpoch,
+        storageUnavailableAdmissionError(),
+      );
+    }
     if (route.expectedHostEpoch !== initialEpoch) {
       return epochMismatchFrame(route, initialEpoch);
     }
@@ -2467,7 +2547,9 @@ export class RelayV2HostCommandPlane {
 
     await this.compact();
     const now = this.now();
-    return this.store.serialize((section) => {
+    const querySection = async (): Promise<RelayV2JsonObject> => {
+      try {
+        return await this.store.serialize((section) => {
       const snapshot = section.read();
       if (snapshot.hostEpoch !== query.expectedHostEpoch) {
         return epochMismatchFrame(query, snapshot.hostEpoch);
@@ -2501,7 +2583,15 @@ export class RelayV2HostCommandPlane {
           items,
         },
       });
-    });
+        });
+      } catch (error) {
+        if (isRelayV2HostStateStorageFault(error)) {
+          return errorFrame(query, query.expectedHostEpoch, storageUnavailableAdmissionError());
+        }
+        throw error;
+      }
+    };
+    return querySection();
   }
 
   async compact(): Promise<void> {
@@ -2653,7 +2743,15 @@ export class RelayV2HostCommandPlane {
     command: NormalizedCommand,
     error: RelayV2CommandStructuredError,
   ): Promise<RelayV2JsonObject> {
-    const actualEpoch = await this.readEpoch();
+    // The failure already prevented any durable commit. A storage fault here
+    // (the ledger became unavailable between the admission write and this
+    // read) cannot reveal a newer epoch; report the pre-ledger error against
+    // the epoch the command was framed with so the client gets a bounded
+    // retryable error instead of a dropped route.
+    const actualEpoch = await this.readEpoch().catch((readError: unknown) => {
+      if (isRelayV2HostStateStorageFault(readError)) return command.expectedHostEpoch;
+      throw readError;
+    });
     if (actualEpoch !== command.expectedHostEpoch) return epochMismatchFrame(command, actualEpoch);
     return errorFrame(command, actualEpoch, error);
   }

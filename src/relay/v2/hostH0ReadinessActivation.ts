@@ -10,7 +10,7 @@ import type {
 
 type HostStateH0CaptureModule = Pick<
   typeof import("./hostState.js"),
-  "captureRelayV2HostH0ReadinessPort"
+  "captureRelayV2HostH0ReadinessPort" | "isRelayV2HostStateStorageFault"
 >;
 
 // Root ESM entries are independently bundled. Keep this dynamic import
@@ -24,6 +24,8 @@ const captureRegisteredH0Port =
 if (typeof captureRegisteredH0Port !== "function") {
   throw new Error("Relay v2 H0 owner capture seam is unavailable");
 }
+const isHostStateStorageFault =
+  hostStateH0CaptureModule.isRelayV2HostStateStorageFault;
 
 export interface RelayV2HostH0ReadinessLifecycle {
   /** Performs a new durable no-op proof; no prior success is reusable. */
@@ -156,6 +158,14 @@ export function createRelayV2HostH0ReadinessActivation(
   let sourceGeneration = 0n;
   let sourceWithdrawn = false;
   let active: H0ActivationRecord | null = null;
+  // Last H0 snapshot verified against this activation's host lineage. During a
+  // bounded local storage/IO fault (read-only/permission/full-disk), reads
+  // fail before the atomic commit point, so this lineage is still the
+  // committed authority. Serve it for identity checks while storage is
+  // unavailable so an admitted route returns a retryable command error
+  // instead of the H0 readiness source being torn down. Re-validated against
+  // durable state on every successful read.
+  let lastVerifiedSnapshot: RelayV2HostStateSnapshot | null = null;
 
   const withSynchronousMutation = <Result>(operation: () => Result): Result => {
     synchronousMutationDepth += 1;
@@ -237,15 +247,28 @@ export function createRelayV2HostH0ReadinessActivation(
 
   const runtimeH0 = Object.freeze({
     async read(): Promise<RelayV2HostStateSnapshot> {
+      if (disposed) throw new Error("Relay v2 H0 readiness activation is disposed");
       try {
-        if (disposed) throw new Error("Relay v2 H0 readiness activation is disposed");
         const snapshot = await h0.read();
         if (snapshot.hostEpoch !== hostEpoch
           || snapshot.hostInstanceId !== hostInstanceId) {
           throw new Error("Relay v2 H0 runtime lineage changed");
         }
+        lastVerifiedSnapshot = snapshot;
         return snapshot;
       } catch (error) {
+        // A bounded local storage/IO fault (read-only/permission/full-disk)
+        // landed before the atomic commit point: no durable change happened,
+        // so the last verified lineage is still authoritative. Serve it for
+        // identity checks and keep readiness intact; the command plane rejects
+        // the actual mutation with a bounded retryable structured error. Only
+        // non-storage errors (lineage change, commit uncertainty) withdraw H0.
+        if (typeof isHostStateStorageFault === "function"
+          && isHostStateStorageFault(error)
+          && lastVerifiedSnapshot !== null
+          && !disposed) {
+          return lastVerifiedSnapshot;
+        }
         failClosed(error);
         throw error;
       }
@@ -280,6 +303,19 @@ export function createRelayV2HostH0ReadinessActivation(
         const cleanupError = failClosed();
         if (cleanupError !== null) throw cleanupError;
         return false;
+      }
+
+      // Storage is healthy at activation (the receipt just committed). Seed the
+      // last-verified lineage so a storage fault striking before the next
+      // runtime read is served from cache instead of withdrawing readiness.
+      try {
+        const seeded = await h0.read();
+        if (seeded.hostEpoch === hostEpoch
+          && seeded.hostInstanceId === hostInstanceId) {
+          lastVerifiedSnapshot = seeded;
+        }
+      } catch {
+        lastVerifiedSnapshot = null;
       }
 
       const record: H0ActivationRecord = {
