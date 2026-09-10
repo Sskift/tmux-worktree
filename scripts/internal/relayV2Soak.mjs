@@ -689,8 +689,11 @@ async function maybeRefreshCredentials(topology) {
   const resp = await fetch(`${topology.issuerUrl}v2/tokens/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    // Wire shape is token.refresh.client.request (codecSchema.ts): exactly
+    // refreshAttemptId + grantId + clientInstanceId + refreshToken.
     body: JSON.stringify({
       refreshAttemptId: "refresh-" + Math.random().toString(36).slice(2, 12),
+      grantId: creds.grantId,
       clientInstanceId: topology.clientInstanceId,
       refreshToken: creds.refreshToken,
     }),
@@ -701,7 +704,7 @@ async function maybeRefreshCredentials(topology) {
   }
   const next = await resp.json();
   topology.clientCreds = { ...next, _issuedAt: Date.now() };
-  logLine("[creds] access token refreshed; new expiresAtMs=" + next.expiresAtMs);
+  logLine("[creds] access token refreshed; new accessExpiresAtMs=" + next.accessExpiresAtMs);
 }
 
 // ---------------------------------------------------------------------------
