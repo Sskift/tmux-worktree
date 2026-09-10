@@ -509,7 +509,7 @@ impl MobileRelayV2ManagementCommandState {
     /// callers coalesce onto the single Replacing completion; the rebuild is
     /// bounded by RESURRECT_MAX_ATTEMPTS inside a rolling cooldown to avoid a
     /// spawn storm against a crash-looping child.
-    fn lazy_respawn_default_production(&self) -> Result<(), ManagementStartError> {
+    pub(crate) fn lazy_respawn_default_production(&self) -> Result<(), ManagementStartError> {
         if self.disposed.load(Ordering::Acquire) {
             return Err(ManagementStartError::ChannelClosed);
         }
@@ -545,7 +545,10 @@ impl MobileRelayV2ManagementCommandState {
             // child cannot trigger unbounded spawns.
             let mut budget = self.resurrect.lock().unwrap();
             if !budget.take_attempt(Instant::now()) {
-                return Err(ManagementStartError::ChannelClosed);
+                let mut owner = self.owner.lock().unwrap();
+                *owner =
+                    ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                return Err(ManagementStartError::RecoveryRequired);
             }
         }
         let completion = Arc::new(ManagementDrainCompletion::pending());
@@ -654,6 +657,19 @@ impl MobileRelayV2ManagementCommandState {
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Reset operator recovery latch and respawn budget. Called when an operator
+    /// explicitly requests restart/recovery or starts the self-hosted center.
+    pub(crate) fn reset_recovery(&self) {
+        *self.resurrect.lock().unwrap() = RespawnBudget::fresh();
+        let mut owner = self.owner.lock().unwrap();
+        if matches!(
+            &*owner,
+            ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired)
+        ) {
+            *owner = ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed);
         }
     }
 
@@ -870,7 +886,7 @@ impl MobileRelayV2ManagementCommandState {
     where
         F: FnOnce() -> Result<(), String>,
     {
-        self.replace_self_hosted_with_reuse(app, selection, true, commit_ready)
+        self.replace_self_hosted_with_reuse(Some(app), selection, true, commit_ready)
     }
 
     /// Rebuild the self-hosted management child even when its process is still
@@ -885,12 +901,24 @@ impl MobileRelayV2ManagementCommandState {
     where
         F: FnOnce() -> Result<(), String>,
     {
-        self.replace_self_hosted_with_reuse(app, selection, false, commit_ready)
+        self.replace_self_hosted_with_reuse(Some(app), selection, false, commit_ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restart_self_hosted_for_test<F>(
+        &self,
+        selection: ManagementChildSelection,
+        commit_ready: F,
+    ) -> Result<(), ManagementStartError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        self.replace_self_hosted_with_reuse(None, selection, false, commit_ready)
     }
 
     fn replace_self_hosted_with_reuse<F>(
         &self,
-        app: &tauri::AppHandle,
+        app: Option<&tauri::AppHandle>,
         selection: ManagementChildSelection,
         reuse_ready_child: bool,
         commit_ready: F,
@@ -933,7 +961,31 @@ impl MobileRelayV2ManagementCommandState {
             completion.complete(ManagementCleanupOutcome::Clean);
             return Err(ManagementStartError::ChannelClosed);
         }
-        let candidate = ManagementChildManager::start_selected(app, selection);
+        {
+            let mut budget = self.resurrect.lock().unwrap();
+            if !budget.take_attempt(Instant::now()) {
+                let mut owner = self.owner.lock().unwrap();
+                *owner =
+                    ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                drop(owner);
+                completion.complete(ManagementCleanupOutcome::RecoveryRequired);
+                return Err(ManagementStartError::RecoveryRequired);
+            }
+        }
+        #[cfg(test)]
+        let candidate = {
+            if let Some(overrider) = self.rebuild_override.lock().unwrap().clone() {
+                overrider()
+            } else {
+                let app = app.ok_or(ManagementStartError::ChannelClosed)?;
+                ManagementChildManager::start_selected(app, selection)
+            }
+        };
+        #[cfg(not(test))]
+        let candidate = {
+            let app = app.ok_or(ManagementStartError::ChannelClosed)?;
+            ManagementChildManager::start_selected(app, selection)
+        };
         let settled = settle_candidate_start(candidate, commit_ready);
 
         // Phase 3: re-take the lock to publish the terminal owner.
@@ -1256,6 +1308,37 @@ pub(crate) async fn mobile_relay_v2_enrollment_artifact_inline_png(
     .await
     .map_err(|_| not_ready_error())?
     .map_err(|_| not_ready_error())
+}
+
+#[tauri::command]
+pub(crate) async fn mobile_relay_v2_restart_management_service(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+) -> Result<(), String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        state.reset_recovery();
+        if state.allow_default_production_respawn.load(Ordering::Acquire) {
+            state.lazy_respawn_default_production().map_err(|e| {
+                format!("Failed to restart default production management service: {:?}", e)
+            })
+        } else {
+            let prepared = super::self_hosted_deployment::prepare_relay_v2_self_hosted_management_prerequisites()?
+                .ok_or_else(|| "Relay v2 self-hosted management configuration disappeared".to_string())?;
+            let selection = prepared.selection();
+            let steady_key = selection.steady_launch_key();
+            let _binding = prepared.management_binding()?;
+            state
+                .restart_self_hosted(&app, selection, move || prepared.commit_ready())
+                .map_err(|e| {
+                    format!("Failed to restart self-hosted management service: {:?}", e)
+                })?;
+            let _ = state.ensure_self_hosted_connector_start_accepted(&steady_key);
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| format!("Restart management service task failed: {e}"))?
 }
 
 /// Returns the live QR PNG as base64 (data-URL-ready payload) without
@@ -2671,5 +2754,257 @@ mod tests {
                 invalid_argument_error()
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn self_hosted_test_selection() -> ManagementChildSelection {
+        let identity = super::super::management_child::ManagementPreparedFileIdentity {
+            device: 1,
+            inode: 2,
+            length: 3,
+            mode: 0o600,
+            uid: 501,
+            links: 1,
+            sha256: [9; 32],
+        };
+        ManagementChildSelection::SelfHostedDarwinArm64 {
+            account_home: std::path::PathBuf::from("/Users/test"),
+            credential_https_ca_input: std::path::PathBuf::from("/Users/test/issuer-ca.pem"),
+            carrier_wss_ca_input: std::path::PathBuf::from("/Users/test/carrier-ca.pem"),
+            credential_https_ca_identity: identity.clone(),
+            carrier_wss_ca_identity: identity,
+            profile_lineage: "00112233445566778899aabbccddeeff".to_string(),
+            provision_profile_input: None,
+            bootstrap_secret_input: None,
+            bootstrap_secret_mode: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_post_handshake_respawns_and_returns_to_ready() {
+        // (a) Post-handshake child killed by SIGKILL (`kill -9 $$`) -> watchdog/rebuild
+        // respawns on next tick, spawn count increments by 1, and state returns to Ready.
+        let sigkill_script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; kill -9 $$".to_string();
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(sigkill_script, [101u8; 16])
+                .expect("child starts");
+        let selection = self_hosted_test_selection();
+        let self_hosted_key = selection.steady_launch_key();
+        let state = Arc::new(
+            MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+                Ok(manager),
+                self_hosted_key.clone(),
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        );
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = resurrect_live_script();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[102u8; 16], [103u8; 16]],
+                )
+            });
+        }
+
+        // Allow child to process SIGKILL
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Rebuild via restart_self_hosted (watchdog reconcile path)
+        let rebuild = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(rebuild.is_ok(), "rebuild must succeed: {rebuild:?}");
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "spawn count must be 1"
+        );
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn four_consecutive_signal_deaths_within_60s_enters_recovery_required() {
+        // (b) 4 consecutive signal deaths within 60s -> 4th attempt exhausts RespawnBudget
+        // (3 attempts max per 60s window) and latches into RecoveryRequired without spawning.
+        let sigkill_script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; kill -9 $$".to_string();
+        let manager = ManagementChildManager::start_v2_command_regression_script(
+            sigkill_script.clone(),
+            [110u8; 16],
+        )
+        .expect("child starts");
+        let selection = self_hosted_test_selection();
+        let self_hosted_key = selection.steady_launch_key();
+        let state = Arc::new(
+            MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+                Ok(manager),
+                self_hosted_key.clone(),
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        );
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let script = sigkill_script.clone();
+            state.set_rebuild_override(move || {
+                let count = spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script(
+                    script.clone(),
+                    [(111 + count) as u8; 16],
+                )
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Attempt 1: succeeds (spawn 1)
+        let r1 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r1.is_ok(), "attempt 1 succeeds: {r1:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Attempt 2: succeeds (spawn 2)
+        let r2 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r2.is_ok(), "attempt 2 succeeds: {r2:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Attempt 3: succeeds (spawn 3)
+        let r3 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r3.is_ok(), "attempt 3 succeeds: {r3:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 3);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Attempt 4: budget exhausted! Must enter RecoveryRequired and NOT spawn.
+        let r4 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert_eq!(r4.err(), Some(ManagementStartError::RecoveryRequired));
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must not spawn when budget is exhausted"
+        );
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired)
+        ));
+
+        // Calls fail closed with CELL_RECOVERY_REQUIRED
+        let call_res = state.call(MobileRelayV2ManagementOperation::Status);
+        assert_eq!(call_res.unwrap_err().code, RECOVERY_REQUIRED_CODE);
+
+        // Operator recovery resets latch and allows restart
+        state.reset_recovery();
+        let r5 = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(r5.is_ok(), "operator reset allows restart: {r5:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_stop_exited_child_does_not_rebuild() {
+        // (c) Actively stopped child exits -> does NOT rebuild.
+        let script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while IFS= read -r request; do exit 0; done".to_string();
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(script, [120u8; 16])
+                .expect("child starts");
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start(Ok(manager)));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = resurrect_live_script();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[121u8; 16], [122u8; 16]],
+                )
+            });
+        }
+
+        // Active stop / disposal
+        state.dispose();
+        assert!(state.disposed.load(Ordering::Acquire));
+
+        // Calls fail closed with CHANNEL_CLOSED and never respawn
+        let result = state.call(MobileRelayV2ManagementOperation::Status);
+        assert_eq!(result.unwrap_err().code, CHANNEL_CLOSED_CODE);
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "disposed state must never respawn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_hosted_owner_sigkill_rebuilds_self_hosted_never_production() {
+        // (d) Self-hosted owner killed by SIGKILL -> rebuilds self-hosted, never production.
+        let sigkill_script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; kill -9 $$".to_string();
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(sigkill_script, [130u8; 16])
+                .expect("child starts");
+        let selection = self_hosted_test_selection();
+        let self_hosted_key = selection.steady_launch_key();
+        let state = Arc::new(
+            MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+                Ok(manager),
+                self_hosted_key.clone(),
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        );
+        assert!(
+            !state
+                .allow_default_production_respawn
+                .load(Ordering::Acquire),
+            "self-hosted must not allow default production respawn"
+        );
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = resurrect_live_script();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[131u8; 16], [132u8; 16]],
+                )
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Non-connector call must not lazily spawn default production
+        let call_res = state.call(MobileRelayV2ManagementOperation::Status);
+        assert_eq!(call_res.unwrap_err().code, CHANNEL_CLOSED_CODE);
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not spawn production on status call"
+        );
+
+        // Rebuilding rebuilds the self-hosted owner
+        let rebuild = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(rebuild.is_ok(), "self-hosted rebuild succeeds: {rebuild:?}");
+        assert_eq!(
+            spawns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "self-hosted spawn count is 1"
+        );
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+        assert!(
+            !state
+                .allow_default_production_respawn
+                .load(Ordering::Acquire),
+            "lineage remains self-hosted"
+        );
     }
 }

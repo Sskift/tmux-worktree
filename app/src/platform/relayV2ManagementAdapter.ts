@@ -20,6 +20,7 @@ const COMMAND = "mobile_relay_v2_management_call";
 const SHOW_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
 const COPY_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_copy";
 const INLINE_PNG_COMMAND = "mobile_relay_v2_enrollment_artifact_inline_png";
+const RESTART_COMMAND = "mobile_relay_v2_restart_management_service";
 const REQUEST_ID_PATTERN = /^dmgmt2\.[A-Za-z0-9_-]{21}[AQgw]$/;
 
 const MANAGEMENT_ERRORS = {
@@ -695,6 +696,9 @@ export function createRelayV2ManagementAdapter(
       } catch (error) {
         return Promise.reject(error);
       }
+    },
+    restartManagementService: async () => {
+      await invoke(RESTART_COMMAND);
     },
   };
 }

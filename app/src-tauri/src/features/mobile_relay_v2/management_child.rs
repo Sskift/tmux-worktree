@@ -1853,11 +1853,11 @@ impl ManagerInner {
         } else {
             LifecycleKind::Poisoned
         };
-        let cleanup = if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) {
-            ManagementCleanupOutcome::Clean
-        } else {
-            ManagementCleanupOutcome::RecoveryRequired
-        };
+        // Post-handshake unexpected exits (e.g. killed by external signal like SIGKILL,
+        // or unexpected process crash) leave the child process already reaped and holding
+        // no live sockets or credential claims. Their cleanup is Clean so that bounded
+        // respawn via RespawnBudget can replace the child.
+        let cleanup = ManagementCleanupOutcome::Clean;
         self.terminalize_with_cleanup(kind, false, cleanup)
     }
 

@@ -107,6 +107,7 @@ export interface MobileRelayV2ProductAdapter {
   revokeClientGrant(
     input: MobileRelayV2RevokeClientGrantInput,
   ): Promise<MobileRelayV2DashboardState>;
+  restartManagementService?(): Promise<void>;
 }
 
 export interface MobileRelayV2SelfHostedDeploymentPort {
@@ -116,6 +117,7 @@ export interface MobileRelayV2SelfHostedDeploymentPort {
   startCenter(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
   rotateExpiredHostBootstrap(): Promise<MobileRelayV2SelfHostedStatus>;
   stopCenter(): Promise<MobileRelayV2SelfHostedStatus>;
+  restartManagementService?(): Promise<void>;
 }
 
 export interface DashboardBackend {
@@ -303,6 +305,7 @@ export function createUnavailableMobileRelayV2Adapter(
     },
     createEnrollment: unavailable,
     revokeClientGrant: unavailable,
+    restartManagementService: async () => {},
   };
 }
 
@@ -676,6 +679,10 @@ export function createDashboardBackend(
         stopCenter: () =>
           transport.invoke<MobileRelayV2SelfHostedStatus>(
             "mobile_relay_v2_self_hosted_stop_center",
+          ),
+        restartManagementService: () =>
+          transport.invoke<void>(
+            "mobile_relay_v2_restart_management_service",
           ),
       },
     },

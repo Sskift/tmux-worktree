@@ -196,6 +196,7 @@ pub fn run() {
             mobile_relay_v2_self_hosted_start_center,
             mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap,
             mobile_relay_v2_self_hosted_stop_center,
+            mobile_relay_v2_restart_management_service,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

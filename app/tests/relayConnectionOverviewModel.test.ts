@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   deriveRelayConnectionOverview,
   relayRepairRequiresManagementRestart,
   type RelayConnectionOverviewInput,
 } from "../src/dashboard/Settings/relayConnectionOverviewModel.ts";
+import { RelayConnectionOverviewCard } from "../src/dashboard/Settings/RelayConnectionOverviewCard.tsx";
 import type { RelayV2EnrollmentView } from "../src/dashboard/Settings/relayV2EnrollmentModel.ts";
 import type { MobileRelayV2SelfHostedStatus } from "../src/platform/domainTypes.ts";
 
@@ -137,13 +140,36 @@ test("center stopped is a warning with a fix action", () => {
   assert.equal(overview.primaryAction?.label, "Fix connection");
 });
 
-test("backend unavailable surfaces as danger when the center is up", () => {
+test("backend unavailable surfaces as danger with Restart relay service action", () => {
   const overview = deriveRelayConnectionOverview(input({
     enrollmentView: readyEnrollmentView({ adapterAvailable: false }),
   }));
   assert.equal(overview.tone, "danger");
   assert.equal(overview.headline, "Relay backend unavailable");
   assert.equal(overview.primaryAction?.kind, "fix");
+  assert.equal(overview.primaryAction?.label, "Restart relay service");
+});
+
+test("RelayConnectionOverviewCard renders Restart relay service button when backend is unavailable", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    enrollmentView: readyEnrollmentView({ adapterAvailable: false }),
+  }));
+  assert.equal(overview.primaryAction?.label, "Restart relay service");
+  const html = renderToStaticMarkup(createElement(RelayConnectionOverviewCard, {
+    overview,
+    activeReview: null,
+    connectedMobileDevices: [],
+    revokingGrantId: null,
+    mobileDeviceObservationAvailable: false,
+    qrBusy: false,
+    copiedEnrollmentLink: false,
+    inlineQr: null,
+    onPrimaryAction() {},
+    onCopyEnrollmentLink() {},
+    onRevokeClientGrant() {},
+    onHidePairingQr() {},
+  }));
+  assert.match(html, /Restart relay service/);
 });
 
 test("repair rebuilds the management child after terminal connector failure", () => {
