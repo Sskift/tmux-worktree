@@ -68,6 +68,34 @@ function clientError(error: NodeJS.ErrnoException): boolean {
   return error.code === "ENOENT" || error.code === "ECONNREFUSED";
 }
 
+/**
+ * Errors a daemon restart can present to a request after (or just as) the
+ * connection was established:
+ *
+ * - ENOENT/ECONNREFUSED — nothing was listening (already covered by
+ *   clientError);
+ * - EPIPE/ECONNRESET — the socket was torn down before the request bytes were
+ *   delivered (the daemon died between accepting the connection and reading
+ *   from it, e.g. SIGKILL right after bind); the daemon could not have started
+ *   processing the request;
+ * - "server closed without a response" — the peer vanished after connect
+ *   before replying. The authority fences every mutating request with an
+ *   in-flight operation record, so re-driving the same request over a fresh
+ *   connection converges rather than double-applying; this matches the
+ *   existing ENOENT/ECONNREFUSED best-effort retry on the autostart path.
+ *
+ * These are retried only on the autoStart restart path: a stable daemon that
+ * answers the socket never produces them, so a non-autostart caller keeps the
+ * raw failure.
+ */
+function clientRestartTransientError(error: NodeJS.ErrnoException): boolean {
+  if (clientError(error)) return true;
+  if (error.code === "EPIPE" || error.code === "ECONNRESET") return true;
+  return error instanceof Error
+    && error.code === undefined
+    && /terminal-control server closed without a response/.test(error.message);
+}
+
 function localDevelopmentHome(
   target?: Readonly<TerminalControlAutoStartCliTarget>,
 ): string | undefined {
@@ -233,7 +261,7 @@ export async function requestTerminalControl<T = unknown>(
   try {
     response = await sendRequest(socketPath, request, timeoutMs, options.signal);
   } catch (error) {
-    if (options.autoStart === false || !(error instanceof Error) || !clientError(error as NodeJS.ErrnoException)) {
+    if (options.autoStart === false || !(error instanceof Error) || !clientRestartTransientError(error as NodeJS.ErrnoException)) {
       throw error;
     }
     if (options.signal?.aborted) throw aborted();
@@ -264,7 +292,7 @@ export async function requestTerminalControl<T = unknown>(
         response = await sendRequest(socketPath, request, timeoutMs, options.signal);
         break;
       } catch (retryError) {
-        if (!(retryError instanceof Error) || !clientError(retryError as NodeJS.ErrnoException) || Date.now() >= deadline) {
+        if (!(retryError instanceof Error) || !clientRestartTransientError(retryError as NodeJS.ErrnoException) || Date.now() >= deadline) {
           throw retryError;
         }
         await delay(25, options.signal);

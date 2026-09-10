@@ -131,7 +131,7 @@ export interface TerminalControlStoreLock {
   owner: string;
 }
 
-type LockOwner = { owner: string; pid: number; createdAt: number };
+type LockOwner = { owner: string; pid?: number; createdAt: number };
 
 export function terminalControlHome(home = homedir()): string {
   return join(home, ".tmux-worktree");
@@ -428,9 +428,22 @@ function lockOwnerPath(path: string): string {
 function readLockOwner(path: string): LockOwner | undefined {
   try {
     const value = JSON.parse(readFileSync(lockOwnerPath(path), "utf8")) as unknown;
-    if (!isRecord(value) || !exactKeys(value, ["owner", "pid", "createdAt"])) return undefined;
-    if (typeof value.owner !== "string" || !Number.isSafeInteger(value.pid) || !Number.isFinite(value.createdAt)) return undefined;
-    return value as unknown as LockOwner;
+    if (!isRecord(value)) return undefined;
+    // Records written by every current release carry owner/pid/createdAt;
+    // legacy records (older releases) carry owner/createdAt only and keep the
+    // historical createdAt age gate below.
+    const keys = Object.keys(value).sort().join(",");
+    if (keys !== "createdAt,owner" && keys !== "createdAt,owner,pid") return undefined;
+    if (typeof value.owner !== "string"
+      || value.owner.length === 0
+      || !Number.isFinite(value.createdAt)) return undefined;
+    if (value.pid !== undefined
+      && (!Number.isSafeInteger(value.pid) || (value.pid as number) < 2)) return undefined;
+    return {
+      owner: value.owner,
+      createdAt: value.createdAt as number,
+      ...(value.pid === undefined ? {} : { pid: value.pid as number }),
+    };
   } catch {
     return undefined;
   }
@@ -581,29 +594,58 @@ export function terminalControlStoreLockOwnerProcessId(path: string): number | u
 
 async function lockIsStale(path: string): Promise<boolean> {
   const owner = readLockOwner(path);
-  const ageExpired = Date.now() - (owner?.createdAt ?? 0) > LOCK_STALE_MS;
   if (owner) {
-    if (!ageExpired) return false;
-    // The server lock is held for the daemon's whole lifetime and the default
-    // state lock is held per operation — across a ~45s cold-resume
-    // agent-message — by that same daemon. After a SIGKILL (cleanup never
-    // runs) either lock can linger while its recorded pid is reused by an
-    // unrelated same-uid process, which keeps a pid-only liveness check
-    // claiming the owner is alive forever. The authoritative liveness evidence
-    // is the daemon socket: only a confirmed-dead socket lets the lock be
-    // reclaimed, while an answering daemon or a 250ms timeout keeps it (a
-    // reclaim against a live daemon would let two authorities race the
-    // whole-state read/modify/write). During initializeContinuity the new
-    // daemon holds the server lock but is not listening yet, so a live probe
-    // can only be a different process, which will itself fail at the server
-    // lock's "already running" check. Locks whose daemon socket cannot be
-    // derived (custom state path / relay upgrade) keep the pid gate.
-    const socketPath = daemonSocketPathForLock(path);
-    if (socketPath !== undefined) {
-      const liveness = await probeServerSocket(socketPath);
-      return liveness === "dead";
+    const ageExpired = Date.now() - owner.createdAt > LOCK_STALE_MS;
+    // Three-branch reclaim decision, kept aligned with managedStateLockIsStale
+    // in src/state.ts (both sides implement the same stale-lock contract —
+    // keep them in sync).
+    if (owner.pid === undefined) {
+      // Legacy pid-less records: the 60s createdAt age gate is the only
+      // liveness signal, still confirmed by a dead daemon socket when one is
+      // derivable.
+      if (!ageExpired) return false;
+      const legacySocketPath = daemonSocketPathForLock(path);
+      if (legacySocketPath !== undefined) {
+        return (await probeServerSocket(legacySocketPath)) === "dead";
+      }
+      return true;
     }
-    return !processExists(owner.pid);
+    const holderAlive = processExists(owner.pid);
+    const socketPath = daemonSocketPathForLock(path);
+    if (socketPath === undefined) {
+      // The server lock is held for the daemon's whole lifetime and the default
+      // state lock is held per operation — across a ~45s cold-resume
+      // agent-message — by that same daemon. After a SIGKILL (cleanup never
+      // runs) either lock can linger while its recorded pid is reused by an
+      // unrelated same-uid process, which keeps a pid-only liveness check
+      // claiming the owner is alive forever. Locks whose daemon socket cannot
+      // be derived (custom state path / relay upgrade) have no authoritative
+      // socket evidence, so they keep the age gate plus the pid gate.
+      if (!ageExpired) return false;
+      return !holderAlive;
+    }
+    // The daemon socket is the authoritative liveness evidence: only a
+    // confirmed-dead socket (ECONNREFUSED/ENOENT) lets the lock be reclaimed,
+    // while an answering daemon or a 250ms timeout keeps it (a reclaim against
+    // a live daemon would let two authorities race the whole-state
+    // read/modify/write). During initializeContinuity the new daemon holds the
+    // server lock but is not listening yet, so a live probe can only be a
+    // different process, which will itself fail at the server lock's "already
+    // running" check.
+    const liveness = await probeServerSocket(socketPath);
+    if (liveness !== "dead") return false;
+    if (!holderAlive) {
+      // The OS confirms the recorded pid no longer exists (ESRCH) and nothing
+      // is listening on the daemon socket: the holder crashed (SIGKILL, pkill,
+      // upgrade) and the lock is reclaimable immediately — waiting out the 60s
+      // age gate would make every terminal operation fail for the first minute
+      // after a fresh daemon dies.
+      return true;
+    }
+    // A live pid (including an EPERM answer or a pid reused by an unrelated
+    // same-uid process) paired with a dead socket: wait for the age gate so a
+    // lock belonging to a daemon that is starting / restarting is never stolen.
+    return ageExpired;
   }
   // No owner record (never fully created or an orphan): the mtime age gate is
   // the only signal, but still never reclaim a lock whose daemon is answering
