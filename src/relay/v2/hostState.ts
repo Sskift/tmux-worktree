@@ -1025,7 +1025,15 @@ function lockIsStale(path: string): boolean {
     if (owner.pid === process.pid && !activeStoreLockOwners.has(owner.owner)) {
       return true;
     }
-    return Date.now() - owner.createdAt > LOCK_STALE_MS && !processExists(owner.pid);
+    // A recorded pid the OS no longer knows (ESRCH) cannot be holding this
+    // lock: the host was SIGKILLed / crashed mid-turn. Reclaim right away.
+    // Waiting out the 60s age gate here made every replacement host spawned
+    // inside that minute time out on LOCK_WAIT and fail activation, burning
+    // the management child's respawn budget on a lock nobody held. A live pid
+    // (including EPERM and a reused pid) keeps the age gate: it may be a
+    // host that is still finishing its turn.
+    if (!processExists(owner.pid)) return true;
+    return Date.now() - owner.createdAt > LOCK_STALE_MS;
   }
   try {
     return Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS;

@@ -163,3 +163,37 @@ test("host-config-v1 CRUD preserves unknown root and host fields", () => {
     assert.equal(existsSync(`${path}.lock`), false);
   });
 });
+
+// Same stale-lock contract as relay/v2/hostState.ts: a lock whose recorded pid
+// no longer exists was left by a SIGKILLed writer and is reclaimed at once; a
+// fresh lock held by a live unrelated pid is not stolen.
+test("managed-state lock owned by a dead pid is reclaimed immediately", () => {
+  withTempDir("tw-managed-state-deadpid-", (root) => {
+    const lockPath = join(root, "state.json.lock");
+    const gone = spawnSync("true");
+    assert.ok(Number.isSafeInteger(gone.pid) && gone.pid > 1);
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({ owner: `${gone.pid}-crashed`, pid: gone.pid, createdAt: Date.now() })}\n`,
+      { mode: 0o600 },
+    );
+    const started = Date.now();
+    const lock = state.acquireManagedStateLock(lockPath);
+    assert.ok(Date.now() - started < 2_000, "dead-pid lock must be reclaimed without the age gate");
+    assert.notEqual(lock.owner, `${gone.pid}-crashed`);
+    state.releaseManagedStateLock(lock);
+    assert.equal(existsSync(lockPath), false);
+
+    // Control: a fresh lock held by THIS (live) process under a foreign owner
+    // id is not stolen.
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(
+      join(lockPath, "owner.json"),
+      `${JSON.stringify({ owner: `${process.pid}-other-turn`, pid: process.pid, createdAt: Date.now() })}\n`,
+      { mode: 0o600 },
+    );
+    assert.throws(() => state.acquireManagedStateLock(lockPath), /lock/i);
+    rmSync(lockPath, { recursive: true, force: true });
+  });
+});

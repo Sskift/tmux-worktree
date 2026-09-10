@@ -289,6 +289,16 @@ impl MobileRelayV2ManagementCommandState {
         }
     }
 
+    /// Test-only: pretend the respawn budget window started `age` ago so a
+    /// test can observe the cooldown rolling over without sleeping 60s.
+    #[cfg(test)]
+    fn age_respawn_budget_for_test(&self, age: Duration) {
+        let mut budget = self.resurrect.lock().unwrap();
+        if let Some(started) = budget.window_started {
+            budget.window_started = started.checked_sub(age);
+        }
+    }
+
     #[cfg(test)]
     fn from_start(start: Result<ManagementChildManager, ManagementStartError>) -> Self {
         Self::from_start_with_artifacts(
@@ -542,13 +552,15 @@ impl MobileRelayV2ManagementCommandState {
         }
         {
             // Claim one bounded attempt before publishing so a crash-looping
-            // child cannot trigger unbounded spawns.
+            // child cannot trigger unbounded spawns. An exhausted budget is a
+            // soft refusal, not a recovery latch: the owner stays
+            // StartFailed(ChannelClosed) so the watchdog / next lazy call
+            // retries once the 60s window has rolled over. RecoveryRequired is
+            // reserved for deterministic failures (uncertain cleanup, a
+            // replacement that could not commit ready).
             let mut budget = self.resurrect.lock().unwrap();
             if !budget.take_attempt(Instant::now()) {
-                let mut owner = self.owner.lock().unwrap();
-                *owner =
-                    ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
-                return Err(ManagementStartError::RecoveryRequired);
+                return Err(ManagementStartError::ChannelClosed);
             }
         }
         let completion = Arc::new(ManagementDrainCompletion::pending());
@@ -962,14 +974,18 @@ impl MobileRelayV2ManagementCommandState {
             return Err(ManagementStartError::ChannelClosed);
         }
         {
+            // Same soft refusal as the default-production path: the drained
+            // owner is already gone, so publish StartFailed(ChannelClosed) and
+            // let the watchdog retry after the budget window rolls over instead
+            // of latching RecoveryRequired (which only an operator can clear).
             let mut budget = self.resurrect.lock().unwrap();
             if !budget.take_attempt(Instant::now()) {
+                drop(budget);
                 let mut owner = self.owner.lock().unwrap();
-                *owner =
-                    ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                *owner = ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed);
                 drop(owner);
-                completion.complete(ManagementCleanupOutcome::RecoveryRequired);
-                return Err(ManagementStartError::RecoveryRequired);
+                completion.complete(ManagementCleanupOutcome::Clean);
+                return Err(ManagementStartError::ChannelClosed);
             }
         }
         #[cfg(test)]
@@ -2830,9 +2846,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn four_consecutive_signal_deaths_within_60s_enters_recovery_required() {
-        // (b) 4 consecutive signal deaths within 60s -> 4th attempt exhausts RespawnBudget
-        // (3 attempts max per 60s window) and latches into RecoveryRequired without spawning.
+    fn four_consecutive_signal_deaths_within_60s_pause_until_window_rolls_over() {
+        // (b) 4 consecutive signal deaths within 60s -> the 4th attempt exhausts the
+        // RespawnBudget and is refused (no spawn) until the window rolls over;
         let sigkill_script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; kill -9 $$".to_string();
         let manager = ManagementChildManager::start_v2_command_regression_script(
             sigkill_script.clone(),
@@ -2881,9 +2897,14 @@ mod tests {
         assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 3);
         std::thread::sleep(Duration::from_millis(50));
 
-        // Attempt 4: budget exhausted! Must enter RecoveryRequired and NOT spawn.
+        // Attempt 4: budget exhausted. Must NOT spawn, and must NOT latch
+        // RecoveryRequired either: an exhausted budget is a soft refusal that
+        // the watchdog retries after the 60s window rolls over. Latching here
+        // would turn a transient crash burst (upgrade, OOM killer, a flaky
+        // devbox link) into an outage only an operator click can end — the
+        // very failure mode this package exists to remove.
         let r4 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
-        assert_eq!(r4.err(), Some(ManagementStartError::RecoveryRequired));
+        assert_eq!(r4.err(), Some(ManagementStartError::ChannelClosed));
         assert_eq!(
             spawns.load(std::sync::atomic::Ordering::SeqCst),
             3,
@@ -2891,18 +2912,41 @@ mod tests {
         );
         assert!(matches!(
             &*state.owner.lock().unwrap(),
-            ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired)
+            ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed)
         ));
-
-        // Calls fail closed with CELL_RECOVERY_REQUIRED
+        // Calls fail with CHANNEL_CLOSED (retryable), not CELL_RECOVERY_REQUIRED.
         let call_res = state.call(MobileRelayV2ManagementOperation::Status);
-        assert_eq!(call_res.unwrap_err().code, RECOVERY_REQUIRED_CODE);
+        assert_eq!(call_res.unwrap_err().code, CHANNEL_CLOSED_CODE);
 
-        // Operator recovery resets latch and allows restart
-        state.reset_recovery();
-        let r5 = state.restart_self_hosted_for_test(selection, || Ok(()));
-        assert!(r5.is_ok(), "operator reset allows restart: {r5:?}");
+        // Still inside the window: a retry is refused again without spawning.
+        let r4b = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert_eq!(r4b.err(), Some(ManagementStartError::ChannelClosed));
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Once the 60s window has elapsed the watchdog's next reconcile rebuilds
+        // without any operator action.
+        state.age_respawn_budget_for_test(RESURRECT_COOLDOWN);
+        let r5 = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r5.is_ok(), "budget window rollover allows restart: {r5:?}");
         assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        // Operator reset still works as an immediate override of the window.
+        // (Let each replacement child reach its post-handshake death before the
+        // next restart drains it, as the earlier attempts do.)
+        std::thread::sleep(Duration::from_millis(50));
+        let r5b = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r5b.is_ok(), "attempt 2 of the new window succeeds: {r5b:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        let r5c = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert!(r5c.is_ok(), "attempt 3 of the new window succeeds: {r5c:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        let refused = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert_eq!(refused.err(), Some(ManagementStartError::ChannelClosed));
+        let before = spawns.load(std::sync::atomic::Ordering::SeqCst);
+        state.reset_recovery();
+        let r6 = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(r6.is_ok(), "operator reset allows restart: {r6:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), before + 1);
     }
 
     #[cfg(unix)]

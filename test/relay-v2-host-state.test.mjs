@@ -2980,3 +2980,56 @@ test("A6: ESTALE/EDQUOT publish faults are retryable storage faults and keep the
     }
   }
 });
+
+// A SIGKILLed host (app crash, force-quit, upgrade) leaves state-v1.lock
+// owned by a pid the OS no longer knows. The replacement host must reclaim it
+// at once: waiting out the 60s age gate made every replacement spawned inside
+// that minute time out on LOCK_WAIT, fail activation, and burn the management
+// child's respawn budget (observed on the production Dashboard 1.0.26 during
+// the round-3 kill -9 verification). A live foreign pid keeps the age gate.
+test("state lock owned by a dead pid is reclaimed immediately; a live foreign pid keeps the age gate", async () => {
+  const { spawn, spawnSync } = await import("node:child_process");
+  const { mkdirSync, writeFileSync, readdirSync } = await import("node:fs");
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const before = await store.read();
+    const stateRoot = dirname(h.paths.lock);
+
+    // A pid that definitely existed and is definitely gone.
+    const gone = spawnSync("true");
+    assert.ok(Number.isSafeInteger(gone.pid) && gone.pid > 1);
+    mkdirSync(h.paths.lock, { mode: 0o700 });
+    writeFileSync(
+      join(h.paths.lock, "owner.json"),
+      `${JSON.stringify({ owner: `${gone.pid}-crashed-host`, pid: gone.pid, createdAt: Date.now() })}\n`,
+      { mode: 0o600 },
+    );
+    const started = Date.now();
+    const after = await store.read();
+    const elapsed = Date.now() - started;
+    assert.equal(after.hostEpoch, before.hostEpoch);
+    assert.ok(elapsed < 2_000, `dead-pid lock must not wait out LOCK_WAIT/age gate (took ${elapsed}ms)`);
+    assert.deepEqual(readdirSync(stateRoot).filter((e) => e === "state-v1.lock"), []);
+
+    // Control: a fresh lock held by a live unrelated process is NOT stolen.
+    const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+    try {
+      mkdirSync(h.paths.lock, { mode: 0o700 });
+      writeFileSync(
+        join(h.paths.lock, "owner.json"),
+        `${JSON.stringify({ owner: `${sleeper.pid}-live-host`, pid: sleeper.pid, createdAt: Date.now() })}\n`,
+        { mode: 0o600 },
+      );
+      await assert.rejects(
+        store.read(),
+        (error) => /timed out waiting for Relay v2 host state lock/.test(error.message),
+      );
+      assert.deepEqual(readdirSync(stateRoot).filter((e) => e === "state-v1.lock"), ["state-v1.lock"]);
+    } finally {
+      sleeper.kill("SIGKILL");
+    }
+  } finally {
+    h.cleanup();
+  }
+});

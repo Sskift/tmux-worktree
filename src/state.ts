@@ -481,14 +481,19 @@ function readManagedStateLockOwner(lockPath: string): ManagedStateLockOwnerRecor
 function managedStateLockIsStale(lockPath: string): boolean {
   const owner = readManagedStateLockOwner(lockPath);
   if (owner) {
+    // New-format records carry the holder pid. A pid the OS no longer knows
+    // (ESRCH) cannot be holding the lock — the writer was SIGKILLed — so it is
+    // reclaimed immediately instead of blocking every later writer for the
+    // full age window (same contract as the relay host state lock in
+    // relay/v2/hostState.ts; keep the two in sync). A live pid (including a
+    // reused one) blocks reclaim until the age gate. Legacy records written by
+    // every released version lack pid; they keep the historical createdAt age
+    // gate so a SIGKILL or power-loss leftover lock still self-heals after 60s
+    // rather than wedging all later writers until the lock dir is removed by
+    // hand.
+    if (owner.pid !== undefined && !processExists(owner.pid)) return true;
     if (Date.now() - owner.createdAt <= MANAGED_STATE_LOCK_STALE_MS) return false;
-    // New-format records carry the holder pid: a live pid (including a reused
-    // one) blocks reclaim. Legacy records written by every released version
-    // lack pid; they keep the historical createdAt age gate so a SIGKILL or
-    // power-loss leftover lock still self-heals after 60s rather than wedging
-    // all later writers until the lock dir is removed by hand.
-    if (owner.pid === undefined) return true;
-    return !processExists(owner.pid);
+    return owner.pid === undefined;
   }
   try {
     return Date.now() - statSync(lockPath).mtimeMs > MANAGED_STATE_LOCK_STALE_MS;
