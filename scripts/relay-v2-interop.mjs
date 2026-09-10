@@ -17,7 +17,7 @@ import {
   rmSync,
 } from "node:fs";
 import { join } from "node:path";
-import { startInteropTopology } from "./internal/relayV2InteropHarness.mjs";
+import { startInteropTopology, removeInteropHostTrustedHome } from "./internal/relayV2InteropHarness.mjs";
 
 const RESULTS = [];
 function record(name, passed, detail = "") {
@@ -805,6 +805,11 @@ interopExitCode = failed > 0 ? 1 : 0;
   try { await terminateChild(hostProc, { closeInput: true }); } catch (error) { cleanupErrors.push(error); }
   try { await stopScopedTerminalControlDaemon(hostTrustedHome); } catch (error) { cleanupErrors.push(error); }
   try { await terminateChild(brokerProc); } catch (error) { cleanupErrors.push(error); }
+  // First removal of the host trusted home while every writer except the pane
+  // shell is dead; the dying pane zsh can still rewrite ~/.zsh_history when
+  // its session is killed below, so the home is removed again after the
+  // tmux kill-session settles (double-rm).
+  removeInteropHostTrustedHome(hostTrustedHome);
   for (const name of scopedTmuxSessions) {
     if (!tmuxSessionNames().has(name)) continue;
     try {
@@ -818,8 +823,14 @@ interopExitCode = failed > 0 ? 1 : 0;
   if (leakedSessions.length > 0) {
     cleanupErrors.push(new Error(`tmux sessions leaked: ${leakedSessions.join(", ")}`));
   }
+  // Give a dying pane zsh a brief window to flush ~/.zsh_history, then remove
+  // the home a second time and verify it is gone.
+  await delay(250);
   try { if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true }); } catch (error) { cleanupErrors.push(error); }
-  try { if (hostTrustedHome) rmSync(hostTrustedHome, { recursive: true, force: true }); } catch (error) { cleanupErrors.push(error); }
+  removeInteropHostTrustedHome(hostTrustedHome);
+  if (hostTrustedHome && existsSync(hostTrustedHome)) {
+    cleanupErrors.push(new Error(`host trusted home leaked: ${hostTrustedHome}`));
+  }
   if (cleanupErrors.length > 0) {
     interopExitCode = 1;
     for (const error of cleanupErrors) console.error("[FAIL] cleanup:", error?.message ?? error);

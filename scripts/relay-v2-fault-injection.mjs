@@ -30,6 +30,7 @@ import {
   startInteropTopology,
   spawnInteropHost,
   startInProcessBroker,
+  removeInteropHostTrustedHome,
 } from "./internal/relayV2InteropHarness.mjs";
 import { createSelfSignedCertificate } from "./internal/relayV2InteropTls.mjs";
 
@@ -1949,7 +1950,11 @@ try {
       try { for (const entry of readdirSync(stateRoot)) { try { chmodSync(join(stateRoot, entry), 0o700); } catch {} } } catch {}
     }
     try { rmSync(extraTopo.tmpRoot, { recursive: true, force: true }); } catch {}
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
+    // The trusted home is NOT removed here: its pane zsh sessions are killed
+    // later in the scoped tmux kill loop, and a dying zsh rewrites
+    // ~/.zsh_history after the directory is gone. Homes get a first removal
+    // after every process is dead and a second (double-rm) removal after the
+    // tmux kill-session settles; the global leftover-home self-check verifies.
   }
   if (topology && topology.hostProc?.exitCode === null) {
     try { await topology.hostRequest("stop_connector"); } catch {}
@@ -1964,6 +1969,18 @@ try {
   await killProcessesReferencingHome(hostTrustedHome);
   for (const home of extraTrustedHomes) { await killProcessesReferencingHome(home); }
   try { await terminateChild(brokerProc); } catch (error) { cleanupErrors.push(error); }
+
+  // Every host/daemon/segment-writer process is now dead; only pane shells
+  // remain, and they are killed in the tmux loop below. First removal of ALL
+  // trusted homes (main + A2 dual-host + isolated A6/A8 topologies) — the
+  // second removal runs after the kill-session settles to sweep the
+  // ~/.zsh_history a dying pane zsh can recreate (double-rm).
+  const allHostHomes = [
+    hostTrustedHome,
+    ...extraTrustedHomes,
+    ...extraTopologies.map((extraTopo) => extraTopo.hostTrustedHome),
+  ].filter(Boolean);
+  for (const home of allHostHomes) removeInteropHostTrustedHome(home);
 
   for (const name of scopedTmuxSessions) {
     if (!tmuxSessionNames().has(name)) continue;
@@ -1980,8 +1997,7 @@ try {
   }
   // Restore any permission faults A6 left behind (it chmods the host state
   // dir to 000) so rmSync below can actually remove the trusted home.
-  for (const home of [hostTrustedHome, ...extraTrustedHomes]) {
-    if (!home) continue;
+  for (const home of allHostHomes) {
     try { chmodSync(home, 0o700); } catch {}
     for (const stateRoot of [
       join(home, ".tmux-worktree", "relay-v2-host-state"),
@@ -1995,11 +2011,11 @@ try {
       } catch {}
     }
   }
+  // Brief window for a dying pane zsh to flush ~/.zsh_history, then the
+  // second home removal (double-rm).
+  await delay(250);
   try { if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true }); } catch (error) { cleanupErrors.push(error); }
-  try { if (hostTrustedHome) rmSync(hostTrustedHome, { recursive: true, force: true }); } catch (error) { cleanupErrors.push(error); }
-  for (const home of extraTrustedHomes) {
-    try { rmSync(home, { recursive: true, force: true }); } catch {}
-  }
+  for (const home of allHostHomes) removeInteropHostTrustedHome(home);
 
   // Post-cleanup verification: no leftover relay-v2 temp homes, no stray
   // interop host processes, no scoped tmux sessions.
