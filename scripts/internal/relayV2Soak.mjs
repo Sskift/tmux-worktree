@@ -63,11 +63,15 @@ const D_ROUNDS = QUICK ? envInt("SOAK_D_ROUNDS", 0) : envInt("SOAK_D_ROUNDS", 1)
 const DETACH_MS_RESUME = QUICK ? envInt("SOAK_DETACH_RESUME", 8_000) : 90_000;
 const DETACH_MS_EXPIRED = QUICK ? envInt("SOAK_DETACH_EXPIRED", 8_000) : 130_000;
 const DETACH_MS_FLOOD = QUICK ? envInt("SOAK_DETACH_FLOOD", 8_000) : 30_000;
-// Diagnostic (a)-variant: keep a SECOND terminal on a live connection while
-// the probe terminal is detached. Its producer-lease maintenance timer is
-// the manager's only time-based sweep driver (sweeps fire at each live
-// stream's lease half-life, ~15s). With no live neighbor the manager never
-// sweeps on an idle host and the 120s detached lease is not enforced.
+// Diagnostic (a)-variant (SOAK_A_BEACON=1): keep a SECOND terminal on a live
+// connection while the probe terminal is detached. Historically this was the
+// ONLY configuration that enforced the 120s lease: the producer-lease
+// half-life timer (~15s) was armed for live streams only, so an idle host
+// with no live neighbour never swept and the detached stream lived until the
+// host restarted. The manager now arms its single maintenance timer for the
+// detached lease (and the control retention after it) itself, so lease expiry
+// fires with or without a neighbour; the beacon variant is kept purely as a
+// contrast control.
 const A_BEACON = process.env.SOAK_A_BEACON === "1";
 const HOST_ID = "soak-host";
 
@@ -764,9 +768,11 @@ async function sample(topology, round, kind, phase, note = "") {
 
 /**
  * A second terminal on a persistently connected client, kept live while
- * another terminal is detached. The manager's producer-lease maintenance
- * timer sweeps at each live stream's lease half-life; without any live
- * stream an idle host has no time-based sweep at all.
+ * another terminal is detached. This used to be the only thing that made the
+ * manager sweep on an idle host (the producer-lease half-life timer was armed
+ * for live streams only); it is now just a diagnostic contrast to the
+ * beacon-less (a) round, which must enforce the detached lease on its own via
+ * the manager's detached-lease maintenance timer.
  */
 async function startBeacon(topology, tag) {
   const beacon = await openClient(topology);
@@ -829,8 +835,9 @@ async function detachResumeRound(topology, round, kind, detachMs, options = {}) 
     const lastEnd = beforeFrames.length ? beforeFrames[beforeFrames.length - 1].end : 0n;
     logLine(`[${tag}] detaching; lastEnd=${lastEnd} frames=${beforeFrames.length} detachMs=${detachMs}`);
 
-    // (a) diagnostic: a live neighbor stream drives the manager's only
-    // time-based sweep (producer-lease half-life timer, live streams only).
+    // (a) diagnostic contrast: a live neighbour also drives sweeps at its
+    // producer-lease half-life. The detached lease must be enforced WITHOUT
+    // it — an idle single-terminal host arms its own detached-lease timer.
     if (kind === "a" && useBeacon) {
       beacon = await startBeacon(topology, tag);
     }
@@ -911,7 +918,8 @@ async function detachResumeRound(topology, round, kind, detachMs, options = {}) 
           `type=${respType} disposition=${disposition} resetReason=${resetReason} `
           + `streamEvent=${streamEvent ? `${streamEvent.type}(${streamEvent.payload?.reason ?? "?"}/exit=${streamEvent.payload?.exitCode ?? "?"})` : "none"}`
           + `${closedOther ? ` closed=${closedOther}` : ""}`
-          + `${(!cleanReset && !useBeacon) ? " [no live neighbor stream: manager has no time-based sweep driver — see a-beacon diagnostic]" : ""}`);
+          + `${(!cleanReset && !useBeacon) ? " [detached lease was not enforced on an idle host with no live neighbour — the detached maintenance timer should have swept]" : ""}`
+          + `${(!cleanReset && useBeacon) ? " [failed even WITH a live neighbour]" : ""}`);
 
         // Host health: brand new terminal on the same host.
         let healthOk = false;
@@ -1153,7 +1161,8 @@ try {
   } else {
     // Spec layout: 30 (b) rounds; an (a) lease-expiry round is inserted after
     // every 5th (b) round (6 total). (a) runs with NO beacon: a single phone
-    // backgrounded has no other live stream on the host.
+    // backgrounded has no other live stream on the host, exactly the case the
+    // detached-lease maintenance timer now covers on its own.
     for (let b = 1; b <= B_ROUNDS; b++) {
       bCount += 1;
       logLine(`===== (b) in-lease resume round ${bCount} =====`);
@@ -1164,11 +1173,11 @@ try {
         await detachResumeRound(topology, aCount, "a", DETACH_MS_EXPIRED);
       }
     }
-    // Diagnostic control: same (a) but with a live neighbor stream kept on a
-    // separate connection. The neighbor's producer-lease half-life timer is
-    // the terminal manager's only time-based sweep driver; with it present the
-    // 120s detached lease IS enforced (reset_required(stream_lost)), proving
-    // the lease logic works and the missing piece is the sweep owner.
+    // Diagnostic contrast: same (a) but with a live neighbour stream kept on
+    // a separate connection. This used to be the only setup that enforced the
+    // 120s lease; it must now behave identically to the beacon-less round
+    // (reset_required(stream_lost)), confirming enforcement no longer depends
+    // on the presence of a neighbour.
     logLine("===== (a-beacon) lease-expiry with live neighbor stream (diagnostic) =====");
     await detachResumeRound(topology, 1, "a", DETACH_MS_EXPIRED, { tag: "a-beacon-1", beacon: true });
   }

@@ -1003,7 +1003,7 @@ interface TerminalStream {
   lastUsedAt: number;
 }
 
-interface ProducerLeaseMaintenance {
+interface MaintenanceTimer {
   active: boolean;
   deadlineMs: number;
   cancel(): void;
@@ -1896,7 +1896,7 @@ export class RelayV2TerminalManager {
   private stopping = false;
   private shutdownBarrier: Promise<void> | null = null;
   private fatalSink: ((error: unknown) => void) | null = null;
-  private producerLeaseMaintenance: ProducerLeaseMaintenance | null = null;
+  private maintenanceTimer: MaintenanceTimer | null = null;
 
   private readonly hostId: string;
   private readonly hostEpoch: string;
@@ -2037,7 +2037,7 @@ export class RelayV2TerminalManager {
   shutdown(): Promise<void> {
     if (this.shutdownBarrier !== null) return this.shutdownBarrier;
     this.stopping = true;
-    this.cancelProducerLeaseMaintenance();
+    this.cancelMaintenanceTimer();
     this.shutdownBarrier = this.enqueue(async () => {
       let uncertainProducerRelease = false;
       for (const stream of this.streams.values()) {
@@ -2093,7 +2093,15 @@ export class RelayV2TerminalManager {
       if (this.isFatalAuthorityFailure(error)) this.notifyFatal(error);
       throw error;
     });
-    this.serialized = observed.then(() => undefined, () => undefined);
+    // Every serialized state mutation funnels through here — public operations
+    // and the backend/onClosed callbacks alike. Re-evaluate the single
+    // maintenance timer once the mutation has settled so any new lease,
+    // detached deadline, or retention deadline owns its wake-up even when the
+    // mutation did not touch a producer lease itself.
+    this.serialized = observed.then(
+      () => this.refreshMaintenanceTimer(),
+      () => this.refreshMaintenanceTimer(),
+    );
     return observed;
   }
 
@@ -2843,7 +2851,7 @@ export class RelayV2TerminalManager {
     for (const [recordKey, record] of this.openRecords) {
       if (record.streamKey === stream.key) this.openRecords.delete(recordKey);
     }
-    this.refreshProducerLeaseMaintenance();
+    this.refreshMaintenanceTimer();
   }
 
   private async fenceDivergentLocalStream(
@@ -4155,59 +4163,112 @@ export class RelayV2TerminalManager {
       owner: { ...lease.owner },
     };
     stream.renewLeaseAfter = now + Math.max(1, Math.floor((expiresAtMs - now) / 2));
-    this.refreshProducerLeaseMaintenance();
+    this.refreshMaintenanceTimer();
     return lease;
   }
 
-  private cancelProducerLeaseMaintenance(): void {
-    const current = this.producerLeaseMaintenance;
+  private cancelMaintenanceTimer(): void {
+    const current = this.maintenanceTimer;
     if (current === null) return;
-    this.producerLeaseMaintenance = null;
+    this.maintenanceTimer = null;
     current.active = false;
     current.cancel();
   }
 
   /**
-   * The terminal manager owns every producer lease, so it also owns the sole
-   * half-life deadline. Without this deadline an otherwise idle live stream
-   * lets its exact 30s lease expire under the observation pump; terminal-control
-   * must then rotate output and fence that observer before any later input can
-   * ask the manager to renew.
+   * The manager owns every time-based deadline. There is exactly ONE
+   * maintenance timer, scheduled at the earliest deadline of any of:
+   *
+   *   - the producer lease half-life of a live stream. Without that deadline
+   *     an otherwise idle live stream lets its exact 30s lease expire under
+   *     the observation pump; terminal-control must then rotate output and
+   *     fence that observer before any later input can renew.
+   *   - the detached lease (detachedUntil) of an unbound stream. A phone that
+   *     backgrounds its only terminal leaves the host with zero live streams,
+   *     so the producer deadline above does not exist. Sweeping only on
+   *     open/input/resize events meant such a detached stream — paused pump,
+   *     retained ring, producer lease, control records — was never reclaimed:
+   *     whether the 120s lease was enforced depended on a neighbour stream
+   *     existing. The clock now owns it; on expiry sweepInternal marks the
+   *     generation lost and disposes it exactly as an event-driven sweep did.
+   *   - control retention after a stream is lost/closed (retainedUntil), and
+   *     the quarantine / ring / control-record deadlines sweepInternal
+   *     reaps. With the detached deadline already armed a successor timer
+   *     covers these too, so a fully idle host still drains retained state
+   *     and durable reservations.
+   *
+   * The timer fires a single serialized sweepInternal (maintaining live
+   * producer leases), then re-arms for the new earliest deadline. When
+   * nothing is pending no timer is scheduled: an idle host never spins.
    */
-  private refreshProducerLeaseMaintenance(): void {
+  private refreshMaintenanceTimer(): void {
+    const now = this.now();
     let deadlineMs = Number.POSITIVE_INFINITY;
     if (!this.stopping) {
       for (const stream of this.streams.values()) {
-        if (stream.status !== "live" || stream.producerLease === undefined) continue;
-        deadlineMs = Math.min(deadlineMs, stream.renewLeaseAfter ?? this.now());
+        if (stream.status === "live" && stream.producerLease !== undefined) {
+          deadlineMs = Math.min(deadlineMs, stream.renewLeaseAfter ?? now);
+        }
+        if (stream.status === "detached" && stream.detachedUntil !== undefined) {
+          deadlineMs = Math.min(deadlineMs, stream.detachedUntil);
+        }
+        if (stream.status === "lost" || stream.status === "closed") {
+          // The stream is only deleted once retainedUntil has passed AND no
+          // open/close record still names its key. While records exist the
+          // records' own deadlines below are the actionable wake-ups; arming
+          // retainedUntil now could schedule a delay-0 sweep that cannot
+          // delete the stream and would re-arm forever.
+          const pinnedByRecord = [...this.openRecords.values()]
+            .some((record) => record.streamKey === stream.key)
+            || [...this.closeRecords.values()]
+              .some((record) => record.streamKey === stream.key);
+          if (!pinnedByRecord) deadlineMs = Math.min(deadlineMs, stream.retainedUntil);
+        }
+        if (stream.status === "closed" && stream.close && stream.ringRetained) {
+          deadlineMs = Math.min(deadlineMs, stream.close.ringExpiresAt);
+        }
+      }
+      for (const quarantined of this.quarantinedBackends.values()) {
+        deadlineMs = Math.min(deadlineMs, quarantined.expiresAt);
+      }
+      // A record deadline only owns a wake-up if sweepInternal would actually
+      // reap it then: an open record of a current live/detached generation is
+      // retained indefinitely, so its expiresAt must never schedule a delay-0
+      // re-fire loop. Mirror the sweep's predicate exactly.
+      for (const [key, record] of this.openRecords) {
+        if (this.openRecordHeldByLiveGeneration(record)) continue;
+        deadlineMs = Math.min(deadlineMs, record.expiresAt);
+      }
+      for (const record of this.closeRecords.values()) {
+        deadlineMs = Math.min(deadlineMs, record.expiresAt);
       }
     }
-    const current = this.producerLeaseMaintenance;
+    const current = this.maintenanceTimer;
     if (Number.isFinite(deadlineMs)
       && current !== null
       && current.active
       && current.deadlineMs === deadlineMs) return;
-    this.cancelProducerLeaseMaintenance();
+    this.cancelMaintenanceTimer();
     if (!Number.isFinite(deadlineMs)) return;
 
-    const maintenance: ProducerLeaseMaintenance = {
+    const maintenance: MaintenanceTimer = {
       active: true,
       deadlineMs,
       cancel: () => undefined,
     };
-    this.producerLeaseMaintenance = maintenance;
+    this.maintenanceTimer = maintenance;
     const callback = (): void => {
-      if (!maintenance.active || this.producerLeaseMaintenance !== maintenance) return;
+      if (!maintenance.active || this.maintenanceTimer !== maintenance) return;
       maintenance.active = false;
-      this.producerLeaseMaintenance = null;
-      void this.sweep().finally(() => {
-        this.refreshProducerLeaseMaintenance();
+      this.maintenanceTimer = null;
+      void this.enqueue(() => this.sweepInternal(true)).finally(() => {
+        this.refreshMaintenanceTimer();
       }).catch(() => undefined);
     };
-    const cancel = this.schedule(Math.max(0, deadlineMs - this.now()), callback);
+    const cancel = this.schedule(Math.max(0, deadlineMs - now), callback);
     if (typeof cancel !== "function") {
       maintenance.active = false;
-      if (this.producerLeaseMaintenance === maintenance) this.producerLeaseMaintenance = null;
+      if (this.maintenanceTimer === maintenance) this.maintenanceTimer = null;
       throw new TypeError("Relay v2 terminal lease scheduler returned an invalid cancel handle");
     }
     maintenance.cancel = cancel;
@@ -4331,14 +4392,14 @@ export class RelayV2TerminalManager {
   private dropProducerLease(stream: TerminalStream): void {
     stream.producerLease = undefined;
     stream.renewLeaseAfter = undefined;
-    this.refreshProducerLeaseMaintenance();
+    this.refreshMaintenanceTimer();
   }
 
   private async releaseProducerLease(stream: TerminalStream): Promise<ProducerReleaseResult> {
     const lease = stream.producerLease;
     stream.producerLease = undefined;
     stream.renewLeaseAfter = undefined;
-    this.refreshProducerLeaseMaintenance();
+    this.refreshMaintenanceTimer();
     if (!lease) {
       if (stream.retiringLease) {
         return {
@@ -5977,6 +6038,20 @@ export class RelayV2TerminalManager {
     );
   }
 
+  /**
+   * An open record whose opened outcome is the live/detached generation is
+   * retained past its nominal expiresAt; only records that no longer name a
+   * live generation may be reaped. The maintenance timer mirrors this: such a
+   * record's deadline never schedules a wake-up.
+   */
+  private openRecordHeldByLiveGeneration(record: OpenRecord): boolean {
+    if (record.outcome.kind !== "opened") return false;
+    const stream = this.streams.get(record.streamKey);
+    return !!stream
+      && (stream.status === "live" || stream.status === "detached")
+      && stream.generation === record.outcome.generation;
+  }
+
   private async sweepInternal(maintainProducerLeases = false): Promise<void> {
     const now = this.now();
     for (const [handle, quarantined] of this.quarantinedBackends) {
@@ -6023,12 +6098,9 @@ export class RelayV2TerminalManager {
     }
 
     for (const [key, record] of this.openRecords) {
-      const stream = this.streams.get(record.streamKey);
-      const currentLiveGeneration = record.outcome.kind === "opened"
-        && stream
-        && (stream.status === "live" || stream.status === "detached")
-        && stream.generation === record.outcome.generation;
-      if (record.expiresAt <= now && !currentLiveGeneration) this.openRecords.delete(key);
+      if (record.expiresAt <= now && !this.openRecordHeldByLiveGeneration(record)) {
+        this.openRecords.delete(key);
+      }
     }
     for (const [key, record] of this.closeRecords) {
       if (record.expiresAt <= now) this.closeRecords.delete(key);
