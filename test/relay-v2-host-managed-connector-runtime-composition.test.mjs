@@ -228,6 +228,36 @@ function completeScope() {
   };
 }
 
+function unreachableScope() {
+  return {
+    backendIdentity: "ssh:devbox",
+    displayName: "devbox",
+    kind: "ssh",
+    reachability: "unreachable",
+    sessionsCompleteness: "partial",
+    sessions: [],
+    error: {
+      code: "SCOPE_UNREACHABLE",
+      message: "ssh probe failed",
+      retryable: true,
+      commandDisposition: "not_applicable",
+    },
+  };
+}
+
+function partialScan() {
+  return { coverage: "partial", scopes: [completeScope(), unreachableScope()] };
+}
+
+function completeScan() {
+  return { coverage: "complete", scopes: [completeScope(), {
+    ...unreachableScope(),
+    reachability: "online",
+    sessionsCompleteness: "complete",
+    error: null,
+  }] };
+}
+
 function registeredFrame(record, disposition = "connected") {
   const registered = fixture("host-registered");
   registered.requestId = record.hello.requestId;
@@ -464,6 +494,12 @@ async function createHarness(options = {}) {
   discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
   if (options.freshH2) {
     discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+  }
+  if (options.partialSeed) {
+    // Every configured remote scope is unreachable at startup: the seed scan
+    // and the reconcile inside fresh-install issuance are both partial.
+    discovery.scans.length = 0;
+    discovery.scans.push(partialScan(), partialScan());
   }
   const seeded = await foundation.reconcile();
   const spoolRoot = join(home, "snapshot-spool");
@@ -1481,6 +1517,65 @@ test("Dashboard-owned fresh H2 recovers its full offer after a post-open materia
       connectorId: `managed-connector-${record.sequence}`,
       negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
     });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("Dashboard-owned fresh H2 starts with a partial scan and registers once coverage completes", async () => {
+  // Live 1.0.26 crash loop: an unreachable SSH scope at startup made the
+  // fresh-install bootstrap throw, the management child exited 1, and the
+  // watchdog respawned it forever. The composition must open with h2 unready,
+  // fail the first connector attempt as retryable UNAVAILABLE, and register
+  // with the full offer after the next complete authoritative reconcile.
+  const h = await createHarness({ managedWss: true, freshH2: true, partialSeed: true });
+  try {
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    await assert.rejects(
+      h.composition.start(startInput("managed.fresh-h2.partial-seed")),
+      (error) => error?.name === "RelayV2HostConnectorControllerError"
+        && error.code === "UNAVAILABLE",
+    );
+    assert.deepEqual(h.composition.inspect(), {
+      status: "failed",
+      controllerGeneration: "1",
+      connectorId: null,
+      retryable: true,
+    });
+    assert.equal(h.records.length, 0, "an unready h2 must not create a socket");
+
+    // Still partial: nothing changes.
+    h.discovery.scans.push(partialScan());
+    const stillPartial = await h.foundation.reconcile();
+    assert.equal(stillPartial.readiness.snapshotMaterializationReady, false);
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+
+    // Scope becomes reachable: the authoritative reconcile edge installs the
+    // deferred fresh-install activation and h2 flips ready.
+    h.discovery.scans.push(completeScan());
+    const recovered = await h.foundation.reconcile();
+    assert.equal(recovered.readiness.snapshotMaterializationReady, true);
+    const { record } = await startManagedWssRegistered(h, "managed.fresh-h2.recovered");
+    assert.deepEqual(
+      record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+    await settle();
+    assert.equal(h.composition.inspect().status, "registered_incomplete");
+
+    // Snapshots are served from the same spool after the deferred activation.
+    const epoch = (await h.store.read()).hostEpoch;
+    const first = await h.spool.get({
+      principalId: "partial-seed-principal",
+      clientInstanceId: "partial-seed-client",
+      expectedHostEpoch: epoch,
+      snapshotRequestId: "partial-seed-first-snapshot",
+      snapshotId: null,
+      cursor: null,
+      nextChunkIndex: 0,
+    });
+    assert.equal(first.coverageComplete, true);
+    assert.equal(typeof first.snapshotId, "string");
   } finally {
     await h.cleanup();
   }

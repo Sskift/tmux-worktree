@@ -711,6 +711,85 @@ test("concurrent bound spool opens leave exactly one current H2 claim", async ()
   }
 });
 
+test("fresh-install H2 candidate is issued deferred while the startup scan is partial", async () => {
+  // Reproduces the 1.0.26 Dashboard crash loop: every configured SSH scope is
+  // unreachable at startup (expired Kerberos), so the seed scan is partial and
+  // the materialized state is not snapshot-ready. The bootstrap must still
+  // hand out a candidate whose process authority matches the HostState owner;
+  // the runtime keeps h2 unready and closes v2 routes until coverage completes.
+  const unreachable = scope([], {
+    backendIdentity: "ssh:devbox",
+    displayName: "devbox",
+    kind: "ssh",
+    reachability: "unreachable",
+    sessionsCompleteness: "partial",
+    error: {
+      code: "SCOPE_UNREACHABLE",
+      message: "ssh probe failed",
+      retryable: true,
+      commandDisposition: "not_applicable",
+    },
+  });
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-spool-partial-"));
+  const paths = hostState.relayV2HostStatePaths(home);
+  const store = await hostState.RelayV2HostStateStore.open({ paths });
+  const discovery = new QueueDiscovery();
+  const readiness = [];
+  const foundation = new resourceState.RelayV2MaterializedStateFoundation({
+    hostId: "mac-admin",
+    discovery,
+    store,
+    readinessSink: { apply: (snapshot) => { readiness.push(snapshot.reason); return true; } },
+  });
+  // A host that never completed a scan reports authority-not-established; one
+  // that did (the live 1.0.26 case) reports aggregate_coverage_partial once a
+  // scope drops out. Both must defer rather than abort, so drive the store
+  // through the live shape: complete once, then lose the SSH scope.
+  discovery.push({ coverage: "partial", scopes: [scope(), unreachable] });
+  const neverComplete = await foundation.reconcile();
+  assert.equal(neverComplete.readiness.snapshotMaterializationReady, false);
+  assert.equal(neverComplete.readiness.reason, "aggregate_authority_not_established");
+  discovery.push({ coverage: "complete", scopes: [scope(), scope([], {
+    backendIdentity: "ssh:devbox",
+    displayName: "devbox",
+    kind: "ssh",
+  })] });
+  const complete = await foundation.reconcile();
+  assert.equal(complete.readiness.snapshotMaterializationReady, true);
+  discovery.push({ coverage: "partial", scopes: [scope(), unreachable] });
+  const seeded = await foundation.reconcile();
+  assert.equal(seeded.readiness.snapshotMaterializationReady, false);
+  assert.equal(seeded.readiness.reason, "aggregate_coverage_partial");
+  let spool;
+  try {
+    spool = await foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(home, "snapshot-spool"),
+      ownerInstanceId: store.hostInstanceId,
+    });
+    // Reconcile inside issuance re-runs discovery: still partial.
+    discovery.push({ coverage: "partial", scopes: [scope(), unreachable] });
+    const candidate = await spool.issueFreshInstallHostH2Candidate();
+    assert.notEqual(candidate, null,
+      "a partial startup scan must not abort the fresh-install H2 bootstrap");
+    const authority = snapshotSpool.captureRelayV2RecoveredHostH2ProcessAuthority(
+      candidate,
+      store,
+    );
+    assert.notEqual(authority, null);
+    assert.equal(authority.hostId, "mac-admin");
+    assert.equal(authority.hostEpoch, seeded.snapshot.hostEpoch);
+    assert.equal(authority.hostInstanceId, store.hostInstanceId);
+    assert.equal(await spool.issueFreshInstallHostH2Candidate(), null,
+      "the deferred bootstrap is still one-shot");
+    assert.equal(readiness.at(-1), "aggregate_coverage_partial");
+  } finally {
+    await spool?.close().catch(() => undefined);
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("bound spool instance does not expose materialized or readiness authorities", async () => {
   const h = await realHarness({
     bound: true,

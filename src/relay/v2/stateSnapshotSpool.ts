@@ -38,6 +38,7 @@ import type {
 import type { RelayV2CommandResourceMutationOwner } from "./hostCommandPlane.js";
 import {
   canonicalizeRelayV2MaterializedJson as canonicalizeSnapshotJson,
+  isRelayV2MaterializedStateError,
   RelayV2MaterializedStateError,
 } from "./resourceState.js";
 
@@ -342,7 +343,12 @@ interface RelayV2FreshInstallHostH2CandidateRecord {
   readonly spoolGeneration: string;
   readonly boundSpool: RelayV2StateSnapshotSpool;
   readonly boundSpoolClaim: object;
-  readonly materializedCutIdentity: string;
+  /**
+   * Null while the candidate was issued deferred: the startup scan was still
+   * partial, so no materialized cut existed to bind. The first authoritative
+   * reconcile installs the real source activation.
+   */
+  readonly materializedCutIdentity: string | null;
   readonly compositionPair: object;
   readonly processAuthority: RelayV2MaterializedStateProcessAuthorityPorts;
   claimReadiness(
@@ -529,6 +535,30 @@ export function captureRelayV2RecoveredHostH2ProcessAuthority(
 }
 let recoveredHostH2ActivationGeneration = 0n;
 const MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION = 18_446_744_073_709_551_615n;
+
+/**
+ * Readiness reasons under which the fresh-install H2 bootstrap may start
+ * without a materialized cut. They all mean "the discovery scan has not yet
+ * covered every configured scope" — a transient the foundation's periodic
+ * rescan resolves on its own, after which the authoritative-reconcile edge
+ * installs the real source activation. Continuity fences and withdrawals are
+ * deliberately excluded: those need the owner to recover, not to wait.
+ */
+const DEFERRABLE_FRESH_INSTALL_READINESS_REASONS: ReadonlySet<string> = new Set([
+  "aggregate_authority_not_established",
+  "aggregate_coverage_partial",
+  "scope_without_complete_authority",
+  "partial_online_scope",
+]);
+
+function isDeferrableFreshInstallCaptureError(error: unknown): boolean {
+  if (!isRelayV2MaterializedStateError(error) || error.code !== "CAPABILITY_UNAVAILABLE") {
+    return false;
+  }
+  const reason = error.details?.readinessReason;
+  return typeof reason === "string"
+    && DEFERRABLE_FRESH_INSTALL_READINESS_REASONS.has(reason);
+}
 
 function exactDataDescriptor(
   owner: object,
@@ -2596,6 +2626,15 @@ export class RelayV2StateSnapshotSpool {
         try {
           provisional = await this.#cutSource.captureCandidate(hostEpoch);
         } catch (error) {
+          if (isDeferrableFreshInstallCaptureError(error)) {
+            return this.issueDeferredFreshInstallHostH2Candidate(
+              binding,
+              hostEpoch,
+              compositionPair,
+              processAuthority,
+              (token) => { issued = token; },
+            );
+          }
           throw mapSourceError(error);
         }
         const candidateLease = provisional;
@@ -2678,9 +2717,67 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
+  /**
+   * Lease-less variant of the fresh-install bootstrap, taken when the startup
+   * scan has not yet covered every configured scope (an unreachable SSH host,
+   * an expired Kerberos ticket, ...). The host must still come up: the
+   * connector already tolerates an unready H2 by failing retryably, and the
+   * foundation's periodic rescan will eventually deliver the first
+   * authoritative reconcile edge, at which point the installed lifecycle
+   * captures and activates the real cut exactly like a post-loss recovery.
+   * Until then H2 stays unpublished, so v2 routes remain closed.
+   */
+  private issueDeferredFreshInstallHostH2Candidate(
+    binding: BoundHostH2SpoolBinding,
+    hostEpoch: string,
+    compositionPair: object,
+    processAuthority: RelayV2MaterializedStateProcessAuthorityPorts,
+    markIssued: (token: RelayV2HostH2RecoveryCandidate) => void,
+  ): RelayV2HostH2RecoveryCandidate | null {
+    this.assertCurrentOwner();
+    if (this.freshInstallBootstrapCandidateIssued
+      || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
+    const token = Object.freeze(Object.create(null)) as RelayV2HostH2RecoveryCandidate;
+    let cancelled = false;
+    const record: RelayV2FreshInstallHostH2CandidateRecord = Object.freeze({
+      freshInstall: true,
+      hostId: this.hostId,
+      hostEpoch,
+      hostInstanceId: this.ownerInstanceId,
+      ownerFence: this.#ownerFence,
+      spoolGeneration: this.#spoolGeneration,
+      boundSpool: this,
+      boundSpoolClaim: binding.claim,
+      materializedCutIdentity: null,
+      compositionPair,
+      processAuthority,
+      claimReadiness: (readinessSink) => (
+        this.#activateFreshInstallHostH2Candidate(
+          record,
+          null,
+          { attached: false, activation: null },
+          readinessSink,
+        )
+      ),
+      release: () => {
+        if (cancelled) return;
+        cancelled = true;
+        this.freshInstallBootstrapCandidateIssued = false;
+        if (this.freshInstallBootstrap?.record === record) {
+          this.freshInstallBootstrap = null;
+        }
+      },
+    });
+    recoveredHostH2Candidates.set(token as object, record);
+    this.freshInstallBootstrapCandidateIssued = true;
+    this.freshInstallBootstrap = { record, closeActivation: null };
+    markIssued(token);
+    return token;
+  }
+
   async #activateFreshInstallHostH2Candidate(
     record: RelayV2FreshInstallHostH2CandidateRecord,
-    candidateLease: RelayV2MaterializedStateCutCandidateLease,
+    candidateLease: RelayV2MaterializedStateCutCandidateLease | null,
     bootstrapState: {
       attached: boolean;
       activation: RelayV2MaterializedStateCutActivationLease | null;
@@ -2716,23 +2813,30 @@ export class RelayV2StateSnapshotSpool {
       recoveryInFlight: null,
       permanentlyClosed: false,
     };
-    const installed = await this.#installFreshInstallH2SourceActivation(
-      lifecycle,
-      candidateLease,
-      record.materializedCutIdentity,
-    );
-    if (!installed || lifecycle.current === null) {
-      this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
-      record.release();
-      return null;
+    if (candidateLease !== null) {
+      const installed = await this.#installFreshInstallH2SourceActivation(
+        lifecycle,
+        candidateLease,
+        record.materializedCutIdentity,
+      );
+      if (!installed || lifecycle.current === null) {
+        this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+        record.release();
+        return null;
+      }
     }
+    // Deferred issuance: no cut to install yet. `lifecycle.current` stays
+    // null so `assertAccepting` keeps rejecting until the authoritative
+    // reconcile observer installs the first real source activation.
     if (currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
       this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
       record.release();
       return null;
     }
-    bootstrapState.attached = true;
-    bootstrapState.activation = lifecycle.current.sourceActivation;
+    if (lifecycle.current !== null) {
+      bootstrapState.attached = true;
+      bootstrapState.activation = lifecycle.current.sourceActivation;
+    }
 
     const assertAccepting = (): void => {
       const current = lifecycle.current;
