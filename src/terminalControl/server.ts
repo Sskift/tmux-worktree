@@ -217,6 +217,10 @@ export async function runTerminalControlServer(options: {
         if (closed || closeRequested) return;
         void daemonHasLiveWork().then((busy) => {
           if (closed || closeRequested) return;
+          // A request that arrived while the busy predicate was being read has
+          // already re-armed a fresh idle window; that window owns the next
+          // decision, so this (now stale) evaluation must not close the server.
+          if (idleTimer !== null) return;
           if (busy) {
             // Live work cleared without a trailing frame (channel/handler
             // drain, claim/lease expiry): re-poll on the same idle budget so
@@ -227,7 +231,7 @@ export async function runTerminalControlServer(options: {
           closeRequested = true;
           try { server.close(); } catch {}
         }, () => {
-          rearm(idleExitMs);
+          if (idleTimer === null) rearm(idleExitMs);
         });
       }, delayMs);
       idleTimer.unref();
