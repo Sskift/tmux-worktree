@@ -2423,7 +2423,7 @@ export class RelayV2TerminalDurableLineageAuthority
       && lostMatchesClaim(stream, record.streamAuthority)
     ));
     if (record.streamAuthority.status === "absent") {
-      if (current && !bareResetSupersedesLive) return "stream_lost";
+      if (current) return "stream_lost";
     } else if (record.streamAuthority.status === "lost") {
       if (current || lostIndex < 0) return "stream_lost";
     } else if (!streamMatchesClaim(current, record.streamAuthority)) {
