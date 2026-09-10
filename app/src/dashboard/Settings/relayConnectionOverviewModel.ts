@@ -140,7 +140,7 @@ export function deriveRelayConnectionOverview(
     tone = "danger";
     headline = "Relay backend unavailable";
     detail = "The relay management service is not responding.";
-    primaryAction = { kind: "fix", label: "Fix connection" };
+    primaryAction = { kind: "fix", label: "Restart relay service" };
   } else if (connectorStatus === "registered_incomplete") {
     tone = "warning";
     headline = "Mac connector is missing Relay v2 capabilities";

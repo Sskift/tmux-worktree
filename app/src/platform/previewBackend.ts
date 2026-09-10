@@ -460,6 +460,7 @@ transport.handlers.set(
   value(relayV2DeploymentStatus),
 );
 transport.handlers.set("mobile_relay_v2_self_hosted_stop_center", value(relayV2DeploymentStatus));
+transport.handlers.set("mobile_relay_v2_restart_management_service", nothing);
 const feishuIntegrationStatus = {
   selectedProfile: "preview-bot",
   profileSource: "config",

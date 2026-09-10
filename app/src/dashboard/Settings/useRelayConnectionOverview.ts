@@ -207,6 +207,7 @@ export function useRelayConnectionOverview(
     setRepairError(null);
 
     const { ready: infraReady } = selfHostedInfraReady(selfHosted);
+    const backendDown = view?.adapterAvailable === false;
     const needsCenterStart = relayRepairRequiresManagementRestart({
       infraReady,
       adapterAvailable: view?.adapterAvailable,
@@ -215,7 +216,15 @@ export function useRelayConnectionOverview(
     });
 
     try {
-      if (needsCenterStart) {
+      if (backendDown) {
+        setRepair({ running: true, headline: "Restarting relay service…" });
+        if (backend.relay.v2.restartManagementService) {
+          await backend.relay.v2.restartManagementService();
+        } else if (backend.relay.v2Deployment.restartManagementService) {
+          await backend.relay.v2Deployment.restartManagementService();
+        }
+        await refreshSelfHostedStatus();
+      } else if (needsCenterStart) {
         if (!selfHosted?.config) {
           throw new Error("Relay is not configured.");
         }

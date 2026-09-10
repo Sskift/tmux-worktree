@@ -341,5 +341,12 @@ export function createFakeMobileRelayV2Adapter(
       };
       return publish();
     },
+    restartManagementService: async () => {
+      state = {
+        ...state,
+        authority: { kind: "node", reason: null },
+      };
+      return;
+    },
   };
 }

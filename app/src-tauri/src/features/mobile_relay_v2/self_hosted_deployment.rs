@@ -4102,6 +4102,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
                 .ok_or("Relay v2 self-hosted management configuration disappeared")?;
             let selection = prepared.selection();
             let binding = prepared.management_binding()?;
+            management.reset_recovery();
             management
                 .restart_self_hosted(&app, selection, move || prepared.commit_ready())
                 .map_err(|error| match error {
