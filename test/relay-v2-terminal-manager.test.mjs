@@ -1429,6 +1429,201 @@ test("detached lease expiry fences the generation and exact open retry never cre
   assert.equal(h.backend.opens.length, 1);
 });
 
+// --- Time-driven detached lease / retention maintenance ---------------------
+// A phone backgrounding its only terminal leaves the host with zero live
+// streams; the detached lease and the control retention after it MUST still be
+// enforced by the clock, not by the next open/input/resize event.
+
+function maintenanceTimerHarness() {
+  const scheduled = [];
+  const h = harness({
+    schedule(delayMs, callback) {
+      const task = { delayMs, callback, cancelled: false, fired: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  return { h, scheduled };
+}
+
+function activeTimerTasks(scheduled) {
+  return scheduled.filter((task) => !task.cancelled && !task.fired);
+}
+
+// Fire a fake-clock timer and let the serialized sweep it enqueues settle
+// WITHOUT calling manager.sweep() ourselves: the sweep must be time-driven.
+async function fireTimerTask(task) {
+  task.fired = true;
+  task.callback();
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+async function waitFor(predicate, ticks = 100) {
+  for (let attempt = 0; attempt < ticks; attempt += 1) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return predicate();
+}
+
+test("detached lease expires on the maintenance timer with no explicit sweep and no other live stream", async () => {
+  const { h, scheduled } = maintenanceTimerHarness();
+  const request = goldenOpen({ requestId: "timer-detach-open" });
+  await h.manager.open(request);
+  const framesAfterOpen = h.sent.length;
+
+  await h.manager.unbind(AUTH, ROUTE_ONE);
+  assert.equal(h.sent.length, framesAfterOpen, "detach sends no frames");
+
+  const leaseTimer = activeTimerTasks(scheduled).at(-1);
+  assert.ok(leaseTimer, "unbind arms a time-based maintenance timer");
+  assert.equal(
+    leaseTimer.delayMs,
+    terminal.RELAY_V2_TERMINAL_DETACHED_LEASE_MS,
+    "the timer fires at the frozen 120s detached lease boundary",
+  );
+
+  // Advance past the lease: no sweep() call, no frames, no events of any kind.
+  h.advance(terminal.RELAY_V2_TERMINAL_DETACHED_LEASE_MS + 1);
+  await fireTimerTask(leaseTimer);
+
+  assert.equal(
+    await waitFor(() => h.backend.opens[0].handle.closeCalls === 1),
+    true,
+    "the paused backend handle is closed when the detached lease expires",
+  );
+  assert.equal(h.sent.length, framesAfterOpen, "expiry on an unbound route sends no frames");
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 0);
+
+  // A later resume reconciles the fenced generation as stream_lost, never a
+  // silent disposition=resumed of a generation whose lease never expired.
+  await h.manager.open({
+    ...request,
+    route: exactRoute({
+      connectorId: "connector-timer-expiry",
+      routeId: "route-timer-expiry",
+      routeFence: "fence-timer-expiry",
+    }),
+    requestId: "open-timer-after-expiry",
+  });
+  const reset = h.sent.find(({ frame }) => frame.requestId === "open-timer-after-expiry").frame;
+  assert.equal(reset.type, "terminal.reset_required");
+  assert.equal(reset.payload.reason, "stream_lost");
+  assert.equal(h.backend.opens.length, 1, "a reset never creates a second backend");
+  await h.manager.shutdown();
+});
+
+test("retention after a time-driven lease expiry is time-driven too and the timer stops when nothing remains", async () => {
+  const { h, scheduled } = maintenanceTimerHarness();
+  const request = goldenOpen({ requestId: "timer-retention-open" });
+  await h.manager.open(request);
+  await h.manager.unbind(AUTH, ROUTE_ONE);
+
+  const leaseTimer = activeTimerTasks(scheduled).at(-1);
+  assert.ok(leaseTimer);
+  h.advance(terminal.RELAY_V2_TERMINAL_DETACHED_LEASE_MS + 1);
+  await fireTimerTask(leaseTimer);
+  assert.equal(await waitFor(() => h.backend.opens[0].handle.closeCalls === 1), true);
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 0);
+  assert.equal(h.manager.stats().retainedStreams, 1, "the lost stream is retained for control retention");
+
+  // The successor timer owns the retention deadline on the still-idle host.
+  const retentionTimer = activeTimerTasks(scheduled).at(-1);
+  assert.ok(retentionTimer, "control retention is driven by the clock, not the next client event");
+  h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+  await fireTimerTask(retentionTimer);
+
+  assert.equal(await waitFor(() => h.manager.stats().retainedStreams === 0), true);
+  assert.equal(h.manager.stats().controlRecords, 0);
+  assert.equal(
+    activeTimerTasks(scheduled).length,
+    0,
+    "with nothing retained the manager arms no further timer (no idle spinning)",
+  );
+  await h.manager.shutdown();
+});
+
+test("resume inside the 120s detached lease succeeds and the pending lease timer is retired", async () => {
+  const { h, scheduled } = maintenanceTimerHarness();
+  const request = goldenOpen({ requestId: "timer-inlease-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  await h.manager.unbind(AUTH, ROUTE_ONE);
+  assert.equal(h.backend.opens[0].handle.paused, true, "detach parks the read pump");
+
+  const leaseTimer = activeTimerTasks(scheduled).at(-1);
+  assert.ok(leaseTimer);
+  h.advance(119_000);
+  // Still inside the lease: the timer has NOT fired. Resume on a new route.
+  await h.manager.open(goldenOpen({
+    route: {
+      connectorId: "timer-inlease-connector",
+      routeId: "timer-inlease-route",
+      routeFence: "timer-inlease-fence",
+    },
+    requestId: "timer-inlease-resume",
+    openId: "timer-inlease-open-id",
+    mode: "resume",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  }));
+  const resumed = opened(h.sent, "timer-inlease-resume");
+  assert.equal(resumed.payload.disposition, "resumed");
+  assert.equal(h.backend.opens.length, 1);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 0, "an in-lease resume never disposes the backend");
+  assert.equal(h.backend.opens[0].handle.paused, false, "rebinding re-arms the parked pump");
+  assert.equal(
+    activeTimerTasks(scheduled).filter((task) => task === leaseTimer).length,
+    0,
+    "the detached-lease timer is cancelled when the stream goes live again",
+  );
+  await h.manager.shutdown();
+});
+
+test("repeated detach/rebind cycles never stack duplicate maintenance timers", async () => {
+  const { h, scheduled } = maintenanceTimerHarness();
+  const request = goldenOpen({ requestId: "timer-idempotent-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  const routes = [
+    ROUTE_ONE,
+    { connectorId: "timer-idem-connector-2", routeId: "timer-idem-route-2", routeFence: "timer-idem-fence-2" },
+    { connectorId: "timer-idem-connector-3", routeId: "timer-idem-route-3", routeFence: "timer-idem-fence-3" },
+  ];
+
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    await h.manager.unbind(AUTH, routes[cycle]);
+    const detachedTimers = activeTimerTasks(scheduled);
+    assert.equal(detachedTimers.length, 1, `cycle ${cycle}: exactly one timer armed while detached`);
+    assert.equal(detachedTimers[0].delayMs, terminal.RELAY_V2_TERMINAL_DETACHED_LEASE_MS);
+    if (cycle < 2) {
+      await h.manager.open(goldenOpen({
+        route: routes[cycle + 1],
+        requestId: `timer-idem-resume-${cycle + 1}`,
+        openId: `timer-idem-open-${cycle + 1}`,
+        mode: "resume",
+        resume: {
+          generation: first.payload.generation,
+          nextOffset: "0",
+          resumeToken: first.payload.resumeToken,
+        },
+      }));
+      opened(h.sent, `timer-idem-resume-${cycle + 1}`);
+      assert.equal(
+        activeTimerTasks(scheduled).length,
+        0,
+        `cycle ${cycle}: the detached timer is cancelled when the stream is live again`,
+      );
+    }
+  }
+  await h.manager.shutdown();
+});
+
 test("retention sweep releases the exact durable stream reservation before local deletion", async () => {
   const h = harness();
   const request = goldenOpen({ requestId: "release-before-delete-open" });
