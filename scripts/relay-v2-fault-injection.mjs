@@ -276,7 +276,16 @@ async function openClient(topology, options = {}) {
   await withTimeout(new Promise((resolve, reject) => {
     const check = () => {
       if (relayWelcome) return resolve();
-      if (socket.readyState !== WebSocket.OPEN) return reject(new Error("ws closed before relay.welcome"));
+      if (socket.readyState !== WebSocket.OPEN) {
+        // Surface the broker's close code/reason (1013 host_offline vs 1012
+        // draining vs 1011) so an intermittent pre-welcome close is diagnosable
+        // from the scenario log instead of reading as a generic timeout.
+        const brokerAlive = topology.brokerProc?.exitCode === null;
+        const hostAlive = topology.hostExitCode ? topology.hostExitCode() === null : null;
+        return reject(new Error(
+          `ws closed before relay.welcome (close=${JSON.stringify(closeInfo)}, brokerAlive=${brokerAlive}, hostAlive=${hostAlive})`,
+        ));
+      }
       setTimeout(check, 50);
     };
     check();
