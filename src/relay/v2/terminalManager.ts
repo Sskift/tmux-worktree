@@ -2437,11 +2437,32 @@ export class RelayV2TerminalManager {
     }
     const retained = this.openRecords.get(recordKey);
     const claimAuthority = this.openClaimAuthority(claim);
-    const reconciliation = this.reconcileLocalStreamLineage(key, {
+    const bareForceReset = request.mode === "reset" && request.resume === undefined;
+    let reconciliation = this.reconcileLocalStreamLineage(key, {
       kind: "claimed",
       authority: claimAuthority.streamAuthority,
       ...(retained ? { record: retained } : {}),
     });
+    // A bare mode=reset (no predecessor proof) is an explicit force-reset. If
+    // the only local attachment for this stream is a dead "lost" stream with
+    // no backend or leases (e.g. slow_consumer already retired it, but the
+    // client could not carry the old resume token), retire that dead local
+    // attachment and proceed against the durable absent successor instead of
+    // bouncing a second terminal.reset_required back to the client.
+    if (bareForceReset
+      && reconciliation.status === "divergent"
+      && reconciliation.stream.status === "lost"
+      && !reconciliation.stream.backend
+      && !reconciliation.stream.producerLease
+      && !reconciliation.stream.retiringLease
+    ) {
+      await this.fenceDivergentLocalStream(reconciliation);
+      reconciliation = this.reconcileLocalStreamLineage(key, {
+        kind: "claimed",
+        authority: claimAuthority.streamAuthority,
+        ...(retained ? { record: retained } : {}),
+      });
+    }
     const exactLostLocalReset = reconciliation.status === "divergent"
       && retained === undefined
       && request.mode === "reset"
