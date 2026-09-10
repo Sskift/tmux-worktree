@@ -1025,14 +1025,16 @@ async function staleCursorRound(topology, round) {
         `type=${respType} disposition=${disposition} resetReason=${resetReason} `
         + `streamEvent=${streamEvent ? `${streamEvent.type}(${streamEvent.payload?.reason ?? "?"}/exit=${streamEvent.payload?.exitCode ?? "?"})` : "none"}`);
 
-      // mode=reset reopen on a FRESH route with resume:{generation,resumeToken}
-      // pointing at the lost generation: the reset retired the attachment to a
-      // durable "lost" authority keyed by that generation's token, and the
-      // durable lineage only admits a reset as the exact successor of that
-      // lost authority (terminalDurableLineage.openAdmission exactLost); a
-      // bare mode=reset is rejected stream_conflict for the 10-minute control
-      // retention window. The resuming connection still owns the live route,
-      // so the reset goes over a new connection.
+      // mode=reset reopen on a FRESH route with NO resume block. The Android
+      // automatic RESET successor (slow_consumer pre-open successor, D042
+      // ONLINE edge, cold-start reclaim) sends a bare mode=reset: the open
+      // fence is minted from the reset fence alone, and the plaintext resume
+      // token never survives process death. The host admits that bare
+      // force-reset (openAdmission bareForceReset): a same-target live
+      // authority is retired by the claim itself; a retained process-restart
+      // lost authority no longer blocks the bare successor for the 10-minute
+      // control retention window. The resuming connection still owns the live
+      // route, so the reset goes over a new connection.
       const lostGeneration = streamEvent?.payload?.generation ?? generation;
       clientB.close();
       await delay(500);
@@ -1041,7 +1043,6 @@ async function staleCursorRound(topology, round) {
         await discoverScope(clientC);
         const resetOpened = await openTerminalStream(clientC, { sessionId, streamId }, {
           mode: "reset",
-          resume: { generation: lostGeneration, resumeToken },
           maxAttempts: 12,
           timeoutMs: 10_000,
         });

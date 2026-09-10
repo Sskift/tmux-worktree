@@ -14,11 +14,34 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSelfSignedCertificate } from "./relayV2InteropTls.mjs";
+
+/**
+ * Best-effort removal of an interop host trusted home.
+ *
+ * The home doubles as the pane's $HOME: when the topology tears a tmux
+ * session down, the dying zsh can rewrite ~/.zsh_history a beat AFTER the
+ * directory was first removed, recreating the directory entry. Runners
+ * therefore call this once before killing the session and AGAIN after the
+ * tmux kill-session settles (the "double-rm" pattern). Failures are
+ * warnings, never fatal: a leftover home is caught by the post-cleanup
+ * self-check instead of masking the actual test result.
+ */
+export function removeInteropHostTrustedHome(hostTrustedHome) {
+  if (!hostTrustedHome) return;
+  try {
+    rmSync(hostTrustedHome, { recursive: true, force: true });
+  } catch (error) {
+    console.warn(
+      `[warn] could not remove host trusted home ${hostTrustedHome}: ${error?.message ?? error}`,
+    );
+  }
+}
 
 const BROKER_READY_DEADLINE_MS = 15_000;
 const HOST_READY_DEADLINE_MS = 15_000;

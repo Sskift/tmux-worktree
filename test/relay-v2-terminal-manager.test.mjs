@@ -3521,6 +3521,132 @@ test("HostState exact lost-local reset atomically replaces and preserves on back
   }
 });
 
+test("bare mode=reset reopens a lost terminal without resume tokens (phone D042 successor)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-bare-reset-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const resolver = new FakeResolver();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: resolver,
+      now: () => 1_000_000,
+    });
+    const h = harness({
+      resolver,
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+      limits: {
+        streamRingBytes: 8,
+        hostRingBytes: 16,
+        maxUnackedBytes: 4,
+        maxFrameBytes: 4,
+      },
+    });
+    const request = goldenOpen({
+      requestId: "bare-reset-source-open",
+      streamId: "bare-reset-stream",
+      openId: "bare-reset-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(request);
+    const source = opened(h.sent, request.requestId);
+    const oversized = new Proxy({}, {
+      get(_target, property) {
+        if (property === "byteLength") return 5;
+        throw new Error(`oversize callback was inspected through ${String(property)}`);
+      },
+    });
+    await h.backend.opens[0].handle.emitRaw(oversized);
+    assert.equal(h.sent.at(-1).frame.type, "terminal.reset_required");
+
+    // The Android automatic RESET successor (D042 / cold-start reclaim) sends
+    // mode=reset with NO resume block — the slow_consumer auto-successor path
+    // has no generation/token in its open fence, and the phone cannot keep a
+    // plaintext resume token across process death. A lost terminal within the
+    // control retention window must accept that bare reset and mint a fresh
+    // generation rather than answering TERMINAL_STREAM_CONFLICT for 10
+    // minutes. mode=new on the same streamId must still conflict.
+    const bareNew = goldenOpen({
+      requestId: "bare-reset-new-attempt",
+      streamId: request.streamId,
+      openId: "bare-reset-new-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "new",
+    });
+    await assert.rejects(h.manager.open(bareNew), managerError("TERMINAL_STREAM_CONFLICT"));
+
+    const bareReset = goldenOpen({
+      requestId: "bare-reset-first-attempt",
+      streamId: request.streamId,
+      openId: "bare-reset-first-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+    });
+    await h.manager.open(bareReset);
+    const replacement = opened(h.sent, bareReset.requestId);
+    assert.ok(replacement, "bare mode=reset must return terminal.opened");
+    assert.equal(replacement.payload.disposition, "reset");
+    assert.notEqual(replacement.payload.generation, source.payload.generation);
+    assert.equal(h.backend.opens.length, 2);
+
+    // The old generation is gone: a second bare reset on the (now replaced)
+    // stream is a no-op retry of the same logical replacement... instead it
+    // must reset again cleanly and never resurrect the retired generation.
+    let snapshot = await store.read();
+    let durableState = Object.values(snapshot.materialized).find((value) => (
+      value?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    assert.equal(durableState.streamAuthorities.length, 1);
+    assert.equal(durableState.streamAuthorities[0].generation, replacement.payload.generation);
+    assert.equal(durableState.lostAuthorities.length, 0);
+
+    // Host process restart (the durable live authority retires to a LOST
+    // authority keyed by the old generation). A bare reset must still admit
+    // a fresh successor instead of refusing for the retention window.
+    await h.manager.shutdown();
+    const restartedStore = await hostState.RelayV2HostStateStore.open({ home });
+    const restartedResolver = new FakeResolver();
+    const restartedLineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store: restartedStore,
+      admissionFence: restartedResolver,
+      now: () => 1_000_000,
+    });
+    const restarted = harness({
+      resolver: restartedResolver,
+      lineage: restartedLineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: restartedStore.hostInstanceId,
+    });
+    await restartedLineage.recoverForHostH3(restarted.manager);
+    const afterRestart = goldenOpen({
+      requestId: "bare-reset-after-restart",
+      streamId: request.streamId,
+      openId: "bare-reset-after-restart-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+    });
+    await restarted.manager.open(afterRestart);
+    const reopened = opened(restarted.sent, afterRestart.requestId);
+    assert.ok(reopened, "bare mode=reset after host restart must return terminal.opened");
+    assert.equal(reopened.payload.disposition, "reset");
+    assert.equal(restarted.backend.opens.length, 1);
+
+    snapshot = await restartedStore.read();
+    durableState = Object.values(snapshot.materialized).find((value) => (
+      value?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    assert.equal(durableState.streamAuthorities.length, 1);
+    // The process-restart lost authority is retained for its own control
+    // retention window (existing lineage semantics); it no longer blocks a
+    // token-less reopen.
+    assert.equal(durableState.lostAuthorities.length, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("durable open claims every mode and retains fingerprints and reset outcomes across restart", async () => {
   const lineage = new FakeDurableLineage();
   const first = harness({ lineage, hostInstanceId: "durable-host-one" });

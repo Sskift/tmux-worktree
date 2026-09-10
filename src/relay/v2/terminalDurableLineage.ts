@@ -1521,6 +1521,10 @@ type OpenAdmission =
       streamAuthority: PersistedClaimStreamAuthority;
       reservesStreamSlot: boolean;
       immediateStreamLost: boolean;
+      // A bare mode=reset supersedes the same-target live authority: the claim
+      // retires that row (freeing its close/live slots, which the new record
+      // replaces) before the replacement prepares.
+      retiresLive: boolean;
     };
 
 /**
@@ -1659,7 +1663,24 @@ export class RelayV2TerminalDurableLineageAuthority
         if (admission.kind === "busy") {
           return { result: { status: "busy", reason: "control_record_quota" } as const, state };
         }
-        const { streamAuthority, reservesStreamSlot } = admission;
+        const { streamAuthority, reservesStreamSlot, retiresLive } = admission;
+        // A bare mode=reset supersedes the same-target live authority at claim
+        // time: retire that durable row before capturing the absent successor
+        // so the replacement prepares against an empty slot (and frees the
+        // row's close/live reservation, which this claim re-reserves). Retained
+        // same-stream LOST authorities (process-restart recovery) keep their
+        // own retention window; the digest captured below reflects the
+        // post-retirement state.
+        if (retiresLive) {
+          for (let i = state.streamAuthorities.length - 1; i >= 0; i--) {
+            const retained = state.streamAuthorities[i]!;
+            if (retained.streamKey === normalized.streamKey
+              && sameTarget(retained.target, normalized.target)
+              && retained.pane === normalized.pane) {
+              state.streamAuthorities.splice(i, 1);
+            }
+          }
+        }
         if (admission.immediateStreamLost) {
           const record: PersistedOpenRecord = {
             status: "final",
@@ -2457,11 +2478,29 @@ export class RelayV2TerminalDurableLineageAuthority
       && sameTarget(claim.target, candidate.target)
       && claim.pane === candidate.pane
     ));
+    // Wire rule: mode=reset MAY be sent with no resume block at all. A client
+    // that received terminal.reset_required does not always hold the prior
+    // generation + resume token — the Android automatic RESET successor
+    // (slow_consumer pre-open successor / cold-start reclaim / D042 edge)
+    // mints its fresh open fence from the reset fence alone, and the plaintext
+    // resume token never survives process death. That bare reset is an
+    // explicit "discard whatever generation this streamId currently retains
+    // and start a fresh one" force-reset. A same-target live authority is
+    // retired by the claim (retiresLive); a retained same-stream LOST row
+    // (process-restart recovery) no longer blocks the bare successor either,
+    // it simply stays in the state for its own retention window. Either way a
+    // bare reset is admitted instead of TERMINAL_STREAM_CONFLICT for the whole
+    // 10-minute control retention window. The conflict rules for mode=new and
+    // for a reset WITH resume (which must still name the exact predecessor)
+    // are unchanged.
+    const bareForceReset = claim.mode === "reset"
+      && claim.previousGeneration === null
+      && claim.resumeTokenHash === null;
     if ((stream || lostForStream.length > 0 || retainedCloseForStream)
       && claim.mode === "new") {
       return { kind: "conflict", reason: "stream_conflict" };
     }
-    if (claim.mode === "reset" && stream && (
+    if (claim.mode === "reset" && stream && !bareForceReset && (
       claim.previousGeneration !== stream.generation
       || claim.resumeTokenHash !== stream.resumeTokenHash
       || !sameTarget(claim.target, stream.target)
@@ -2476,17 +2515,43 @@ export class RelayV2TerminalDurableLineageAuthority
       && (lostForStream.length > 0 || retainedCloseForStream)) {
       return { kind: "conflict", reason: "stream_conflict" };
     }
+    // A bare force-reset may only supersede retained authorities that bind the
+    // SAME target+pane; a retained authority on a different target is a real
+    // lineage conflict and must not be silently retired.
+    if (bareForceReset) {
+      const mismatchedRetained = lostForStream.some((candidate) => (
+        !sameTarget(claim.target, candidate.target) || claim.pane !== candidate.pane
+      )) || (stream && (
+        !sameTarget(claim.target, stream.target) || claim.pane !== stream.pane
+      ));
+      if (mismatchedRetained) return { kind: "conflict", reason: "stream_conflict" };
+    }
     // The generation high-water mark prevents reuse but is not predecessor authority.
-    // Once every same-stream authority row expires, RESET may create an absent successor.
-    const streamAuthority = stream
-      ? claimAuthorityFromStream(stream, claim.requestedOffset)
-      : claimAuthorityFromLost(exactLost, claim.requestedOffset);
+    // A bare force-reset captures an absent authority: it retires the same-target
+    // live authority itself (retiresLive); a retained same-stream LOST authority
+    // (host process restart) is left for its normal retention window. A proven
+    // reset keeps capturing the exact live/lost predecessor.
+    const retiresLive = bareForceReset
+      && stream !== undefined
+      && sameTarget(claim.target, stream.target)
+      && claim.pane === stream.pane;
+    const streamAuthority = bareForceReset
+      ? claimAuthorityFromStream(undefined, claim.requestedOffset)
+      : stream
+        ? claimAuthorityFromStream(stream, claim.requestedOffset)
+        : claimAuthorityFromLost(exactLost, claim.requestedOffset);
     const immediateStreamLost = claim.mode === "resume"
       && !stream
       && (exactLost !== undefined || retainedCloseForStream);
-    const reservesStreamSlot = claim.mode !== "resume"
-      && (!stream || !stream.closeSlotReserved);
-    if (controlSlots(state) + 1 + (reservesStreamSlot ? 1 : 0)
+    // A bare force-reset that supersedes a live authority re-reserves the
+    // close slot the retired row frees (net control/live quota change is zero);
+    // otherwise follow the normal "new/reset reserves unless the live row
+    // already holds a reservation" rule.
+    const reservesStreamSlot = retiresLive
+      ? true
+      : claim.mode !== "resume"
+        && (!stream || !stream.closeSlotReserved);
+    if (controlSlots(state) + 1 + (reservesStreamSlot ? 1 : 0) - (retiresLive ? 1 : 0)
         > this.limits.maxControlRecords
       || liveStreamSlots(state, claim) > this.limits.maxStreams
       || (claim.mode !== "resume" && nextCounter(state.generationHighWater) === null)) {
@@ -2497,6 +2562,7 @@ export class RelayV2TerminalDurableLineageAuthority
       streamAuthority,
       reservesStreamSlot,
       immediateStreamLost,
+      retiresLive,
     };
   }
 
