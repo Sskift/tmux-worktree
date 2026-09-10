@@ -23,3 +23,14 @@ export const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 
 /** Upper bound on a captured pane snapshot used as a render source. */
 export const MAX_RENDERED_SNAPSHOT_SOURCE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Idle-exit budget for an auto-started terminal-control daemon. The daemon
+ * exits this long after its last request once no live terminal work remains
+ * (no open Relay v2 observation/compound channel, no active input lease), so
+ * detached+unref'd autostart children cannot accumulate as launchd orphans.
+ * Kept in lockstep with the Rust spawner's `DAEMON_IDLE_EXIT_MS`
+ * (app/src-tauri/src/features/terminal_control.rs): the two spawn paths must
+ * retire daemons on the same schedule.
+ */
+export const TERMINAL_CONTROL_DAEMON_IDLE_EXIT_MS = 600_000;
