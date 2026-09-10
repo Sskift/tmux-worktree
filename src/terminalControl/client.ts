@@ -12,6 +12,7 @@ import {
 } from "./protocol";
 import { terminalControlSocketPath } from "./store";
 import { TERMINAL_CONTROL_AGENT_MESSAGE_REQUEST_TIMEOUT_MS } from "./timeouts";
+import { TERMINAL_CONTROL_DAEMON_IDLE_EXIT_MS } from "./constants";
 
 type DistributiveRequestInput<T> = T extends TerminalControlRequest
   ? Omit<T, "protocolVersion" | "requestId">
@@ -24,7 +25,12 @@ export interface TerminalControlAutoStartCliTarget {
   readonly entrypoint: string;
   /** Exact local-development home; production callers must omit it. */
   readonly home?: string;
-  /** Explicit ephemeral/test daemon policy; production callers must omit it. */
+  /**
+   * Explicit ephemeral/test daemon policy. Production callers omit it and the
+   * auto-started daemon gets the bounded default
+   * (TERMINAL_CONTROL_DAEMON_IDLE_EXIT_MS) so a detached, unref'd child retires
+   * itself instead of lingering as an orphan; tests pass a small value.
+   */
   readonly idleExitMs?: number;
 }
 
@@ -105,9 +111,15 @@ function startServer(
   paths?: Readonly<TerminalControlAutoStartPaths>,
 ): void {
   const home = localDevelopmentHome(target);
-  const idleExitMs = target !== undefined && Object.hasOwn(target, "idleExitMs")
+  const explicitIdle = target !== undefined && Object.hasOwn(target, "idleExitMs")
     ? Object.getOwnPropertyDescriptor(target, "idleExitMs")?.value
     : undefined;
+  // Production auto-start callers omit the policy and get the bounded default;
+  // tests pass their own small value. An explicit `undefined` is treated as
+  // omitted so a spread call site can never accidentally disable idle exit.
+  const idleExitMs = explicitIdle === undefined
+    ? TERMINAL_CONTROL_DAEMON_IDLE_EXIT_MS
+    : explicitIdle;
   if (idleExitMs !== undefined && (
     !Number.isSafeInteger(idleExitMs)
     || idleExitMs < 100

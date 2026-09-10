@@ -1,4 +1,5 @@
 export * from "./protocol";
+export * from "./constants";
 export * from "./client";
 export * from "./authority";
 export * from "./backend";

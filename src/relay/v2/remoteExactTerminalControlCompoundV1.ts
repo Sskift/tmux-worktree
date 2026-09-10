@@ -740,6 +740,13 @@ export function relayV2RemoteExactCompoundSocketPathV1(
 export interface RelayV2RemoteExactCompoundDaemonIngressV1 {
   readonly socketPath: string;
   closeAndDrain(): Promise<void>;
+  /**
+   * Whether any compound channel is currently open (connected socket or a
+   * still-draining frame loop). The daemon idle-exit gate treats an open
+   * channel as live work even while the phone-side pump is detached and no
+   * frames are flowing.
+   */
+  hasActiveChannels(): boolean;
 }
 
 function listenUnix(server: Server, socketPath: string): Promise<void> {
@@ -1131,6 +1138,9 @@ export async function openRelayV2RemoteExactCompoundDaemonIngressV1(options: {
   let closeBarrier: Promise<void> | null = null;
   return Object.freeze({
     socketPath,
+    hasActiveChannels(): boolean {
+      return sockets.size > 0 || handlers.size > 0;
+    },
     closeAndDrain(): Promise<void> {
       if (closeBarrier !== null) return closeBarrier;
       admissionClosed = true;

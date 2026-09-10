@@ -171,15 +171,68 @@ export async function runTerminalControlServer(options: {
   let closeRequested = false;
   let server: Server;
   let idleTimer: NodeJS.Timeout | null = null;
-  const touchIdle = () => {
-    if (options.idleExitMs === undefined || closed || closeRequested) return;
+  // Live-work gate for idle exit. A timer that fires on the request-only
+  // trail would retire a daemon while a detached phone still holds an open
+  // Relay v2 observation (its paused pump sends no frames): the resumed tail
+  // would then land on a fresh daemon with no observation record and the
+  // continuity fence would be lost. Exit only when the request trail is idle
+  // AND there is no open compound channel, open observation, pending exact
+  // claim, or unexpired input lease. The authority snapshot prunes
+  // gone/rotated observers under its state lock and fails closed.
+  const daemonHasLiveWork = async (): Promise<boolean> => {
+    if (compoundIngress !== null && compoundIngress.hasActiveChannels()) {
+      return true;
+    }
+    if (typeof (authority as { relayV2ExactIdleActivitySnapshot?: unknown })
+      .relayV2ExactIdleActivitySnapshot !== "function") {
+      return false;
+    }
+    try {
+      const snapshot = await (
+        authority as unknown as {
+          relayV2ExactIdleActivitySnapshot(): Promise<{
+            observations: number;
+            pendingClaims: number;
+            activeLeases: number;
+          }>;
+        }
+      ).relayV2ExactIdleActivitySnapshot();
+      return snapshot.observations > 0
+        || snapshot.pendingClaims > 0
+        || snapshot.activeLeases > 0;
+    } catch {
+      // An unreadable busy predicate fails closed: keep the daemon alive and
+      // let the next idle trail re-evaluate.
+      return true;
+    }
+  };
+  const touchIdle = (): void => {
+    const idleExitMs = options.idleExitMs;
+    if (idleExitMs === undefined || closed || closeRequested) return;
     if (idleTimer !== null) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      idleTimer = null;
-      closeRequested = true;
-      try { server.close(); } catch {}
-    }, options.idleExitMs);
-    idleTimer.unref();
+    const rearm = (delayMs: number): void => {
+      if (closed || closeRequested) return;
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        if (closed || closeRequested) return;
+        void daemonHasLiveWork().then((busy) => {
+          if (closed || closeRequested) return;
+          if (busy) {
+            // Live work cleared without a trailing frame (channel/handler
+            // drain, claim/lease expiry): re-poll on the same idle budget so
+            // the daemon still retires once everything settles.
+            rearm(idleExitMs);
+            return;
+          }
+          closeRequested = true;
+          try { server.close(); } catch {}
+        }, () => {
+          rearm(idleExitMs);
+        });
+      }, delayMs);
+      idleTimer.unref();
+    };
+    rearm(idleExitMs);
   };
   server = createServer((socket) => handleSocket(socket, authority, touchIdle));
   // Observe close before the first idle timer can fire. A cold compound-ingress

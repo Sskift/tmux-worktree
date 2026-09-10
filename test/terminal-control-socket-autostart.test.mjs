@@ -284,8 +284,7 @@ test("explicit ephemeral auto-start exits after idle and removes its owned socke
   }
 });
 
-test("local-development exact auto-start binds the child to its validated managed-state home", async (t) => {
-  const sessionName = `tw-term-isolated-auto-start-${process.pid}`;
+test("local-development exact auto-start binds the child to its validated managed-state home", async (t) => {  const sessionName = `tw-term-isolated-auto-start-${process.pid}`;
   const harness = isolatedManagedTmux(t, sessionName, { lifecycleV2: true });
   if (harness === undefined) return;
   const socketPath = join(
@@ -476,5 +475,82 @@ test("local-development exact auto-start binds the child to its validated manage
     await stopAutoStartedTerminalControl(socketPath);
     process.env.HOME = harness.home;
     await harness.cleanup();
+  }
+});
+
+test("terminal-control request auto-starts a daemon with the bounded idle-exit budget", async () => {
+  const temp = tempState("tc-request-autostart-");
+  const socketPath = join(temp.root, "request.sock");
+  const statePath = join(temp.root, "request-state.json");
+  const previousSocket = process.env.TW_TERMINAL_CONTROL_SOCKET;
+  const previousState = process.env.TW_TERMINAL_CONTROL_STATE;
+  process.env.TW_TERMINAL_CONTROL_SOCKET = socketPath;
+  process.env.TW_TERMINAL_CONTROL_STATE = statePath;
+  const daemonArgv = () => {
+    const lockPath = `${socketPath}.server.lock`;
+    const ownerPath = join(lockPath, "owner.json");
+    if (!existsSync(ownerPath)) return null;
+    let pid;
+    try {
+      pid = JSON.parse(readFileSync(ownerPath, "utf8")).pid;
+    } catch {
+      return null;
+    }
+    if (!Number.isSafeInteger(pid) || pid < 2) return null;
+    const result = spawnSync("ps", ["-o", "args=", "-p", String(pid)], {
+      encoding: "utf8",
+    });
+    return result.status === 0 ? result.stdout.trim() : null;
+  };
+  try {
+    assert.equal(existsSync(socketPath), false);
+    const request = spawn(
+      process.execPath,
+      [terminalControlCli, "terminal-control", "request"],
+      {
+        env: process.env,
+      },
+    );
+    request.stdin.end(`${JSON.stringify({
+      protocolVersion: 1,
+      requestId: randomUUID(),
+      type: "ping",
+    })}\n`);
+    const [stdout, stderr] = await Promise.all([
+      new Promise((resolve, reject) => {
+        let buffer = "";
+        request.stdout.on("data", (chunk) => { buffer += chunk; });
+        request.on("error", reject);
+        request.on("close", () => resolve(buffer));
+      }),
+      new Promise((resolve) => {
+        let buffer = "";
+        request.stderr.on("data", (chunk) => { buffer += chunk; });
+        request.on("close", () => resolve(buffer));
+      }),
+    ]);
+    assert.equal(stderr, "", stderr);
+    const response = JSON.parse(stdout);
+    assert.equal(response.ok, true, stdout);
+    assert.equal(response.result.authority, "local-terminal-control");
+    const argv = daemonArgv();
+    assert.ok(argv, "an auto-started daemon must own the server lock");
+    assert.match(
+      argv ?? "",
+      /terminal-control serve/,
+      `auto-started argv must serve terminal-control: ${argv}`,
+    );
+    assert.match(
+      argv ?? "",
+      /--idle-exit-ms 600000/,
+      `the request subcommand auto-start must pass the bounded idle budget: ${argv}`,
+    );
+  } finally {
+    await stopAutoStartedTerminalControl(socketPath);
+    if (previousSocket === undefined) delete process.env.TW_TERMINAL_CONTROL_SOCKET;
+    else process.env.TW_TERMINAL_CONTROL_SOCKET = previousSocket;
+    if (previousState === undefined) delete process.env.TW_TERMINAL_CONTROL_STATE;
+    else process.env.TW_TERMINAL_CONTROL_STATE = previousState;
+    temp.cleanup();
   }
 });

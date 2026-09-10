@@ -1626,6 +1626,61 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     this.relayV2ExternalEpoch += 1;
   }
 
+  /**
+   * Read-only snapshot of live terminal work that must keep an idle-exiting
+   * daemon alive:
+   *  - open Relay v2 exact observations (a detached/resumed phone keeps its
+   *    observation pinned so output continuity survives),
+   *  - prepared/admitted exact reservations nobody has consumed yet,
+   *  - durable targets holding an unexpired input lease (or an in-flight
+   *    operation), matching the daemon-upgrade busy predicate.
+   * Observers pinned to a gone/rotated target are pruned under the state lock
+   * first, so an abandoned observation cannot pin the daemon forever; an
+   * expired lease is treated as idle because a later restart deterministically
+   * fences it through the continuity recovery path.
+   */
+  async relayV2ExactIdleActivitySnapshot(): Promise<{
+    observations: number;
+    pendingClaims: number;
+    activeLeases: number;
+  }> {
+    if (this.relayV2ExactClosed) {
+      return { observations: 0, pendingClaims: 0, activeLeases: 0 };
+    }
+    const nowMs = this.now().getTime();
+    let pendingClaims = 0;
+    for (const claim of this.relayV2ExactLiveClaims) {
+      const record = this.relayV2ExactClaims.get(claim as object);
+      if (record !== undefined
+        && (record.state === "prepared" || record.state === "admitted")
+        && Date.parse(record.lease.expiresAt) > nowMs) {
+        pendingClaims += 1;
+      }
+    }
+    // Failing to read the durable state must fail closed: report enough
+    // activity to keep the daemon alive until the next idle recheck.
+    let activeLeases = 1;
+    try {
+      activeLeases = await this.locked(async (state) => {
+        let held = 0;
+        for (const target of state.targets) {
+          this.relayV2ExactPruneStaleObservers(state, target);
+          const leaseUnexpired = target.ownership.state !== "FREE"
+            && Date.parse(target.ownership.leaseExpiresAt) > nowMs;
+          if (leaseUnexpired || target.inFlight !== undefined) held += 1;
+        }
+        return held;
+      });
+    } catch {
+      activeLeases = 1;
+    }
+    return {
+      observations: this.relayV2ExactLiveObservations.size,
+      pendingClaims,
+      activeLeases,
+    };
+  }
+
   async initializeContinuity(): Promise<string> {
     return this.relayV2ExternalOperation(() => this.locked(async (state) => {
       const previousControlEpoch = state.controlEpoch;
