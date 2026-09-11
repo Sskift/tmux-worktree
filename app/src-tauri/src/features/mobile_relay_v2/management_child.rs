@@ -1,3 +1,18 @@
+//! Management child process supervision.
+//!
+//! Cleanup policy (1.0.28): once the exact child has been REAPED it holds no
+//! live claim — the JS credential-cell lock and the host-state lock are
+//! pid-liveness reclaimed, and the native lock/claim sidecars belonged to a
+//! deleted admission protocol. Therefore every supervisor-initiated kill and
+//! every non-zero exit classifies as [`ManagementCleanupOutcome::Clean`]: the
+//! bounded respawn budget (owned by commands.rs) is free to replace the child
+//! with no in-memory latch. `ManagementCleanupOutcome::RecoveryRequired` is
+//! reserved for a replacement that could not commit its ready configuration
+//! (`settle_candidate_start` in commands.rs), which never executes in this
+//! file. A graceful stdin close is still attempted first so a slow-but-healthy
+//! child can drain; the independent close budget only bounds how long teardown
+//! waits before SIGKILL, it does not change the Clean classification.
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -33,10 +48,10 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 // Once a response read exceeds its deadline the request itself is failed, but
 // a healthy child that is simply slow is not killed out of hand: close stdin
-// and give it the same bounded clean-close drain the disposal path uses. Only
-// a child that cannot exit within that independent budget is killed, matching
-// cleanup_timed_out_start and keeping the supervisor from restarting a child
-// that still owns a live native credential claim.
+// and give it the same bounded clean-close drain the disposal path uses. A
+// child that cannot exit within that independent budget is SIGKILLed, but the
+// reaped process holds no live claim, so that kill is still a Clean cleanup —
+// the budget bounds teardown latency, it never latches operator recovery.
 const OPERATION_TIMEOUT_CLOSE_BUDGET: Duration = CLEAN_CLOSE_TIMEOUT;
 // A complete, request-id-correlated frame arriving just after the operation
 // deadline is still the correct response. Give the reader a bounded grace
@@ -45,9 +60,10 @@ const OPERATION_TIMEOUT_CLOSE_BUDGET: Duration = CLEAN_CLOSE_TIMEOUT;
 // wait on a genuinely stalled child.
 const RESPONSE_READ_GRACE: Duration = Duration::from_millis(500);
 // The Node Host owns a bounded five-second WSS drain before it can close the
-// native credential cell and remove its exact admission claim. Keep the
-// supervisor deadline strictly outside that owner deadline so ordinary
-// Dashboard shutdown cannot turn a clean close into a SIGKILL/crash cut.
+// credential cell. Keep the supervisor deadline strictly outside that owner
+// deadline so ordinary Dashboard shutdown lets the child exit cleanly instead
+// of suffering a noisy SIGKILL; if it still overruns, the reaped child is
+// classified Clean (see the module-level cleanup policy).
 const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const SUPERSEDED_EXIT_CODE: i32 = 78;
 const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
@@ -363,6 +379,11 @@ enum ChildWrite {
 
 trait ChildLifecycle: Send + Sync {
     fn kill_if_live(&self);
+    /// Record why the supervisor is about to SIGKILL this child, immediately
+    /// before the matching `kill_if_live` call. Purely diagnostic (it appends
+    /// one line to the child stderr log); the default no-op lets scripted and
+    /// in-memory test doubles ignore it.
+    fn note_kill(&self, _reason: &'static str) {}
     fn wait_and_reap(&self) -> ChildExit;
     fn wait_until(&self, deadline: Instant) -> Option<ChildExit>;
 }
@@ -457,6 +478,12 @@ impl ChildLifecycle for ExactChildAuthority {
             Ok(None) | Err(_) => {
                 let _ = state.child.kill();
             }
+        }
+    }
+
+    fn note_kill(&self, reason: &'static str) {
+        if let Some(path) = self.stderr_log.as_ref() {
+            append_management_child_kill_line(path, reason);
         }
     }
 
@@ -1104,6 +1131,10 @@ impl ChildLifecycle for ProductionProcess {
         self.authority.kill_if_live();
     }
 
+    fn note_kill(&self, reason: &'static str) {
+        self.authority.note_kill(reason);
+    }
+
     fn wait_and_reap(&self) -> ChildExit {
         let exit = self.authority.wait_and_reap();
         self.finish_io();
@@ -1226,6 +1257,13 @@ fn append_management_child_spawn_line(path: &Path) {
     append_management_child_line(path, "management child spawned");
 }
 
+fn append_management_child_kill_line(path: &Path, reason: &str) {
+    append_management_child_line(
+        path,
+        &format!("management child killed by supervisor: {reason}"),
+    );
+}
+
 #[cfg(unix)]
 fn append_management_child_exit_line(path: &Path, status: &ExitStatus) {
     use std::os::unix::process::ExitStatusExt;
@@ -1324,10 +1362,12 @@ fn configure_management_child_environment(
 fn cleanup_spawn_attempt(attempt: SpawnAttempt) {
     match attempt {
         SpawnAttempt::Ready(child) => {
+            child.note_kill("spawn attempt abandoned");
             child.kill_if_live();
             child.wait_and_reap();
         }
         SpawnAttempt::FailedAfterChild(child) => {
+            child.note_kill("spawn attempt abandoned");
             child.kill_if_live();
             child.wait_and_reap();
         }
@@ -1335,27 +1375,30 @@ fn cleanup_spawn_attempt(attempt: SpawnAttempt) {
     }
 }
 
-fn cleanup_timed_out_start(child: &dyn ManagementChildProcess) -> ManagementStartError {
-    // The self-hosted child may already own its crash-intolerant native
-    // credential claim before it can publish the ready frame. Closing stdin
-    // lets that exact child finish startup, observe EOF, and drain the claim;
-    // only a child that cannot settle within the independent close budget is
-    // killed and classified as requiring operator recovery.
+fn cleanup_timed_out_start(
+    child: &dyn ManagementChildProcess,
+    close_timeout: Duration,
+) -> ManagementStartError {
+    // The self-hosted child did not publish a ready frame within the startup
+    // deadline. Closing stdin lets that exact child observe EOF and finish; if
+    // it cannot settle within the independent close budget it is killed. Either
+    // way the reaped child holds no live claim, so the failure is a plain
+    // ChannelClosed: the respawn budget (commands.rs) bounds the retry and no
+    // operator-only RecoveryRequired latch is taken here. The close budget is
+    // parameterized (the per-manager injected value) so tests exercise the
+    // overrun kill without waiting the production fifteen seconds.
     child.close_stdin();
-    let deadline = Instant::now() + CLEAN_CLOSE_TIMEOUT;
+    let deadline = Instant::now() + close_timeout;
     match child.wait_until(deadline) {
         Some(_) => {
-            let exit = child.wait_and_reap();
-            if exit.code == Some(0) {
-                ManagementStartError::ChannelClosed
-            } else {
-                ManagementStartError::RecoveryRequired
-            }
+            child.wait_and_reap();
+            ManagementStartError::ChannelClosed
         }
         None => {
+            child.note_kill("startup timeout and close budget exceeded");
             child.kill_if_live();
             child.wait_and_reap();
-            ManagementStartError::RecoveryRequired
+            ManagementStartError::ChannelClosed
         }
     }
 }
@@ -1364,11 +1407,14 @@ fn spawn_before_deadline(
     factory: Arc<dyn ChildFactory>,
     artifact: BundledManagementArtifact,
     deadline: Instant,
+    close_timeout: Duration,
 ) -> Result<Arc<dyn ManagementChildProcess>, ManagementStartError> {
     let attempt = factory.spawn(&artifact);
     if Instant::now() >= deadline {
         return Err(match attempt {
-            SpawnAttempt::Ready(child) => cleanup_timed_out_start(child.as_ref()),
+            SpawnAttempt::Ready(child) => {
+                cleanup_timed_out_start(child.as_ref(), close_timeout)
+            }
             failed => {
                 cleanup_spawn_attempt(failed);
                 ManagementStartError::ChannelClosed
@@ -1551,6 +1597,10 @@ struct ManagerInner {
     supervisor_stop: AtomicBool,
     operation_timeout: Duration,
     network_operation_timeout: Duration,
+    // Independent clean-close budget granted after a missed response deadline.
+    // Parameterized (with a cfg(test) constructor seam) so tests that target
+    // the overrun kill never wait the production 15s.
+    close_budget: Duration,
 }
 
 fn operation_uses_network_budget(operation: ManagementOperation) -> bool {
@@ -1603,6 +1653,7 @@ impl ManagementChildManager {
             STARTUP_TIMEOUT,
             OPERATION_TIMEOUT,
             NETWORK_OPERATION_TIMEOUT,
+            OPERATION_TIMEOUT_CLOSE_BUDGET,
         )
     }
 
@@ -1619,6 +1670,28 @@ impl ManagementChildManager {
         script: String,
         request_ids: Vec<[u8; 16]>,
     ) -> Result<Self, ManagementStartError> {
+        Self::start_v2_command_regression_script_with_timeouts(
+            script,
+            request_ids,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            OPERATION_TIMEOUT_CLOSE_BUDGET,
+        )
+    }
+
+    /// Test-only constructor with every timeout explicit, so the close-budget
+    /// overrun paths (a child that ignores stdin EOF) can be exercised without
+    /// waiting the production fifteen seconds.
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_v2_command_regression_script_with_timeouts(
+        script: String,
+        request_ids: Vec<[u8; 16]>,
+        startup_timeout: Duration,
+        operation_timeout: Duration,
+        network_operation_timeout: Duration,
+        close_budget: Duration,
+    ) -> Result<Self, ManagementStartError> {
         Self::start_with_factory(
             BundledManagementArtifact {
                 path: PathBuf::from("/test/tw-cli/cli.cjs"),
@@ -1626,9 +1699,10 @@ impl ManagementChildManager {
             Arc::new(CommandRegressionScriptFactory { script }),
             Arc::new(CommandRegressionRequestId(Mutex::new(request_ids.into()))),
             "1.2.3",
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(30),
+            startup_timeout,
+            operation_timeout,
+            network_operation_timeout,
+            close_budget,
         )
     }
 
@@ -1640,9 +1714,10 @@ impl ManagementChildManager {
         startup_timeout: Duration,
         operation_timeout: Duration,
         network_operation_timeout: Duration,
+        close_budget: Duration,
     ) -> Result<Self, ManagementStartError> {
         let deadline = Instant::now() + startup_timeout;
-        let child = spawn_before_deadline(factory, artifact.clone(), deadline)?;
+        let child = spawn_before_deadline(factory, artifact.clone(), deadline, close_budget)?;
         let ready = if Instant::now() < deadline {
             read_frame(child.as_ref(), deadline)
         } else {
@@ -1651,13 +1726,14 @@ impl ManagementChildManager {
         match ready {
             Ok(payload) if decode_startup_ready(&payload, expected_version).is_ok() => {
                 if Instant::now() >= deadline {
-                    return Err(cleanup_timed_out_start(child.as_ref()));
+                    return Err(cleanup_timed_out_start(child.as_ref(), close_budget));
                 }
             }
             Err(FrameFailure::TimedOut) => {
-                return Err(cleanup_timed_out_start(child.as_ref()));
+                return Err(cleanup_timed_out_start(child.as_ref(), close_budget));
             }
             Ok(_) | Err(FrameFailure::Invalid | FrameFailure::Exited(_)) => {
+                child.note_kill("invalid startup handshake");
                 child.kill_if_live();
                 child.wait_and_reap();
                 return Err(ManagementStartError::ChannelClosed);
@@ -1672,6 +1748,7 @@ impl ManagementChildManager {
             supervisor_stop: AtomicBool::new(false),
             operation_timeout,
             network_operation_timeout,
+            close_budget,
         });
         let weak = Arc::downgrade(&inner);
         let supervisor = match thread::Builder::new()
@@ -1680,7 +1757,11 @@ impl ManagementChildManager {
         {
             Ok(supervisor) => supervisor,
             Err(_) => {
-                inner.terminalize(LifecycleKind::Poisoned, true);
+                inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "supervisor thread spawn failed",
+                );
                 return Err(ManagementStartError::ChannelClosed);
             }
         };
@@ -1730,7 +1811,11 @@ impl ManagementChildManager {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            self.inner.terminalize(LifecycleKind::Poisoned, true);
+            self.inner.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "in-flight request collision",
+            );
             return Err(ManagementCallError::ChannelClosed);
         }
         let _in_flight = InFlightGuard(&self.inner.in_flight);
@@ -1751,12 +1836,20 @@ impl ManagementChildManager {
         let request_id = match self.inner.generate_request_id() {
             Ok(request_id) => request_id,
             Err(()) => {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "request id unavailable",
+                );
                 return Err(ManagementCallError::RequestIdUnavailable);
             }
         };
         let frame = encode_request(&request_id, operation, &input).map_err(|_| {
-            self.inner.terminalize(LifecycleKind::Poisoned, true);
+            self.inner.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "request encode failure",
+            );
             ManagementCallError::ChannelClosed
         })?;
 
@@ -1771,13 +1864,29 @@ impl ManagementChildManager {
             );
         match self.inner.child.write_stdin_once(&frame, deadline) {
             ChildWrite::Written(written) if written == frame.len() => {}
-            ChildWrite::Written(_) | ChildWrite::TimedOut | ChildWrite::Failed => {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
+            ChildWrite::Written(_) | ChildWrite::Failed => {
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "stdin write failed",
+                );
+                return Ok(channel_closed_outcome(request_id));
+            }
+            ChildWrite::TimedOut => {
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "stdin write timed out",
+                );
                 return Ok(channel_closed_outcome(request_id));
             }
         }
         if Instant::now() >= deadline {
-            self.inner.terminalize(LifecycleKind::Poisoned, true);
+            self.inner.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "stdin write timed out",
+            );
             return Ok(channel_closed_outcome(request_id));
         }
 
@@ -1796,26 +1905,39 @@ impl ManagementChildManager {
             Err(FrameFailure::TimedOut) => {
                 // A missed response deadline is a transport timeout, not a
                 // protocol violation. Drain the child gracefully so a slow but
-                // healthy child exits cleanly and can be replaced; only a child
-                // that ignores the close budget is killed and latched.
+                // healthy child exits cleanly and can be replaced; a child that
+                // ignores the close budget is SIGKILLed, and that kill is still
+                // Clean (see the module-level cleanup policy).
                 let kind = self.inner.terminalize_after_timed_out_response();
                 return Ok(local_terminal_outcome(request_id, kind));
             }
             Err(_) => {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "stdout failure",
+                );
                 return Ok(channel_closed_outcome(request_id));
             }
         };
         let response = match decode_response(&payload, &request_id, operation) {
             Ok(response) => response,
             Err(()) => {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "response decode failure",
+                );
                 return Ok(channel_closed_outcome(request_id));
             }
         };
         match self.inner.child.poll_after_response(read_deadline) {
             ChildPoll::Output | ChildPoll::Failed => {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
+                self.inner.terminalize(
+                    LifecycleKind::Poisoned,
+                    true,
+                    "unexpected stdout while idle",
+                );
                 return Ok(channel_closed_outcome(request_id));
             }
             ChildPoll::Pending | ChildPoll::Eof | ChildPoll::Exited(_) => {}
@@ -1827,8 +1949,15 @@ impl ManagementChildManager {
     }
 
     pub(crate) fn dispose(&self) -> ManagementCleanupOutcome {
+        self.dispose_with_close_timeout(CLEAN_CLOSE_TIMEOUT)
+    }
+
+    /// Shut the child down with an explicit clean-close budget. Production uses
+    /// [`CLEAN_CLOSE_TIMEOUT`] via [`dispose`](Self::dispose); tests inject a
+    /// small budget when exercising the overrun SIGKILL path.
+    fn dispose_with_close_timeout(&self, timeout: Duration) -> ManagementCleanupOutcome {
         self.inner.supervisor_stop.store(true, Ordering::Release);
-        let cleanup = self.inner.close_and_drain(CLEAN_CLOSE_TIMEOUT);
+        let cleanup = self.inner.close_and_drain(timeout);
         if let Some(supervisor) = self.supervisor.lock().unwrap().take() {
             let _ = supervisor.join();
         }
@@ -1853,12 +1982,15 @@ impl ManagerInner {
         } else {
             LifecycleKind::Poisoned
         };
-        // Post-handshake unexpected exits (e.g. killed by external signal like SIGKILL,
-        // or unexpected process crash) leave the child process already reaped and holding
-        // no live sockets or credential claims. Their cleanup is Clean so that bounded
-        // respawn via RespawnBudget can replace the child.
+        // Post-handshake unexpected exits (a non-zero exit like code 1, or an
+        // external signal death including SIGKILL) leave the child already
+        // reaped and holding no live sockets or pid-liveness-reclaimed claims.
+        // The process is gone on its own, so no supervisor kill is issued and
+        // the cleanup is Clean (see the module-level cleanup policy): the
+        // bounded respawn budget in commands.rs is free to replace the child
+        // without an operator-only latch.
         let cleanup = ManagementCleanupOutcome::Clean;
-        self.terminalize_with_cleanup(kind, false, cleanup)
+        self.terminalize_with_cleanup(kind, false, cleanup, "post-handshake process exit")
     }
 
     fn observe_idle_child(&self) -> Option<LifecycleKind> {
@@ -1869,31 +2001,57 @@ impl ManagerInner {
         match poll {
             ChildPoll::Pending => None,
             ChildPoll::Exited(exit) => Some(self.classify_post_handshake_exit(exit)),
-            ChildPoll::Output | ChildPoll::Eof | ChildPoll::Failed => {
-                Some(self.terminalize(LifecycleKind::Poisoned, true))
-            }
+            // Unsolicited stdout between requests is a protocol violation, but
+            // the reaped child still classifies Clean: the respawn budget, not
+            // an operator-only latch, owns the replacement decision.
+            ChildPoll::Output => Some(self.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "unexpected stdout while idle",
+            )),
+            ChildPoll::Eof => Some(self.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "stdout eof",
+            )),
+            ChildPoll::Failed => Some(self.terminalize(
+                LifecycleKind::Poisoned,
+                true,
+                "stdout failure",
+            )),
         }
     }
 
-    fn terminalize(&self, requested: LifecycleKind, kill: bool) -> LifecycleKind {
-        self.terminalize_with_cleanup(
-            requested,
-            kill,
-            if kill {
-                ManagementCleanupOutcome::RecoveryRequired
-            } else {
-                ManagementCleanupOutcome::Clean
-            },
-        )
+    /// Move the child to a terminal lifecycle kind and reap the exact process.
+    ///
+    /// Every supervisor-initiated teardown classifies Clean: once reaped the
+    /// child holds no live claim (the JS credential-cell lock and the host-state
+    /// lock are pid-liveness reclaimed), and the bounded respawn budget owned
+    /// by commands.rs takes the replacement decision. `RecoveryRequired` is
+    /// never produced in this file — it is reserved for a replacement that
+    /// could not commit its ready configuration (`settle_candidate_start` in
+    /// commands.rs). When `kill` is set a graceful drain was either already
+    /// attempted by the caller or is pointless (protocol poison); `reason` is
+    /// appended to the child stderr log immediately before that SIGKILL so
+    /// every supervisor kill is explainable after the fact.
+    fn terminalize(
+        &self,
+        requested: LifecycleKind,
+        kill: bool,
+        reason: &'static str,
+    ) -> LifecycleKind {
+        self.terminalize_with_cleanup(requested, kill, ManagementCleanupOutcome::Clean, reason)
     }
 
     /// Drain a child whose response simply never arrived in time. The caller
     /// is the in-flight request and already holds the observation barrier, so
-    /// this never re-locks it. A slow-but-healthy child owns a live native
-    /// credential claim: close stdin and give it the same independent
-    /// clean-close budget the disposal path uses. Exit code 0/SUPERSEDED drains
-    /// cleanly and the child can be replaced without operator recovery; only a
-    /// child that ignores the close budget is killed and latched.
+    /// this never re-locks it. The child owns no claim the reaper cannot
+    /// reclaim, so both outcomes are Clean: a child that exits 0/SUPERSEDED
+    /// once stdin is closed drains gracefully, and one that ignores the
+    /// independent close budget is SIGKILLed after it (the kill is logged).
+    /// The budget bounds teardown latency only; it never latches operator
+    /// recovery. Uses the per-manager injected close budget so tests exercise
+    /// the overrun kill without waiting the production fifteen seconds.
     fn terminalize_after_timed_out_response(&self) -> LifecycleKind {
         {
             let mut state = self.lifecycle.state.lock().unwrap();
@@ -1913,16 +2071,18 @@ impl ManagerInner {
             state.reaping = true;
         }
         self.child.close_stdin();
-        let deadline = Instant::now() + OPERATION_TIMEOUT_CLOSE_BUDGET;
+        let deadline = Instant::now() + self.close_budget;
         let cleanup = match self.child.wait_until(deadline) {
-            Some(exit) if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) => {
+            Some(_) => {
                 self.child.wait_and_reap();
                 ManagementCleanupOutcome::Clean
             }
-            Some(_) | None => {
+            None => {
+                self.child
+                    .note_kill("response deadline missed and close budget exceeded");
                 self.child.kill_if_live();
                 self.child.wait_and_reap();
-                ManagementCleanupOutcome::RecoveryRequired
+                ManagementCleanupOutcome::Clean
             }
         };
         let mut state = self.lifecycle.state.lock().unwrap();
@@ -1938,6 +2098,7 @@ impl ManagerInner {
         requested: LifecycleKind,
         kill: bool,
         cleanup: ManagementCleanupOutcome,
+        reason: &'static str,
     ) -> LifecycleKind {
         let leader;
         {
@@ -1959,6 +2120,7 @@ impl ManagerInner {
         }
         if leader {
             if kill {
+                self.child.note_kill(reason);
                 self.child.kill_if_live();
             }
             self.child.wait_and_reap();
@@ -1979,9 +2141,11 @@ impl ManagerInner {
             let mut state = self.lifecycle.state.lock().unwrap();
             state.kind = LifecycleKind::Closed;
             if state.reaped {
+                // A reaped child is Clean by definition; the stored outcome
+                // (e.g. Superseded) is only more specific.
                 return state
                     .cleanup
-                    .unwrap_or(ManagementCleanupOutcome::RecoveryRequired);
+                    .unwrap_or(ManagementCleanupOutcome::Clean);
             }
             self.lifecycle.changed.notify_all();
         }
@@ -1998,31 +2162,30 @@ impl ManagerInner {
             if state.reaped {
                 return state
                     .cleanup
-                    .unwrap_or(ManagementCleanupOutcome::RecoveryRequired);
+                    .unwrap_or(ManagementCleanupOutcome::Clean);
             }
             state.reaping = true;
         }
 
+        // Dispose teardown: close stdin and bound the wait for an independent
+        // drain. Any exit — graceful 0/78 or any other non-zero code — and any
+        // close-budget overrun SIGKILL classify Clean, because the reaped child
+        // holds no live claim (see the module-level cleanup policy).
         self.child.close_stdin();
         let deadline = Instant::now() + timeout;
-        let (exit, cleanup) = match self.child.wait_until(deadline) {
-            Some(exit) => {
-                let cleanup = if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) {
-                    ManagementCleanupOutcome::Clean
-                } else {
-                    ManagementCleanupOutcome::RecoveryRequired
-                };
-                (self.child.wait_and_reap(), cleanup)
+        let cleanup = match self.child.wait_until(deadline) {
+            Some(_) => {
+                self.child.wait_and_reap();
+                ManagementCleanupOutcome::Clean
             }
             None => {
+                self.child
+                    .note_kill("close budget exceeded during dispose");
                 self.child.kill_if_live();
-                (
-                    self.child.wait_and_reap(),
-                    ManagementCleanupOutcome::RecoveryRequired,
-                )
+                self.child.wait_and_reap();
+                ManagementCleanupOutcome::Clean
             }
         };
-        let _ = exit;
         let mut state = self.lifecycle.state.lock().unwrap();
         state.reaping = false;
         state.reaped = true;
@@ -2746,6 +2909,10 @@ mod tests {
             Duration::from_secs(2),
             operation_timeout,
             Duration::from_secs(30),
+            // Script tests never wait the production 15s close budget: the only
+            // scripts that reach the drain are expected to exit on stdin EOF
+            // immediately; an injected 200ms bounds the EOF-ignoring cases.
+            Duration::from_millis(200),
         )
     }
 
@@ -2852,6 +3019,7 @@ mod tests {
             Duration::from_millis(100),
             Duration::from_millis(100),
             Duration::from_millis(100),
+            Duration::from_millis(100),
         )
         .expect("start fake management child")
     }
@@ -2889,6 +3057,7 @@ mod tests {
             startup_timeout,
             operation_timeout,
             network_operation_timeout,
+            Duration::from_millis(100),
         )
         .expect("start fake management child")
     }
@@ -3115,6 +3284,7 @@ mod tests {
                 Duration::from_millis(100),
                 Duration::from_millis(100),
                 Duration::from_millis(100),
+                Duration::from_millis(100),
             );
             assert_eq!(
                 result.err(),
@@ -3255,7 +3425,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_timeout_kills_only_after_graceful_drain_does_not_settle() {
+    fn startup_timeout_drains_then_fails_closed_without_a_recovery_latch() {
+        // 1.0.28 cleanup policy: even when the child ignores stdin EOF past the
+        // close budget and is SIGKILLed during startup, the reaped process
+        // holds no live claim, so the start fails with a plain ChannelClosed
+        // (the respawn budget bounds the retry) instead of latching
+        // RecoveryRequired, which only an operator could clear.
         let child = FakeChild::sequenced(vec![(0, ChildRead::TimedOut)]);
         child.set_exit_after_stdin_close(false);
         let result = ManagementChildManager::start_with_factory(
@@ -3266,9 +3441,10 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(100),
             Duration::from_millis(100),
+            Duration::from_millis(100),
         );
 
-        assert_eq!(result.err(), Some(ManagementStartError::RecoveryRequired));
+        assert_eq!(result.err(), Some(ManagementStartError::ChannelClosed));
         assert_eq!(
             child.state.lock().unwrap().events,
             ["close-stdin", "kill-if-live", "wait-and-reap"]
@@ -3288,6 +3464,7 @@ mod tests {
                 Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
                 "1.2.3",
                 Duration::ZERO,
+                Duration::from_millis(100),
                 Duration::from_millis(100),
                 Duration::from_millis(100),
             );
@@ -3314,6 +3491,7 @@ mod tests {
             FakeFactory::new(child.clone(), FakeSpawnAction::FailedAfterChild),
             Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
             "1.2.3",
+            Duration::from_millis(100),
             Duration::from_millis(100),
             Duration::from_millis(100),
             Duration::from_millis(100),
@@ -3771,6 +3949,70 @@ mod tests {
             child.state.lock().unwrap().events,
             ["write", "close-stdin", "wait-and-reap"]
         );
+        assert_eq!(manager.dispose(), ManagementCleanupOutcome::Clean);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispose_of_a_post_handshake_child_that_ignores_stdin_eof_is_clean() {
+        // The child publishes its ready frame, closes its own stdin fd so an
+        // EOF can never reach a reader, and loops forever. With an injected
+        // small close budget dispose must SIGKILL and reap the exact process,
+        // and still classify Clean: a reaped child holds no live claim, so no
+        // operator-only RecoveryRequired latch may result.
+        let script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; exec 0<&-; while :; do sleep 1; done";
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_timeouts(
+            script.to_string(),
+            vec![[20u8; 16]],
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .expect("eof-ignoring child starts");
+        assert_eq!(
+            manager.dispose_with_close_timeout(Duration::from_millis(100)),
+            ManagementCleanupOutcome::Clean
+        );
+        let state = manager.inner.lifecycle.state.lock().unwrap();
+        assert_eq!(state.kind, LifecycleKind::Closed);
+        assert!(state.reaped, "the overrun child must be reaped");
+        assert_eq!(
+            state.cleanup,
+            Some(ManagementCleanupOutcome::Clean),
+            "a supervisor kill during dispose must not latch recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_response_against_an_eof_ignoring_child_terminates_clean() {
+        // The child completes the handshake, accepts the request on stdin but
+        // never answers, and keeps looping past stdin EOF. The request misses
+        // its deadline; terminalize_after_timed_out_response grants the
+        // injected close budget, SIGKILLs the overrun child, and classifies
+        // Clean. A later dispose observes that stored Clean outcome.
+        let script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while :; do IFS= read -r request || sleep 1; done";
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_timeouts(
+            script.to_string(),
+            vec![[21u8; 16]],
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .expect("never-answering child starts");
+        let outcome = manager.request(ManagementOperation::Status).unwrap();
+        assert_eq!(outcome.error.unwrap().code, "CHANNEL_CLOSED");
+        let state = manager.inner.lifecycle.state.lock().unwrap();
+        assert_eq!(state.kind, LifecycleKind::Poisoned);
+        assert!(state.reaped, "the timed-out child must be reaped");
+        assert_eq!(
+            state.cleanup,
+            Some(ManagementCleanupOutcome::Clean),
+            "a close-budget kill after a missed deadline must not latch recovery"
+        );
+        drop(state);
         assert_eq!(manager.dispose(), ManagementCleanupOutcome::Clean);
     }
 

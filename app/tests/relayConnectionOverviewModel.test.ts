@@ -182,6 +182,85 @@ test("repair rebuilds the management child after terminal connector failure", ()
   }
 });
 
+test("repair leaves the management child alone while a failed connector cut is retryable", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: true,
+    connectorStatus: "failed",
+    connectorRetryable: true,
+  }), false);
+});
+
+test("an explicitly non-retryable failed connector still rebuilds the management child", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: true,
+    connectorStatus: "failed",
+    connectorRetryable: false,
+  }), true);
+});
+
+test("infra and management gates outrank a retryable connector cut", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: false,
+    adapterAvailable: true,
+    connectorStatus: "failed",
+    connectorRetryable: true,
+  }), true);
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: false,
+    connectorStatus: "failed",
+    connectorRetryable: true,
+  }), true);
+});
+
+test("a retryable connector cut renders progress with no primary action", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "failed",
+    connectorRetryable: true,
+    enrollmentView: readyEnrollmentView({ ready: false }),
+  }));
+  assert.equal(overview.tone, "progress");
+  assert.equal(overview.headline, "Reconnecting to the relay center…");
+  assert.equal(overview.primaryAction, null);
+  assert.match(overview.detail ?? "", /retries automatically/);
+  assert.match(overview.detail ?? "", /SSH host/);
+});
+
+test("infra not ready outranks a retryable connector cut", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "failed",
+    connectorRetryable: true,
+    selfHosted: { ...configuredSelfHosted, centerStatus: "stopped" },
+  }));
+  assert.equal(overview.tone, "warning");
+  assert.equal(overview.headline, "Relay center is not running");
+  assert.equal(overview.primaryAction?.kind, "fix");
+});
+
+test("backend unavailable outranks a retryable connector cut", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "failed",
+    connectorRetryable: true,
+    enrollmentView: readyEnrollmentView({ adapterAvailable: false }),
+  }));
+  assert.equal(overview.tone, "danger");
+  assert.equal(overview.headline, "Relay backend unavailable");
+});
+
+test("a failed repair still escalates the reconnecting card to danger", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "failed",
+    connectorRetryable: true,
+    repairError: "start_connector timed out.",
+  }));
+  assert.equal(overview.tone, "danger");
+  assert.equal(overview.headline, "Reconnecting to the relay center…");
+  assert.equal(overview.detail, "start_connector timed out.");
+  assert.equal(overview.primaryAction, null);
+});
+
 test("repair rebuilds a connector that remains in starting past its handshake deadline", () => {
   assert.equal(relayRepairRequiresManagementRestart({
     infraReady: true,

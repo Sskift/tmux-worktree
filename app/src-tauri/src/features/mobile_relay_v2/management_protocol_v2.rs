@@ -436,6 +436,7 @@ pub(crate) fn project_for_renderer(
 pub(crate) enum BaseConnectorReadiness {
     Ready,
     Starting,
+    Retrying,
     NotReady,
 }
 
@@ -517,6 +518,7 @@ pub(crate) fn projection_base_connector_readiness(
         {
             BaseConnectorReadiness::Ready
         }
+        ConnectorProjection::Failed { retryable: true } => BaseConnectorReadiness::Retrying,
         _ => BaseConnectorReadiness::NotReady,
     }
 }
@@ -1286,6 +1288,129 @@ mod tests {
             assert!(!serialized.contains(forbidden), "{forbidden}");
         }
         registry.close();
+    }
+
+    #[test]
+    fn projection_base_connector_readiness_distinguishes_retrying_from_not_ready() {
+        let base_projection = |host_credential: serde_json::Value,
+                               authority: serde_json::Value,
+                               connector: serde_json::Value| {
+            serde_json::json!({
+                "authority": authority,
+                "hostCredential": host_credential,
+                "connector": connector,
+                "enrollment": {"status": "idle"},
+                "knownClientGrant": {"status": "unknown"},
+                "connectedMobileDevices": [],
+            })
+        };
+
+        let valid_auth = serde_json::json!({"kind": "node", "reason": null});
+        let valid_cred = serde_json::json!({
+            "status": "ready",
+            "credentialReference": "test-cred",
+            "expiresAtMs": 5_000_000_000_u64,
+        });
+
+        // Retrying: failed with retryable: true under valid auth + cred
+        let retrying = base_projection(
+            valid_cred.clone(),
+            valid_auth.clone(),
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&retrying),
+            BaseConnectorReadiness::Retrying
+        );
+
+        // NotReady: failed with retryable: false
+        let non_retryable = base_projection(
+            valid_cred.clone(),
+            valid_auth.clone(),
+            serde_json::json!({"status": "failed", "retryable": false}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&non_retryable),
+            BaseConnectorReadiness::NotReady
+        );
+
+        // NotReady: failed with retryable: true but cred is missing or failed
+        let missing_cred = base_projection(
+            serde_json::json!({"status": "missing"}),
+            valid_auth.clone(),
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&missing_cred),
+            BaseConnectorReadiness::NotReady
+        );
+        let failed_cred = base_projection(
+            serde_json::json!({"status": "failed", "retryable": true}),
+            valid_auth.clone(),
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&failed_cred),
+            BaseConnectorReadiness::NotReady
+        );
+
+        // NotReady: failed with retryable: true but authority has reason or wrong kind
+        let reason_auth = base_projection(
+            valid_cred.clone(),
+            serde_json::json!({"kind": "node", "reason": "something"}),
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&reason_auth),
+            BaseConnectorReadiness::NotReady
+        );
+        let wrong_kind_auth = base_projection(
+            valid_cred.clone(),
+            serde_json::json!({"kind": "other", "reason": null}),
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&wrong_kind_auth),
+            BaseConnectorReadiness::NotReady
+        );
+
+        // Other connector statuses
+        let stopped = base_projection(
+            valid_cred.clone(),
+            valid_auth.clone(),
+            serde_json::json!({"status": "stopped"}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&stopped),
+            BaseConnectorReadiness::NotReady
+        );
+        let superseded = base_projection(
+            valid_cred.clone(),
+            valid_auth.clone(),
+            serde_json::json!({"status": "superseded"}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&superseded),
+            BaseConnectorReadiness::NotReady
+        );
+        let starting_no_host = base_projection(
+            valid_cred.clone(),
+            valid_auth.clone(),
+            serde_json::json!({"status": "starting", "hostId": null}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&starting_no_host),
+            BaseConnectorReadiness::NotReady
+        );
+        let starting_with_host = base_projection(
+            valid_cred.clone(),
+            valid_auth,
+            serde_json::json!({"status": "starting", "hostId": "host-1"}),
+        );
+        assert_eq!(
+            projection_base_connector_readiness(&starting_with_host),
+            BaseConnectorReadiness::Starting
+        );
     }
 
     fn operation(value: &str) -> ManagementOperation {

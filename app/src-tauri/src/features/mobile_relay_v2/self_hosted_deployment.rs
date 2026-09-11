@@ -5,14 +5,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 
 use super::management_child::{
     ManagementBootstrapSecretMode, ManagementChildSelection, ManagementError, ManagementLaunchKey,
     ManagementOutcome, ManagementPreparedFileIdentity, ManagementStartError,
 };
-use super::{MobileRelayV2ManagementCommandState, MobileRelayV2ManagementOperation};
+use super::{
+    MobileRelayV2ManagementCommandState, MobileRelayV2ManagementOperation,
+    SelfHostedConnectorRepair,
+};
 use crate::config::find_host;
 use crate::features::control_plane::{scp_cli_to_host, scp_directory_to_host};
 use crate::remote::{
@@ -57,6 +60,12 @@ const READY_COMMIT_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const CONNECTOR_WATCHDOG_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CONNECTOR_WATCHDOG_HEALTHY_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECTOR_WATCHDOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
+/// A live child whose connector cut stays retryable for this long is given one
+/// bounded stall escalation (a forced rebuild) even though its own composition
+/// retry loop nominally owns the cut. This is the safety net for an unknown
+/// wedge (e.g. the child alive but its rescan loop stuck): rebuilds on
+/// consecutive escalations can never land closer together than this.
+const CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER: Duration = Duration::from_secs(600);
 
 /// Public trust anchor: the self-signed ISRG Root X1 certificate.
 ///
@@ -2409,6 +2418,12 @@ pub(crate) fn restore_relay_v2_self_hosted_connector_desired_state(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectorWatchdogReconcileOutcome {
     Healthy,
+    /// The child is ALIVE and its connector cut is retryable (e.g. the relay
+    /// center or a configured SSH scope is unreachable; Kerberos expired). The
+    /// child's own composition retry loop owns the backoff and the 30s rescan,
+    /// so the watchdog neither rebuilds nor writes config: it only backs off.
+    /// Rebuilding here would reset the very rescan timer that recovers the cut.
+    Deferred,
     Retry,
     Superseded,
 }
@@ -2420,19 +2435,202 @@ fn next_connector_watchdog_retry_delay(current: Duration) -> Duration {
         .min(CONNECTOR_WATCHDOG_MAX_RETRY_DELAY)
 }
 
+/// Map the in-lock repair classification taken at the top of a watchdog tick.
+/// `None` means "fall through to the lock-free remote probe and the bounded
+/// rebuild path". Pure so the decision table is unit-testable without an
+/// AppHandle or a management child.
+fn initial_watchdog_repair_outcome(
+    repair: SelfHostedConnectorRepair,
+    escalate_stall: bool,
+) -> Option<ConnectorWatchdogReconcileOutcome> {
+    match repair {
+        SelfHostedConnectorRepair::Accepted => Some(ConnectorWatchdogReconcileOutcome::Healthy),
+        // Without stall escalation a retrying child owns its own recovery; with
+        // escalation armed the bounded 10-minute safety net deliberately takes
+        // the probe/rebuild path even for a retryable cut.
+        SelfHostedConnectorRepair::ChildRetrying if !escalate_stall => {
+            Some(ConnectorWatchdogReconcileOutcome::Deferred)
+        }
+        SelfHostedConnectorRepair::ChildRetrying | SelfHostedConnectorRepair::RebuildRequired => {
+            None
+        }
+    }
+}
+
+/// Map the repair classification observed AFTER this tick committed a rebuild.
+/// A replacement whose cut is already retrying is still alive and owns its next
+/// attempt: report Deferred rather than immediately scheduling another rebuild.
+fn post_rebuild_watchdog_outcome(
+    repair: SelfHostedConnectorRepair,
+) -> ConnectorWatchdogReconcileOutcome {
+    match repair {
+        SelfHostedConnectorRepair::Accepted => ConnectorWatchdogReconcileOutcome::Healthy,
+        SelfHostedConnectorRepair::ChildRetrying => ConnectorWatchdogReconcileOutcome::Deferred,
+        SelfHostedConnectorRepair::RebuildRequired => ConnectorWatchdogReconcileOutcome::Retry,
+    }
+}
+
+/// Resolution of Start Center's bounded base-readiness wait, evaluated only
+/// AFTER `connector_desired_running=true` is durable and `active_management`
+/// is published. There is deliberately no "abort before the watchdog is
+/// armed" variant: every failure observed here leaves a binding whose
+/// persisted desired state says "running", so in-session supervision must own
+/// it from this point. Returning the wait error with `?` here used to skip
+/// the arm: a first Start during a relay-center/SSH outage surfaced the soft
+/// "retrying automatically" notice while leaving dead-child rebuild,
+/// remote-center reboot repair, and the 600s stall escalation unstarted until
+/// the Dashboard was relaunched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommittedStartReadiness {
+    /// Base readiness reached: the command returns the live probed status.
+    Ready,
+    /// The connector cut was still Failed{retryable:true} at the deadline; the
+    /// child's own composition retry owns the next attempt. Surface the
+    /// reachability notice after arming the watchdog.
+    Retrying,
+    /// Any other wait failure (a terminal cut reached mid-wait, or a transport
+    /// error such as the child dying during the wait). Surface the failure
+    /// after arming; the watchdog's probe/rebuild path owns recovery.
+    NotReady,
+}
+
+impl CommittedStartReadiness {
+    /// The renderer-facing error for this outcome, or `None` when Start Center
+    /// should return the probed status. The caller arms the watchdog BEFORE
+    /// acting on this, so a surfaced message never implies "unsupervised".
+    fn surfaced_error(self) -> Option<&'static str> {
+        match self {
+            CommittedStartReadiness::Ready => None,
+            CommittedStartReadiness::Retrying => Some(
+                "Relay v2 self-hosted Host is retrying its relay connection automatically; the relay center or a configured SSH host is not reachable yet",
+            ),
+            CommittedStartReadiness::NotReady => Some(
+                "Relay v2 self-hosted Host did not register with all six required capabilities",
+            ),
+        }
+    }
+}
+
+fn committed_start_readiness_outcome(
+    wait_result: Result<(), ManagementError>,
+) -> CommittedStartReadiness {
+    match wait_result {
+        Ok(()) => CommittedStartReadiness::Ready,
+        Err(ref error)
+            if MobileRelayV2ManagementCommandState::management_error_is_connector_retrying(
+                error,
+            ) =>
+        {
+            CommittedStartReadiness::Retrying
+        }
+        Err(_) => CommittedStartReadiness::NotReady,
+    }
+}
+
+/// Pure watchdog backoff/stall state, split out of the watchdog thread so the
+/// doubling retry backoff and the 10-minute stall escalation are testable
+/// without threads or sleeps. `observe` records the outcome of the reconcile
+/// that just ran and returns `(delay_before_the_next_reconcile,
+/// escalate_the_next_reconcile)`; the thread owns only the sleep and passing
+/// the escalation flag back into the next reconcile call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConnectorWatchdogSchedule {
+    /// Doubling Deferred/Retry backoff, capped at
+    /// CONNECTOR_WATCHDOG_MAX_RETRY_DELAY; reset to the initial delay by any
+    /// Healthy observation (Deferred backs off exactly like Retry).
+    retry_delay: Duration,
+    /// Wall-clock instant of the first Deferred in the current unhealthy run.
+    /// Kept across consecutive Deferred/Retry ticks and cleared by Healthy; it
+    /// is also reset to None the moment a stall escalation is armed, so two
+    /// escalations cannot land less than
+    /// CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER apart even when the escalated
+    /// rebuild itself comes back Deferred.
+    deferred_since: Option<Instant>,
+}
+
+impl ConnectorWatchdogSchedule {
+    fn new() -> Self {
+        Self {
+            retry_delay: CONNECTOR_WATCHDOG_INITIAL_DELAY,
+            deferred_since: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        outcome: ConnectorWatchdogReconcileOutcome,
+        now: Instant,
+    ) -> (Duration, bool) {
+        match outcome {
+            ConnectorWatchdogReconcileOutcome::Healthy => {
+                self.retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                self.deferred_since = None;
+                (CONNECTOR_WATCHDOG_HEALTHY_INTERVAL, false)
+            }
+            ConnectorWatchdogReconcileOutcome::Retry => {
+                // Retry belongs to the same unhealthy run as the Deferred ticks
+                // around it: keep the stall timer, never arm an escalation, and
+                // share the doubling backoff.
+                let delay = self.retry_delay;
+                self.retry_delay = next_connector_watchdog_retry_delay(self.retry_delay);
+                (delay, false)
+            }
+            ConnectorWatchdogReconcileOutcome::Deferred => {
+                let run_started = self.deferred_since.unwrap_or(now);
+                let delay = self.retry_delay;
+                self.retry_delay = next_connector_watchdog_retry_delay(self.retry_delay);
+                if now.duration_since(run_started) >= CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER {
+                    // Arm the one-shot escalation for the NEXT reconcile and
+                    // restart the stall timer immediately afterwards.
+                    self.deferred_since = None;
+                    (delay, true)
+                } else {
+                    self.deferred_since = Some(run_started);
+                    (delay, false)
+                }
+            }
+            // The watchdog thread exits on Superseded without another tick;
+            // leave the state frozen and never ask for an escalation.
+            ConnectorWatchdogReconcileOutcome::Superseded => (self.retry_delay, false),
+        }
+    }
+}
+
 fn reconcile_relay_v2_self_hosted_connector_desired_state(
     app: &tauri::AppHandle,
     state: &MobileRelayV2SelfHostedDeploymentState,
     management: &MobileRelayV2ManagementCommandState,
     expected_binding: &SelfHostedManagementBinding,
+    escalate_stall: bool,
 ) -> ConnectorWatchdogReconcileOutcome {
+    // Decision table (all fencing unchanged; only the repair classification is
+    // new):
+    //
+    //   Accepted (cut Ready/Starting) ....................... Healthy
+    //   ChildRetrying, !escalate_stall (cut failed{retryable},
+    //     stopped/starting-without-host, credential not ready,
+    //     or any other ALIVE projection after a non-transport error) . Deferred
+    //   ChildRetrying, escalate_stall (>=10 min deferred) .... probe/rebuild
+    //   RebuildRequired (terminal cut: failed non-retryable /
+    //     superseded / malformed projection / dead channel) .. probe/rebuild
+    //
+    // A retryable cut means the child PROCESS is alive and its composition
+    // retry loop already owns the next start attempt (it rescans SSH scope
+    // coverage every 30s). Rebuilding would drain that child and reset the very
+    // rescan timer that would recover it — observed in production as 1699 churn
+    // spawns during a Kerberos outage — so Deferred returns from inside Phase 1
+    // with NO lock-free probe, NO prepare_prerequisites and NO save_config. The
+    // one bounded exception is the 10-minute stall escalation
+    // (CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER): the safety net for an unknown
+    // wedge where the child is alive but its retry loop is not progressing.
+    //
     // The deployment owner mutex serializes management mutations (start, stop,
     // replacement) with the watchdog: a user-requested stop cannot race with a
     // stale watchdog decision and be undone after the stop returns. The mutex
     // is std::sync (not reentrant). The dominant black-hole stall — the
-    // read-only remote probe_status (SSH ServerAlive rounds ≈45s on a
+    // read-only remote probe_status (SSH ServerAlive rounds ≈45s on an
     // unreachable devbox), which previously ran every tick WHILE the lock was
-    // held — is now performed lock-free (Phase 2). Start_center and the local
+    // held — is performed lock-free (Phase 2). Start_center and the local
     // child replacement re-acquire the lock (Phase 3) and operate on a FRESH
     // config so their full-struct save_config is fenced and cannot clobber a
     // concurrent Save/Deploy; only a deterministic Stopped reading ever reaches
@@ -2458,13 +2656,13 @@ fn reconcile_relay_v2_self_hosted_connector_desired_state(
             return ConnectorWatchdogReconcileOutcome::Retry;
         }
         // Local management IPC (no network): stays in the fenced critical
-        // section. If the child is fine, the connector is healthy without ever
-        // touching the devbox.
-        if management
-            .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
-            .is_ok()
-        {
-            return ConnectorWatchdogReconcileOutcome::Healthy;
+        // section. Accepted → Healthy; a live retrying child → Deferred without
+        // any probe or disk write; only a terminal/dead cut (or an armed stall
+        // escalation) falls through to the lock-free probe + rebuild path.
+        let repair =
+            management.classify_self_hosted_connector_repair(&expected_binding.steady_launch_key);
+        if let Some(outcome) = initial_watchdog_repair_outcome(repair, escalate_stall) {
+            return outcome;
         }
         config
     };
@@ -2541,12 +2739,14 @@ fn reconcile_relay_v2_self_hosted_connector_desired_state(
         {
             return ConnectorWatchdogReconcileOutcome::Retry;
         }
-        match management
-            .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
-        {
-            Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
-            Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
-        }
+        // Re-classify rather than a bare ensure: when the freshly committed
+        // replacement is alive but its cut is still retryable (the relay center
+        // or an SSH scope is still unreachable), its own retry loop owns the
+        // next attempt and the tick is Deferred instead of scheduling another
+        // rebuild on the following tick.
+        let repair =
+            management.classify_self_hosted_connector_repair(&expected_binding.steady_launch_key);
+        post_rebuild_watchdog_outcome(repair)
     }
 }
 
@@ -2616,29 +2816,37 @@ pub(crate) fn arm_connector_desired_state_watchdog(
             let state = state.clone();
             let management = management.clone();
             move || {
+                // Backoff and stall-escalation bookkeeping lives in the pure
+                // ConnectorWatchdogSchedule so it is covered by unit tests; this
+                // thread only sleeps the returned delay and forwards the
+                // one-shot escalation flag into the next reconcile.
+                let mut schedule = ConnectorWatchdogSchedule::new();
                 let mut next_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
-                let mut retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                let mut escalate_stall = false;
                 loop {
                     thread::sleep(next_delay);
                     let (Some(state), Some(management)) = (state.upgrade(), management.upgrade())
                     else {
                         return;
                     };
-                    match reconcile_relay_v2_self_hosted_connector_desired_state(
+                    let outcome = reconcile_relay_v2_self_hosted_connector_desired_state(
                         &app,
                         state.as_ref(),
                         management.as_ref(),
                         &expected_binding,
-                    ) {
-                        ConnectorWatchdogReconcileOutcome::Healthy => {
-                            next_delay = CONNECTOR_WATCHDOG_HEALTHY_INTERVAL;
-                            retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
-                        }
-                        ConnectorWatchdogReconcileOutcome::Retry => {
-                            next_delay = retry_delay;
-                            retry_delay = next_connector_watchdog_retry_delay(retry_delay);
-                        }
+                        escalate_stall,
+                    );
+                    match outcome {
                         ConnectorWatchdogReconcileOutcome::Superseded => return,
+                        outcome => {
+                            let (scheduled_delay, escalate_next) =
+                                schedule.observe(outcome, Instant::now());
+                            next_delay = scheduled_delay;
+                            // Consumed one-shot: observe() decides whether the
+                            // NEXT reconcile must escalate, so a rebuild that
+                            // came back Retry/Healthy never escalates twice.
+                            escalate_stall = escalate_next;
+                        }
                     }
                 }
             }
@@ -4067,7 +4275,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
     let state = Arc::clone(state.inner());
     let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let (committed, binding, previously_supervised) = {
+        let (committed, binding, previously_supervised, readiness_outcome) = {
             let mut owner = state
                 .operation
                 .lock()
@@ -4127,25 +4335,36 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
             }
             owner.startup_restore_error = None;
             // Network registration remains controller-owned. Once the accepted
-            // desired state is durable, a bounded readiness wait may fail without
-            // disarming the composition-owned retry policy.
-            management
-                .wait_for_self_hosted_connector_base_readiness(
+            // desired state is durable and active_management is published, the
+            // bounded readiness wait must NOT abort Start Center via `?` before
+            // the watchdog is armed. Capture how it ended and surface the
+            // renderer notice only after supervision owns the binding: a cut
+            // still retrying at the deadline is not a start failure, and a
+            // child that dies during the wait is a supervised rebuild rather
+            // than an unsupervised binding for the rest of the session.
+            let readiness_outcome = committed_start_readiness_outcome(
+                management.wait_for_self_hosted_connector_base_readiness(
                     &binding.steady_launch_key,
                     readiness,
-                )
-                .map_err(|_| {
-                    "Relay v2 self-hosted Host did not register with all six required capabilities"
-                        .to_string()
-                })?;
-            (committed, binding, previously_supervised)
+                ),
+            );
+            (
+                committed,
+                binding,
+                previously_supervised,
+                readiness_outcome,
+            )
         };
         // Arm a desired-state watchdog after the deployment lock is released
         // (std::sync::Mutex is not reentrant) and only when this Start created a
         // new supervised binding — an already-supervised binding is covered by a
         // watchdog that will Supersede itself on mismatch. Before this, an in-app
         // first Deploy+Start left the management child unsupervised until the
-        // Dashboard was restarted.
+        // Dashboard was restarted. The arm runs for EVERY committed wait
+        // outcome, including a retrying-deadline Start: the soft "retrying
+        // automatically" notice must never leave a freshly published binding
+        // unsupervised (no dead-child rebuild, no remote-center reboot repair,
+        // no 600s stall escalation) for the rest of the session.
         if !previously_supervised {
             arm_connector_desired_state_watchdog(
                 &app,
@@ -4154,7 +4373,10 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
                 binding,
             );
         }
-        Ok(probe_status(&committed))
+        match readiness_outcome.surfaced_error() {
+            Some(message) => Err(message.to_string()),
+            None => Ok(probe_status(&committed)),
+        }
     })
     .await
     .map_err(|error| format!("Relay v2 start task failed: {error}"))?
@@ -4269,7 +4491,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
 
 #[cfg(test)]
 mod tests {
-    use super::super::management_child::ManagementLaunchKey;
+    use super::super::management_child::{ManagementError, ManagementLaunchKey};
     use super::{
         base_status, bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
@@ -4277,12 +4499,14 @@ mod tests {
         build_remote_center_status_probe_snippet, build_remote_center_stop_script,
         build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
         center_running_version_is_stale, certificate_bodies, commit_bootstrap_ready_state,
-        commit_config_replacement_with_barrier, consumed_local_private_file_path,
-        deployment_fingerprint, ensure_host_profile_identity, ensure_ordinary_center_start_allowed,
-        ensure_self_contained_ca_chain, finish_consuming_if_present,
-        fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
-        next_connector_watchdog_retry_delay, normalize_issuer_url,
-        persisted_management_config_identity, read_local_private_file,
+        commit_config_replacement_with_barrier, committed_start_readiness_outcome,
+        consumed_local_private_file_path, deployment_fingerprint, ensure_host_profile_identity,
+        ensure_ordinary_center_start_allowed, ensure_self_contained_ca_chain,
+        finish_consuming_if_present, fresh_bootstrap_publication_correlation,
+        initial_watchdog_repair_outcome, load_ready_commit_journal_at,
+        management_operation_failed_error, next_connector_watchdog_retry_delay,
+        normalize_issuer_url, persisted_management_config_identity,
+        post_rebuild_watchdog_outcome, read_local_private_file,
         ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
         relay_url_from_issuer, remote_center_repair_action,
         restart_running_center_after_deploy_with, self_hosted_connector_should_be_running,
@@ -4291,18 +4515,22 @@ mod tests {
         valid_center_running_version, validate_bootstrap_bytes, validate_listen_host,
         verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
         BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
-        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
-        PersistedSelfHostedConfig, ReadyCommitJournal, RemoteCenterRepairAction,
+        BootstrapRotationTransferReceipt, CommittedStartReadiness,
+        ConnectorWatchdogReconcileOutcome, ConnectorWatchdogSchedule, DeploymentProbeStatus,
+        LocalPrivateFileIdentity, MobileRelayV2ManagementCommandState, PersistedSelfHostedConfig,
+        ReadyCommitJournal, RemoteCenterRepairAction, SelfHostedConnectorRepair,
         SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
         BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
-        CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
-        HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
-        READY_COMMIT_JOURNAL_CONTRACT, READY_COMMIT_JOURNAL_SCHEMA_VERSION,
-        REMOTE_BOOTSTRAP_FD_READER, REMOTE_CENTER_RUNNING_VERSION_FILE,
-        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
+        CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, CONNECTOR_WATCHDOG_HEALTHY_INTERVAL,
+        CONNECTOR_WATCHDOG_INITIAL_DELAY, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
+        CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER, HOST_PROFILE_CONFIG_SCHEMA_VERSION,
+        ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES, READY_COMMIT_JOURNAL_CONTRACT,
+        READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
+        REMOTE_CENTER_RUNNING_VERSION_FILE, ROTATION_PENDING_CONFIG_SCHEMA_VERSION,
+        ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
     use std::cell::RefCell;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn connector_watchdog_retry_delay_is_bounded() {
@@ -4360,6 +4588,258 @@ mod tests {
             remote_center_repair_action(None),
             RemoteCenterRepairAction::RebuildLocal
         );
+    }
+
+    #[test]
+    fn connector_watchdog_deferred_never_escalates_before_the_stall_timeout() {
+        // Drive the pure schedule with Deferred observations at the same
+        // wall-clock spacing the real thread uses (the returned delay). Every
+        // observation strictly before 600s must stay non-escalating, and
+        // Deferred must share the exact Retry doubling: 1s, 2s, 4s, 8s, 15s…
+        let t0 = Instant::now();
+        let mut schedule = ConnectorWatchdogSchedule::new();
+        let mut elapsed = Duration::ZERO;
+        let mut expected_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+        while elapsed < CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER {
+            let (delay, escalate) =
+                schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0 + elapsed);
+            assert!(!escalate, "no stall escalation before 600s (at {elapsed:?})");
+            assert_eq!(delay, expected_delay, "Deferred backs off exactly like Retry");
+            elapsed += delay;
+            expected_delay = next_connector_watchdog_retry_delay(expected_delay);
+        }
+        // The doubled sequence lands exactly on the 600s boundary; observing AT
+        // it is the escalation case covered by the next test.
+        assert_eq!(elapsed, CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER);
+        assert_eq!(expected_delay, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn connector_watchdog_deferred_escalates_once_at_the_stall_timeout_then_restarts() {
+        let t0 = Instant::now();
+        let mut schedule = ConnectorWatchdogSchedule::new();
+
+        // Approach the boundary with only non-escalating Deferred ticks.
+        let mut elapsed = Duration::ZERO;
+        while elapsed < CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER {
+            let (delay, escalate) =
+                schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0 + elapsed);
+            assert!(!escalate);
+            elapsed += delay;
+        }
+        // At exactly 600s a single one-shot rebuild escalation fires.
+        let (delay, escalate) =
+            schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0 + elapsed);
+        assert!(escalate, "the 600s stall arms exactly one rebuild escalation");
+        assert_eq!(delay, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY);
+
+        // The stall timer restarted immediately: every Deferred observation in
+        // the following 600s window stays non-escalating…
+        elapsed += delay;
+        let restarted_boundary = elapsed + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER;
+        while elapsed < restarted_boundary {
+            let (next_delay, escalate_again) =
+                schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0 + elapsed);
+            assert!(
+                !escalate_again,
+                "no second escalation inside the restarted window (at {elapsed:?})"
+            );
+            elapsed += next_delay;
+        }
+        assert_eq!(elapsed, restarted_boundary);
+        // …and it escalates again only at the restarted run's own boundary.
+        let (_, escalate_again) =
+            schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0 + elapsed);
+        assert!(escalate_again, "the restarted timer escalates again at its own 600s");
+    }
+
+    #[test]
+    fn connector_watchdog_healthy_clears_the_stall_timer_and_backoff() {
+        let t0 = Instant::now();
+        let mut schedule = ConnectorWatchdogSchedule::new();
+        let (_, escalate) =
+            schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0);
+        assert!(!escalate);
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Deferred,
+            t0 + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER - Duration::from_secs(1),
+        );
+        assert!(!escalate);
+        // A Healthy tick at the would-be escalation boundary clears the run.
+        let (healthy_delay, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Healthy,
+            t0 + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER,
+        );
+        assert!(!escalate);
+        assert_eq!(healthy_delay, CONNECTOR_WATCHDOG_HEALTHY_INTERVAL);
+        // Far beyond 600s after the ORIGINAL run started, the fresh Deferred run
+        // neither escalates nor inherits the doubled backoff.
+        let later = t0 + 100 * CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER;
+        let (delay, escalate) =
+            schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, later);
+        assert!(!escalate, "Healthy must clear the deferred-since timer");
+        assert_eq!(
+            delay,
+            CONNECTOR_WATCHDOG_INITIAL_DELAY,
+            "Healthy must reset the doubling backoff"
+        );
+        // The fresh run escalates only at its own 600s boundary.
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Deferred,
+            later + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER - Duration::from_secs(1),
+        );
+        assert!(!escalate);
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Deferred,
+            later + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER,
+        );
+        assert!(escalate);
+    }
+
+    #[test]
+    fn connector_watchdog_retry_keeps_the_doubling_bound_and_never_escalates() {
+        let t0 = Instant::now();
+        let mut schedule = ConnectorWatchdogSchedule::new();
+        let mut expected_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+        for _ in 0..8 {
+            let (delay, escalate) =
+                schedule.observe(ConnectorWatchdogReconcileOutcome::Retry, t0);
+            assert!(!escalate, "Retry alone must never arm a stall escalation");
+            assert_eq!(delay, expected_delay);
+            expected_delay = next_connector_watchdog_retry_delay(expected_delay);
+        }
+        assert_eq!(expected_delay, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY);
+        // A Retry-only run, even an arbitrarily old one, never starts the stall
+        // timer: the timer measures Deferred (live-retrying) runs.
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Retry,
+            t0 + Duration::from_secs(60 * 60 * 24),
+        );
+        assert!(!escalate);
+    }
+
+    #[test]
+    fn connector_watchdog_stall_timer_is_kept_across_retry_ticks() {
+        let t0 = Instant::now();
+        let mut schedule = ConnectorWatchdogSchedule::new();
+        let (_, escalate) =
+            schedule.observe(ConnectorWatchdogReconcileOutcome::Deferred, t0);
+        assert!(!escalate);
+        // An interleaved Retry tick (remote-start path or a failed rebuild)
+        // belongs to the same unhealthy run and must not restart the timer.
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Retry,
+            t0 + Duration::from_secs(300),
+        );
+        assert!(!escalate);
+        let (_, escalate) = schedule.observe(
+            ConnectorWatchdogReconcileOutcome::Deferred,
+            t0 + CONNECTOR_WATCHDOG_STALL_REBUILD_AFTER,
+        );
+        assert!(
+            escalate,
+            "the stall timer measures the whole consecutive Deferred/Retry run"
+        );
+    }
+
+    #[test]
+    fn connector_watchdog_initial_repair_mapping_defers_a_live_retrying_child() {
+        use ConnectorWatchdogReconcileOutcome as Outcome;
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::Accepted, false),
+            Some(Outcome::Healthy)
+        );
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::Accepted, true),
+            Some(Outcome::Healthy)
+        );
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::ChildRetrying, false),
+            Some(Outcome::Deferred)
+        );
+        // An armed stall escalation deliberately takes the probe/rebuild path
+        // even for a retryable cut.
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::ChildRetrying, true),
+            None
+        );
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::RebuildRequired, false),
+            None
+        );
+        assert_eq!(
+            initial_watchdog_repair_outcome(SelfHostedConnectorRepair::RebuildRequired, true),
+            None
+        );
+    }
+
+    #[test]
+    fn connector_watchdog_post_rebuild_mapping_defers_a_retrying_replacement() {
+        use ConnectorWatchdogReconcileOutcome as Outcome;
+        assert_eq!(
+            post_rebuild_watchdog_outcome(SelfHostedConnectorRepair::Accepted),
+            Outcome::Healthy
+        );
+        assert_eq!(
+            post_rebuild_watchdog_outcome(SelfHostedConnectorRepair::ChildRetrying),
+            Outcome::Deferred
+        );
+        assert_eq!(
+            post_rebuild_watchdog_outcome(SelfHostedConnectorRepair::RebuildRequired),
+            Outcome::Retry
+        );
+    }
+
+    #[test]
+    fn committed_start_arms_supervision_for_every_readiness_wait_outcome() {
+        // Regression for the first-Save+Deploy+Start-during-an-outage gap:
+        // once desired=true is durable and active_management is published, a
+        // readiness wait that deadlines on a retrying cut (or hits a terminal
+        // cut / transport error) used to return through `?` BEFORE the only
+        // in-session watchdog arm, so dead-child rebuild, remote-center reboot
+        // repair, and the 600s stall escalation never ran until relaunch while
+        // the UI said recovery was automatic. The committed resolution has no
+        // abort-before-arm variant: every failure is only a renderer message,
+        // surfaced by the command AFTER arming.
+        assert_eq!(
+            committed_start_readiness_outcome(Ok(())),
+            CommittedStartReadiness::Ready
+        );
+        assert_eq!(
+            committed_start_readiness_outcome(Err(
+                MobileRelayV2ManagementCommandState::connector_retrying_error()
+            )),
+            CommittedStartReadiness::Retrying,
+            "a retrying-deadline wait is a committed supervised state, not an abort"
+        );
+        assert_eq!(
+            committed_start_readiness_outcome(Err(management_operation_failed_error())),
+            CommittedStartReadiness::NotReady,
+            "a terminal cut observed during the wait is rebuilt by the armed watchdog"
+        );
+        assert_eq!(
+            committed_start_readiness_outcome(Err(ManagementError {
+                code: "CHANNEL_CLOSED".to_string(),
+                message: "Relay v2 management channel closed".to_string(),
+                retryable: false,
+            })),
+            CommittedStartReadiness::NotReady,
+            "the child dying during the wait is a supervised rebuild, not an abort"
+        );
+
+        // Ready returns the probed status; the failure variants surface their
+        // fixed renderer messages, and the two messages must never be swapped.
+        assert_eq!(CommittedStartReadiness::Ready.surfaced_error(), None);
+        let retrying_message = CommittedStartReadiness::Retrying
+            .surfaced_error()
+            .expect("the retrying deadline must surface the reachability notice");
+        assert!(retrying_message.contains("retrying its relay connection automatically"));
+        assert!(retrying_message.contains("SSH host is not reachable"));
+        let not_ready_message = CommittedStartReadiness::NotReady
+            .surfaced_error()
+            .expect("a non-retrying wait failure still surfaces a renderer message");
+        assert!(not_ready_message.contains("six required capabilities"));
+        assert_ne!(retrying_message, not_ready_message);
     }
 
     fn config() -> PersistedSelfHostedConfig {

@@ -117,7 +117,12 @@ export function useRelayConnectionOverview(
     connectorStartingStalled,
   ]);
 
-  const connectorStatus = controller.state.connector.status;
+  const connector = controller.state.connector;
+  const connectorStatus = connector.status;
+  // Only the failed variant carries a meaningful retryability; every other
+  // variant reports null and must read as "not a retryable failure".
+  const connectorRetryable =
+    connectorStatus === "failed" ? connector.retryable : undefined;
   const overview = useMemo<RelayConnectionOverview>(() => deriveRelayConnectionOverview({
     selfHosted,
     enrollmentView: view,
@@ -125,6 +130,7 @@ export function useRelayConnectionOverview(
     inFlight,
     repairError,
     connectorStatus,
+    connectorRetryable,
   }), [
     selfHosted,
     view,
@@ -132,6 +138,7 @@ export function useRelayConnectionOverview(
     inFlight,
     repairError,
     connectorStatus,
+    connectorRetryable,
   ]);
 
   // Clear a stale repair error once the connector is healthy again: if the
@@ -195,8 +202,11 @@ export function useRelayConnectionOverview(
   /**
    * One-click "Fix connection". Sequences existing commands only:
    *  - center/bundle/TLS not ready, management unavailable, or the connector
-   *    reached a terminal failure → start the center (which replaces the
-   *    management child and sends start_connector);
+   *    reached a non-retryable terminal failure → start the center (which
+   *    replaces the management child and sends start_connector);
+   *  - a retryable connector cut needs no repair: the host's own retry loop
+   *    is already reconnecting, and rebuilding would restart its backoff and
+   *    scope rescan;
    *  - otherwise refresh an unhealthy host credential, then start the connector.
    * Afterwards the 2s status observer is watched until the connector registers
    * or the 30s timeout fires.
@@ -212,6 +222,7 @@ export function useRelayConnectionOverview(
       infraReady,
       adapterAvailable: view?.adapterAvailable,
       connectorStatus,
+      connectorRetryable,
       connectorStartingStalled,
     });
 
@@ -256,6 +267,7 @@ export function useRelayConnectionOverview(
     selfHosted,
     controller,
     connectorStatus,
+    connectorRetryable,
     connectorStartingStalled,
     onSelfHostedStatus,
     view?.adapterAvailable,

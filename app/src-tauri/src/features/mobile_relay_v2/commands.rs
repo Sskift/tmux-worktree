@@ -62,6 +62,13 @@ impl From<MobileRelayV2ManagementOperation> for ManagementOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelfHostedConnectorRepair {
+    Accepted,
+    ChildRetrying,
+    RebuildRequired,
+}
+
 enum ManagementCommandOwner {
     Ready {
         launch_key: ManagementLaunchKey,
@@ -151,6 +158,20 @@ impl RespawnBudget {
             attempts: 0,
             window_started: None,
         }
+    }
+
+    /// Check if an attempt is allowed right now without mutating the budget.
+    /// Resets if the cooldown window has elapsed.
+    fn can_attempt(&self, now: Instant) -> bool {
+        if let Some(started) = self.window_started {
+            if now.duration_since(started) >= RESURRECT_COOLDOWN {
+                return true;
+            }
+            if self.attempts >= RESURRECT_MAX_ATTEMPTS {
+                return false;
+            }
+        }
+        true
     }
 
     /// Return true and record an attempt if a rebuild is allowed right now;
@@ -297,6 +318,13 @@ impl MobileRelayV2ManagementCommandState {
         if let Some(started) = budget.window_started {
             budget.window_started = started.checked_sub(age);
         }
+    }
+
+    #[cfg(test)]
+    fn exhaust_respawn_budget_for_test(&self) {
+        let mut budget = self.resurrect.lock().unwrap();
+        budget.attempts = RESURRECT_MAX_ATTEMPTS;
+        budget.window_started = Some(Instant::now());
     }
 
     #[cfg(test)]
@@ -707,7 +735,9 @@ impl MobileRelayV2ManagementCommandState {
             now_ms,
             true,
         )? {
-            BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(()),
+            BaseConnectorReadiness::Ready
+            | BaseConnectorReadiness::Starting
+            | BaseConnectorReadiness::Retrying => Ok(()),
             BaseConnectorReadiness::NotReady => Err(not_ready_error()),
         }
     }
@@ -730,7 +760,9 @@ impl MobileRelayV2ManagementCommandState {
         let outcome = self.request_self_hosted_connector_start(expected_launch_key)?;
         match base_connector_readiness(outcome.clone())? {
             BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(outcome),
-            BaseConnectorReadiness::NotReady => Err(not_ready_error()),
+            BaseConnectorReadiness::NotReady | BaseConnectorReadiness::Retrying => {
+                Err(not_ready_error())
+            }
         }
     }
 
@@ -748,6 +780,55 @@ impl MobileRelayV2ManagementCommandState {
             Ok(outcome)
         } else {
             Err(not_ready_error())
+        }
+    }
+
+    pub(crate) fn classify_self_hosted_connector_repair(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+    ) -> SelfHostedConnectorRepair {
+        use super::management_protocol_v2::BaseConnectorReadiness;
+
+        match self.ensure_self_hosted_connector_start_accepted(expected_launch_key) {
+            Ok(BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting) => {
+                SelfHostedConnectorRepair::Accepted
+            }
+            Ok(BaseConnectorReadiness::Retrying) => SelfHostedConnectorRepair::ChildRetrying,
+            Ok(BaseConnectorReadiness::NotReady) => SelfHostedConnectorRepair::RebuildRequired,
+            Err(ref error) if management_error_is_transport(error) => {
+                SelfHostedConnectorRepair::RebuildRequired
+            }
+            Err(_) => {
+                let status_outcome = match self.call_with_input_for_launch_key(
+                    MobileRelayV2ManagementOperation::Status,
+                    ManagementInput::None,
+                    Some(expected_launch_key),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(_) => return SelfHostedConnectorRepair::RebuildRequired,
+                };
+                let status_result = match successful_v2_result(status_outcome) {
+                    Ok(result) => result,
+                    Err(_) => return SelfHostedConnectorRepair::RebuildRequired,
+                };
+                let Some(status_str) = connector_projection_status(&status_result) else {
+                    return SelfHostedConnectorRepair::RebuildRequired;
+                };
+                match status_str {
+                    "failed" => {
+                        if projection_connector_failed_retryable(&status_result) == Some(true) {
+                            SelfHostedConnectorRepair::ChildRetrying
+                        } else {
+                            SelfHostedConnectorRepair::RebuildRequired
+                        }
+                    }
+                    "superseded" => SelfHostedConnectorRepair::RebuildRequired,
+                    "stopped" | "starting" | "registered" | "registered_incomplete" => {
+                        SelfHostedConnectorRepair::ChildRetrying
+                    }
+                    _ => SelfHostedConnectorRepair::RebuildRequired,
+                }
+            }
         }
     }
 
@@ -772,12 +853,15 @@ impl MobileRelayV2ManagementCommandState {
 
         let (status, refreshed) =
             self.preflight_self_hosted_connector_credential(expected_launch_key, now_ms)?;
-        let mut readiness =
+        let readiness =
             super::management_protocol_v2::projection_base_connector_readiness(&status);
         if !refreshed && readiness == BaseConnectorReadiness::Ready {
             return Ok(readiness);
         }
         if !refreshed && readiness == BaseConnectorReadiness::Starting {
+            return Ok(readiness);
+        }
+        if !refreshed && readiness == BaseConnectorReadiness::Retrying {
             return Ok(readiness);
         }
         if strict_stopped
@@ -787,13 +871,48 @@ impl MobileRelayV2ManagementCommandState {
         {
             return Err(not_ready_error());
         }
-        readiness = base_connector_readiness(
-            self.request_self_hosted_connector_start(expected_launch_key)?,
+        let original_error = match self.request_self_hosted_connector_start(expected_launch_key) {
+            Ok(outcome) => match base_connector_readiness(outcome) {
+                Ok(
+                    r @ (BaseConnectorReadiness::Ready
+                    | BaseConnectorReadiness::Starting
+                    | BaseConnectorReadiness::Retrying),
+                ) => return Ok(r),
+                Ok(BaseConnectorReadiness::NotReady) => None,
+                Err(error) => {
+                    if management_error_is_transport(&error) {
+                        return Err(error);
+                    }
+                    Some(error)
+                }
+            },
+            Err(error) => {
+                if management_error_is_transport(&error) {
+                    return Err(error);
+                }
+                Some(error)
+            }
+        };
+        let status_outcome = self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::Status,
+            ManagementInput::None,
+            Some(expected_launch_key),
         )?;
-        if readiness == BaseConnectorReadiness::NotReady {
-            return Err(not_ready_error());
+        let status_result = match successful_v2_result(status_outcome) {
+            Ok(result) => result,
+            Err(err) if management_error_is_transport(&err) => return Err(err),
+            Err(_) => return Err(original_error.unwrap_or_else(not_ready_error)),
+        };
+        let reinspected_readiness =
+            super::management_protocol_v2::projection_base_connector_readiness(&status_result);
+        match reinspected_readiness {
+            BaseConnectorReadiness::Ready
+            | BaseConnectorReadiness::Starting
+            | BaseConnectorReadiness::Retrying => Ok(reinspected_readiness),
+            BaseConnectorReadiness::NotReady => {
+                Err(original_error.unwrap_or_else(not_ready_error))
+            }
         }
-        Ok(readiness)
     }
 
     fn preflight_self_hosted_connector_credential(
@@ -840,6 +959,21 @@ impl MobileRelayV2ManagementCommandState {
         )
     }
 
+    pub(crate) fn connector_retrying_error() -> ManagementError {
+        fixed_error(
+            "NOT_READY",
+            "Relay v2 connector is retrying its relay connection automatically",
+        )
+    }
+
+    /// Predicate for the fixed `connector_retrying_error()` so the deployment
+    /// layer can render its own user-facing message without string-matching the
+    /// code itself.
+    pub(crate) fn management_error_is_connector_retrying(error: &ManagementError) -> bool {
+        let expected = Self::connector_retrying_error();
+        error.code == expected.code && error.message == expected.message
+    }
+
     pub(crate) fn wait_for_self_hosted_connector_base_readiness(
         &self,
         expected_launch_key: &ManagementLaunchKey,
@@ -865,7 +999,9 @@ impl MobileRelayV2ManagementCommandState {
         if readiness == BaseConnectorReadiness::Ready {
             return Ok(());
         }
-        if readiness != BaseConnectorReadiness::Starting {
+        if readiness != BaseConnectorReadiness::Starting
+            && readiness != BaseConnectorReadiness::Retrying
+        {
             return Err(not_ready_error());
         }
         let deadline = Instant::now() + timeout;
@@ -873,9 +1009,18 @@ impl MobileRelayV2ManagementCommandState {
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(not_ready_error());
+                return match readiness {
+                    BaseConnectorReadiness::Retrying => Err(Self::connector_retrying_error()),
+                    _ => Err(not_ready_error()),
+                };
             }
             thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+            if Instant::now() >= deadline {
+                return match readiness {
+                    BaseConnectorReadiness::Retrying => Err(Self::connector_retrying_error()),
+                    _ => Err(not_ready_error()),
+                };
+            }
             readiness = base_connector_readiness(self.call_with_input_for_launch_key(
                 MobileRelayV2ManagementOperation::Status,
                 ManagementInput::None,
@@ -883,7 +1028,7 @@ impl MobileRelayV2ManagementCommandState {
             )?)?;
             match readiness {
                 BaseConnectorReadiness::Ready => return Ok(()),
-                BaseConnectorReadiness::Starting => {}
+                BaseConnectorReadiness::Starting | BaseConnectorReadiness::Retrying => {}
                 BaseConnectorReadiness::NotReady => return Err(not_ready_error()),
             }
         }
@@ -902,8 +1047,10 @@ impl MobileRelayV2ManagementCommandState {
     }
 
     /// Rebuild the self-hosted management child even when its process is still
-    /// responsive. Connector failures are terminal within a management root,
-    /// so process liveness alone is not sufficient for connection repair.
+    /// responsive. This is for a terminal cut inside the current root (failed
+    /// non-retryable / superseded), a dead channel, or the watchdog's bounded
+    /// stall escalation — a retryable failure is owned by the child's retry loop
+    /// and must not reach it.
     pub(crate) fn restart_self_hosted<F>(
         &self,
         app: &tauri::AppHandle,
@@ -943,6 +1090,26 @@ impl MobileRelayV2ManagementCommandState {
         }
         let desired_key = selection.launch_key();
         let published_key = selection.steady_launch_key();
+        {
+            // Never sacrifice a live child to an exhausted budget: the budget
+            // used to be charged only after the previous owner had already been
+            // drained, so a refused rebuild left the caller with NO child at
+            // all. Peek (non-mutating) before touching the owner; a dead or
+            // poisoned owner keeps the drain → StartFailed(ChannelClosed) path
+            // below. The same-key reuse fast path in claim_replacement never
+            // spawns, so it is exempt. The peek-then-claim gap is a benign
+            // TOCTOU (worst case: the pre-1.0.28 behavior).
+            let owner = self.owner.lock().unwrap();
+            if let ManagementCommandOwner::Ready { launch_key, manager } = &*owner {
+                let reuse_fast_path = reuse_ready_child && *launch_key == desired_key;
+                if !reuse_fast_path && manager.is_reusable_after_observation() {
+                    let budget = self.resurrect.lock().unwrap();
+                    if !budget.can_attempt(Instant::now()) {
+                        return Err(ManagementStartError::ChannelClosed);
+                    }
+                }
+            }
+        }
         let completion = Arc::new(ManagementDrainCompletion::pending());
         // Phase 1: under the owner lock, either fast-path a reusable child,
         // coalesce behind an in-flight replacement, or publish Replacing and
@@ -1638,6 +1805,25 @@ fn connector_projection_status(result: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+fn projection_connector_failed_retryable(result: &serde_json::Value) -> Option<bool> {
+    result
+        .get("connector")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|connector| {
+            if connector.get("status").and_then(serde_json::Value::as_str) == Some("failed") {
+                connector.get("retryable").and_then(serde_json::Value::as_bool)
+            } else {
+                None
+            }
+        })
+}
+
+fn management_error_is_transport(error: &ManagementError) -> bool {
+    error.code == CHANNEL_CLOSED_CODE
+        || error.code == SUPERSEDED_CODE
+        || error.code == RECOVERY_REQUIRED_CODE
+}
+
 fn map_start_error(error: ManagementStartError) -> ManagementError {
     match error {
         ManagementStartError::Unavailable => unavailable_error(),
@@ -2263,6 +2449,29 @@ mod tests {
             serde_json::json!(8_000_000_000_000_u64);
         response["result"]["connector"] = connector;
         serde_json::to_string(&response).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn command_regression_error_response(request_bytes: [u8; 16], code: &str) -> String {
+        let (message, retryable) = match code {
+            "UNAVAILABLE" => ("Relay v2 management is unavailable", false),
+            "NOT_READY" => ("Relay v2 management is not ready", false),
+            "BUSY" => ("Relay v2 management is busy", true),
+            "OPERATION_FAILED" => ("Relay v2 management operation failed", false),
+            _ => panic!("unsupported code for test error response: {code}"),
+        };
+        serde_json::to_string(&serde_json::json!({
+            "protocolVersion": 2,
+            "requestId": command_regression_request_id(request_bytes),
+            "ok": false,
+            "result": null,
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+            }
+        }))
+        .unwrap()
     }
 
     #[cfg(unix)]
@@ -3050,5 +3259,586 @@ mod tests {
                 .load(Ordering::Acquire),
             "lineage remains self-hosted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_killed_manager_is_not_latched_and_self_hosted_restart_succeeds() {
+        // 1.0.28 cleanup policy: a RUST-INITIATED kill (here the response
+        // deadline path against a child that never answers and ignores stdin
+        // EOF) classifies Clean once the child is reaped. A command state
+        // built from that manager must NOT be latched
+        // StartFailed(RecoveryRequired) — restart_self_hosted must drain the
+        // dead owner and spawn the replacement without an operator reset or an
+        // app relaunch (the post-1789094879 incident: exactly that in-memory
+        // latch refused restarts for four hours).
+        let hang_script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while :; do IFS= read -r request || sleep 1; done".to_string();
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_timeouts(
+            hang_script,
+            vec![[140u8; 16]],
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .expect("never-answering child starts");
+
+        // Force the supervisor-side kill: the missed deadline drains, the
+        // close budget is exceeded, and the child is SIGKILLed — Clean.
+        let killed = manager.request(ManagementOperation::Status).unwrap();
+        assert_eq!(killed.error.unwrap().code, CHANNEL_CLOSED_CODE);
+
+        let selection = self_hosted_test_selection();
+        let self_hosted_key = selection.steady_launch_key();
+        let state = Arc::new(
+            MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+                Ok(manager),
+                self_hosted_key.clone(),
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        );
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = resurrect_live_script();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[141u8; 16], [142u8; 16]],
+                )
+            });
+        }
+
+        let restart = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(
+            restart.is_ok(),
+            "a Clean supervisor kill must not require operator recovery: {restart:?}"
+        );
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retryable_connector_failure_is_owned_by_the_child_not_a_rebuild() {
+        let ids = [[151; 16], [152; 16], [153; 16], [154; 16]];
+        let failed_retryable = serde_json::json!({"status": "failed", "retryable": true});
+        let r0 = command_regression_projection_response(ids[0], failed_retryable.clone());
+        let r1 = command_regression_projection_response(ids[1], failed_retryable.clone());
+        let r2 = command_regression_projection_response(ids[2], failed_retryable.clone());
+        let r3 = command_regression_projection_response(ids[3], failed_retryable);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'\"operation\":\"start_connector\"'*) exit 75 ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 76 ;; esac; done",
+            request_ids[0], r0,
+            request_ids[1], r1,
+            request_ids[2], r2,
+            request_ids[3], r3,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start(Ok(manager)));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            state.set_rebuild_override(move || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(ManagementStartError::ChannelClosed)
+            });
+        }
+
+        assert_eq!(
+            state.ensure_self_hosted_connector_start_accepted(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(super::super::management_protocol_v2::BaseConnectorReadiness::Retrying)
+        );
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            state.classify_self_hosted_connector_repair(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            SelfHostedConnectorRepair::ChildRetrying
+        );
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { .. }
+        ));
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_reinspects_after_a_refused_start() {
+        // Part 1: Status stopped -> start_connector failure -> Status failed{retryable:true} => Ok(Retrying)
+        let ids1 = [[161; 16], [162; 16], [163; 16]];
+        let stopped1 = command_regression_projection_response(
+            ids1[0],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let start_fail1 = command_regression_error_response(ids1[1], "UNAVAILABLE");
+        let retrying1 = command_regression_projection_response(
+            ids1[2],
+            serde_json::json!({"status": "failed", "retryable": true}),
+        );
+        let req_ids1 = ids1.map(command_regression_request_id);
+        let script1 = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 81 ;; esac; done",
+            req_ids1[0], stopped1,
+            req_ids1[1], start_fail1,
+            req_ids1[2], retrying1,
+        );
+        let manager1 = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script1,
+            ids1.to_vec(),
+        )
+        .unwrap();
+        let state1 = MobileRelayV2ManagementCommandState::from_start(Ok(manager1));
+        assert_eq!(
+            state1.ensure_self_hosted_connector_start_accepted(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(super::super::management_protocol_v2::BaseConnectorReadiness::Retrying)
+        );
+
+        // Part 2: Status stopped -> start failure -> Status still stopped => Err whose code is start failure's code
+        let ids2 = [[164; 16], [165; 16], [166; 16]];
+        let stopped2a = command_regression_projection_response(
+            ids2[0],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let start_fail2 = command_regression_error_response(ids2[1], "UNAVAILABLE");
+        let stopped2b = command_regression_projection_response(
+            ids2[2],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let req_ids2 = ids2.map(command_regression_request_id);
+        let script2 = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 82 ;; esac; done",
+            req_ids2[0], stopped2a,
+            req_ids2[1], start_fail2,
+            req_ids2[2], stopped2b,
+        );
+        let manager2 = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script2,
+            ids2.to_vec(),
+        )
+        .unwrap();
+        let state2 = MobileRelayV2ManagementCommandState::from_start(Ok(manager2));
+        let err2 = state2
+            .ensure_self_hosted_connector_start_accepted(&ManagementLaunchKey::DefaultProduction)
+            .unwrap_err();
+        assert_eq!(err2.code, "UNAVAILABLE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonretryable_failed_cut_requires_rebuild() {
+        // Four scripted frames: ensure() spends the first three (preflight
+        // Status failed{retryable:false}, a refused start, and the single
+        // re-inspection Status that stays non-retryable) and classify()'s
+        // non-transport error arm then spends the fourth — the asserted
+        // RebuildRequired must come from the terminal cut itself, not from a
+        // dead re-inspection channel.
+        let ids = [[171; 16], [172; 16], [173; 16], [174; 16]];
+        let cut = serde_json::json!({"status": "failed", "retryable": false});
+        let r0 = command_regression_projection_response(ids[0], cut.clone());
+        let r1 = command_regression_error_response(ids[1], "OPERATION_FAILED");
+        let r2 = command_regression_projection_response(ids[2], cut.clone());
+        let r3 = command_regression_projection_response(ids[3], cut);
+        let req_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 83 ;; esac; done",
+            req_ids[0], r0,
+            req_ids[1], r1,
+            req_ids[2], r2,
+            req_ids[3], r3,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+        assert_eq!(
+            state.classify_self_hosted_connector_repair(&ManagementLaunchKey::DefaultProduction),
+            SelfHostedConnectorRepair::RebuildRequired
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_cut_requires_rebuild() {
+        // Same four-frame sequence as the non-retryable case: classify() must
+        // read "superseded" itself on its dedicated Status re-inspection rather
+        // than inferring RebuildRequired from a channel that already died.
+        let ids = [[175; 16], [176; 16], [177; 16], [178; 16]];
+        let cut = serde_json::json!({"status": "superseded"});
+        let r0 = command_regression_projection_response(ids[0], cut.clone());
+        let r1 = command_regression_error_response(ids[1], "OPERATION_FAILED");
+        let r2 = command_regression_projection_response(ids[2], cut.clone());
+        let r3 = command_regression_projection_response(ids[3], cut);
+        let req_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 84 ;; esac; done",
+            req_ids[0], r0,
+            req_ids[1], r1,
+            req_ids[2], r2,
+            req_ids[3], r3,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+        assert_eq!(
+            state.classify_self_hosted_connector_repair(&ManagementLaunchKey::DefaultProduction),
+            SelfHostedConnectorRepair::RebuildRequired
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_channel_requires_rebuild() {
+        let script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; kill -9 $$".to_string();
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(script, [177u8; 16])
+                .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+        assert_eq!(
+            state.classify_self_hosted_connector_repair(&ManagementLaunchKey::DefaultProduction),
+            SelfHostedConnectorRepair::RebuildRequired
+        );
+    }
+
+    /// Build a four-frame scripted child that forces
+    /// classify_self_hosted_connector_repair into its non-transport error arm
+    /// and then answers classify's OWN dedicated Status re-inspection with
+    /// `final_cut`. Frames 0-2 drive ensure() into a non-transport Err exactly
+    /// like ensure_reinspects_after_a_refused_start Part 2: preflight Status
+    /// "stopped" (projects NotReady), a refused start_connector (UNAVAILABLE),
+    /// and a re-inspection Status still "stopped"; frame 3 is the raw status
+    /// string table under test.
+    #[cfg(unix)]
+    fn classify_reinspection_state(
+        ids: &[[u8; 16]],
+        final_cut: &serde_json::Value,
+        exit_code: u8,
+    ) -> MobileRelayV2ManagementCommandState {
+        assert_eq!(ids.len(), 4, "the fixture spends exactly four request frames");
+        let stopped = serde_json::json!({"status": "stopped"});
+        let r0 = command_regression_projection_response(ids[0], stopped.clone());
+        let r1 = command_regression_error_response(ids[1], "UNAVAILABLE");
+        let r2 = command_regression_projection_response(ids[2], stopped);
+        let r3 = command_regression_projection_response(ids[3], final_cut.clone());
+        let request_ids: Vec<String> =
+            ids.iter().map(|id| command_regression_request_id(*id)).collect();
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit {exit_code} ;; esac; done",
+            request_ids[0], r0,
+            request_ids[1], r1,
+            request_ids[2], r2,
+            request_ids[3], r3,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        MobileRelayV2ManagementCommandState::from_start(Ok(manager))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_reinspection_table_defers_every_alive_cut_after_a_refused_start() {
+        // Each row drives ensure() into a non-transport Err and then pins ONE
+        // raw status string in classify()'s dedicated re-inspection. This table
+        // deliberately diverges from projection_base_connector_readiness (raw
+        // "stopped" is NotReady in ensure but ChildRetrying here), so a typo or
+        // a reorder of the string patterns must flip these assertions instead
+        // of being swallowed by the wildcard arm. Frames use fully-decodable
+        // wire shapes: the typed protocol rejects a bare "starting"/registered
+        // cut as an invalid frame (which terminalizes the child) — a genuine
+        // child can never emit one.
+        let alive_cuts: [(&str, serde_json::Value); 5] = [
+            (
+                "failed retryable",
+                serde_json::json!({"status": "failed", "retryable": true}),
+            ),
+            ("stopped", serde_json::json!({"status": "stopped"})),
+            (
+                "starting without a host id",
+                serde_json::json!({"status": "starting", "hostId": null}),
+            ),
+            (
+                "registered complete",
+                serde_json::json!({
+                    "status": "registered",
+                    "acknowledgement": "host.registered",
+                    "hostId": "mac-admin",
+                    "connectorId": "connector-one",
+                    "negotiatedCapabilityIntersection":
+                        super::super::management_protocol_v2::REQUIRED_CAPABILITIES,
+                }),
+            ),
+            (
+                "registered incomplete",
+                serde_json::json!({
+                    "status": "registered_incomplete",
+                    "acknowledgement": "host.registered",
+                    "hostId": "mac-admin",
+                    "connectorId": "connector-one",
+                    "negotiatedCapabilityIntersection": [],
+                }),
+            ),
+        ];
+        for (index, (label, cut)) in alive_cuts.iter().enumerate() {
+            let base = 201u8 + u8::try_from(index * 4).unwrap();
+            let ids: Vec<[u8; 16]> = (0..4).map(|offset| [base + offset; 16]).collect();
+            let state = classify_reinspection_state(&ids, cut, 91 + u8::try_from(index).unwrap());
+            assert_eq!(
+                state.classify_self_hosted_connector_repair(
+                    &ManagementLaunchKey::DefaultProduction
+                ),
+                SelfHostedConnectorRepair::ChildRetrying,
+                "{label} observed after a refused start must defer to the alive child's own retry"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_reinspection_unknown_status_requires_rebuild() {
+        // A connector status outside the typed wire vocabulary cannot decode
+        // (internally tagged connector enum + deny_unknown_fields): the invalid
+        // frame terminalizes the child and classify's transport path rebuilds
+        // rather than deferring for 600s. This pins the raw table's defensive
+        // wildcard — an out-of-vocabulary status must never read as
+        // ChildRetrying.
+        let ids: Vec<[u8; 16]> = (221..225u8).map(|byte| [byte; 16]).collect();
+        let state = classify_reinspection_state(
+            &ids,
+            &serde_json::json!({"status": "capabilities_handshaking"}),
+            96,
+        );
+        assert_eq!(
+            state.classify_self_hosted_connector_repair(&ManagementLaunchKey::DefaultProduction),
+            SelfHostedConnectorRepair::RebuildRequired
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_budget_never_drains_a_live_child() {
+        let live_script = resurrect_live_script();
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            live_script.clone(),
+            vec![[181u8; 16], [182u8; 16]],
+        )
+        .unwrap();
+        let selection = self_hosted_test_selection();
+        let self_hosted_key = selection.steady_launch_key();
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+            Ok(manager),
+            self_hosted_key.clone(),
+            EnrollmentArtifactRegistry::disabled(),
+        ));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let spawns = spawns.clone();
+            let live_script = live_script.clone();
+            state.set_rebuild_override(move || {
+                let count = spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+                    live_script.clone(),
+                    vec![[(190 + count) as u8; 16], [(191 + count) as u8; 16]],
+                )
+            });
+        }
+
+        // Exhaust the budget without killing the child
+        state.exhaust_respawn_budget_for_test();
+
+        // Rebuilding a live child when budget is exhausted must be refused without draining
+        let refused = state.restart_self_hosted_for_test(selection.clone(), || Ok(()));
+        assert_eq!(refused.err(), Some(ManagementStartError::ChannelClosed));
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Owner must still be Ready with the live child
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+
+        // Status call still succeeds against the undrained child
+        assert!(
+            state
+                .call_with_input_for_launch_key(
+                    MobileRelayV2ManagementOperation::Status,
+                    ManagementInput::None,
+                    Some(&self_hosted_key)
+                )
+                .unwrap()
+                .ok
+        );
+
+        // The same-key reuse fast path never spawns (and never drains), so it
+        // stays exempt from the budget peek while the budget is exhausted.
+        let reused = state.replace_self_hosted_with_reuse(
+            None,
+            selection.clone(),
+            true,
+            || Ok(()),
+        );
+        assert!(
+            reused.is_ok(),
+            "same-key reuse must stay allowed under an exhausted budget: {reused:?}"
+        );
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::Ready { launch_key, .. } if *launch_key == self_hosted_key
+        ));
+
+        // After the window rolls over, restart succeeds and spawns replacement
+        state.age_respawn_budget_for_test(RESURRECT_COOLDOWN);
+        let restarted = state.restart_self_hosted_for_test(selection, || Ok(()));
+        assert!(restarted.is_ok(), "restart succeeds after cooldown: {restarted:?}");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_readiness_polls_through_retrying() {
+        use super::super::management_protocol_v2::BaseConnectorReadiness;
+
+        // Part 1: Status answers failed{retryable:true} twice, then registered => Ok(())
+        let ids1 = [[183; 16], [184; 16], [185; 16]];
+        let retrying_connector = serde_json::json!({"status": "failed", "retryable": true});
+        let registered_connector = serde_json::json!({
+            "status": "registered",
+            "acknowledgement": "host.registered",
+            "hostId": "mac-admin",
+            "connectorId": "connector-one",
+            "negotiatedCapabilityIntersection":
+                super::super::management_protocol_v2::REQUIRED_CAPABILITIES,
+        });
+        let r0 = command_regression_projection_response(ids1[0], retrying_connector.clone());
+        let r1 = command_regression_projection_response(ids1[1], retrying_connector.clone());
+        let r2 = command_regression_projection_response(ids1[2], registered_connector);
+        let req_ids1 = ids1.map(command_regression_request_id);
+        let script1 = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 88 ;; esac; done",
+            req_ids1[0], r0,
+            req_ids1[1], r1,
+            req_ids1[2], r2,
+        );
+        let manager1 = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script1,
+            ids1.to_vec(),
+        )
+        .unwrap();
+        let state1 = MobileRelayV2ManagementCommandState::from_start(Ok(manager1));
+        assert_eq!(
+            state1.wait_for_self_hosted_connector_base_readiness_with_bounds(
+                &ManagementLaunchKey::DefaultProduction,
+                BaseConnectorReadiness::Retrying,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            ),
+            Ok(())
+        );
+
+        // Part 2: every Status keeps reporting failed{retryable:true} until the
+        // deadline, so the wait must surface connector_retrying_error(). The
+        // script rewrites a placeholder request id into every answer, which
+        // keeps the result independent of how many polls fit in the deadline.
+        let mut retrying_frame: serde_json::Value = serde_json::from_str(
+            &command_regression_projection_response([0u8; 16], retrying_connector.clone()),
+        )
+        .unwrap();
+        retrying_frame["requestId"] = serde_json::json!("RIDPLACEHOLDER");
+        let retrying_frame = serde_json::to_string(&retrying_frame).unwrap();
+        assert!(!retrying_frame.contains('\''));
+        let ids2: Vec<[u8; 16]> = (186..194u8).map(|byte| [byte; 16]).collect();
+        let script2 = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do rid=$(printf '%s' \"$request\" | sed -n 's/.*\"requestId\":\"\\([^\"]*\\)\".*/\\1/p'); printf '%s\\n' '{retrying_frame}' | sed \"s/RIDPLACEHOLDER/$rid/\"; done"
+        );
+        let manager2 = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script2,
+            ids2,
+        )
+        .unwrap();
+        let state2 = MobileRelayV2ManagementCommandState::from_start(Ok(manager2));
+        assert_eq!(
+            state2.wait_for_self_hosted_connector_base_readiness_with_bounds(
+                &ManagementLaunchKey::DefaultProduction,
+                BaseConnectorReadiness::Retrying,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+            ),
+            Err(MobileRelayV2ManagementCommandState::connector_retrying_error())
+        );
+    }
+
+    #[test]
+    fn respawn_budget_can_attempt_peeks_without_mutating_and_respects_rollover() {
+        let mut budget = RespawnBudget::fresh();
+        let t0 = Instant::now();
+
+        // Fresh: can_attempt is true, no mutation
+        assert!(budget.can_attempt(t0));
+        assert_eq!(budget.attempts, 0);
+        assert!(budget.window_started.is_none());
+
+        // Take 3 attempts
+        assert!(budget.take_attempt(t0));
+        assert_eq!(budget.attempts, 1);
+        assert!(budget.can_attempt(t0));
+
+        assert!(budget.take_attempt(t0));
+        assert_eq!(budget.attempts, 2);
+        assert!(budget.can_attempt(t0));
+
+        assert!(budget.take_attempt(t0));
+        assert_eq!(budget.attempts, 3);
+
+        // Budget exhausted: can_attempt is false, does not mutate
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(!budget.can_attempt(t1));
+        assert_eq!(budget.attempts, 3);
+        assert!(!budget.can_attempt(t1));
+        assert_eq!(budget.attempts, 3);
+        assert!(!budget.take_attempt(t1));
+
+        // After cooldown: can_attempt is true without mutating
+        let t2 = t0 + RESURRECT_COOLDOWN;
+        assert!(budget.can_attempt(t2));
+        assert_eq!(budget.attempts, 3);
+        assert!(budget.can_attempt(t2));
+
+        // take_attempt at t2 actually resets window and succeeds
+        assert!(budget.take_attempt(t2));
+        assert_eq!(budget.attempts, 1);
+        assert_eq!(budget.window_started, Some(t2));
     }
 }

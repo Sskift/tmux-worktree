@@ -34,6 +34,12 @@ export type RelayConnectionOverviewInput = {
   repairError: string | null;
   /** Normalized connector status; distinguishes registered_incomplete. */
   connectorStatus: MobileRelayV2Connector["status"];
+  /**
+   * Whether a failed connector cut is retryable. Only meaningful alongside
+   * connectorStatus === "failed"; the host's own composition loop is already
+   * reconnecting in that case.
+   */
+  connectorRetryable?: boolean;
 };
 
 /**
@@ -57,20 +63,30 @@ export function selfHostedInfraReady(
 }
 
 /**
- * A failed/superseded connector is terminal inside its current management
- * child. Retrying start_connector against that same child cannot recover it;
- * repair must rebuild the management child through startCenter instead.
+ * Whether one-click repair has to rebuild the management child via startCenter.
+ *
+ * A non-retryable failed connector, and a superseded one, are terminal inside
+ * their current management child: retrying start_connector against that same
+ * child cannot recover them, so repair must rebuild the child.
+ *
+ * A RETRYABLE failure is different. The cut means the relay center (or a
+ * configured SSH scope) is temporarily unreachable, and the host's own
+ * composition retry loop already owns recovery — it backs off (1s→15s) and
+ * rescans the scopes every 30s. Rebuilding the management child would restart
+ * that backoff and reset the very 30s rescan that would have recovered, so
+ * repair must leave the child alone.
  */
 export function relayRepairRequiresManagementRestart(input: {
   infraReady: boolean;
   adapterAvailable: boolean | undefined;
   connectorStatus: MobileRelayV2Connector["status"];
+  connectorRetryable?: boolean;
   connectorStartingStalled?: boolean;
 }): boolean {
   return !input.infraReady
     || input.adapterAvailable === false
     || input.connectorStartingStalled === true
-    || input.connectorStatus === "failed"
+    || (input.connectorStatus === "failed" && input.connectorRetryable !== true)
     || input.connectorStatus === "superseded";
 }
 
@@ -82,9 +98,11 @@ export function relayRepairRequiresManagementRestart(input: {
  *  2. in-flight operation          → progress, no button ("Starting relay center…" etc.)
  *  3. center/bundle/TLS not ready  → warning naming the stalled piece (fix)
  *  4. management backend down      → danger "Relay backend unavailable" (fix)
- *  5. connector registered_incomplete → warning naming the incomplete Mac connector
- *  6. connector not registered     → warning "Not connected to the relay center" (fix)
- *  7. connector registered         → success "Mac connected — enrollment available" (show QR)
+ *  5. connector failed, retryable  → progress "Reconnecting to the relay center…", no button:
+ *                                    the host's own retry loop already owns recovery
+ *  6. connector registered_incomplete → warning naming the incomplete Mac connector
+ *  7. connector not registered     → warning "Not connected to the relay center" (fix)
+ *  8. connector registered         → success "Mac connected — enrollment available" (show QR)
  *
  * A failed repair escalates the current diagnosis to danger and carries the
  * error one-liner in `detail`.
@@ -99,6 +117,7 @@ export function deriveRelayConnectionOverview(
     inFlight,
     repairError,
     connectorStatus,
+    connectorRetryable,
   } = input;
 
   if (!selfHosted?.configured) {
@@ -141,6 +160,14 @@ export function deriveRelayConnectionOverview(
     headline = "Relay backend unavailable";
     detail = "The relay management service is not responding.";
     primaryAction = { kind: "fix", label: "Restart relay service" };
+  } else if (connectorStatus === "failed" && connectorRetryable === true) {
+    // The host's composition loop is already reconnecting (1s→15s backoff,
+    // 30s scope rescans); offering "Fix connection" would rebuild the
+    // management child and restart that recovery from zero.
+    tone = "progress";
+    headline = "Reconnecting to the relay center…";
+    detail = "The relay center or a configured SSH host is not reachable yet. The Mac retries automatically.";
+    primaryAction = null;
   } else if (connectorStatus === "registered_incomplete") {
     tone = "warning";
     headline = "Mac connector is missing Relay v2 capabilities";
