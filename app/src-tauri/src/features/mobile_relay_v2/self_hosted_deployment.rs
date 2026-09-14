@@ -3712,16 +3712,74 @@ fn start_center_with_pending_rotation_output(
     }
     let command = build_remote_relay_v2_center_command(config, bootstrap_attempt.as_ref());
     let fingerprint = deployment_fingerprint(config);
+    let bootstrap_output_guard = bootstrap_attempt
+        .as_ref()
+        .map(|attempt| {
+            format!(
+                "test ! -e \"$root/bootstrap/{name}\"\ntest ! -L \"$root/bootstrap/{name}\"",
+                name = attempt.file_name
+            )
+        })
+        .unwrap_or_else(|| ":".to_string());
+    let script = build_remote_center_start_script(BuildRemoteCenterStartScriptArgs {
+        fingerprint: &fingerprint,
+        command: &command,
+        bootstrap_output_guard: &bootstrap_output_guard,
+        listen_port: config.listen_port,
+        tmux: &remote_tmux_cmd(&host),
+        state_directory_preflight: &build_remote_state_directory_launcher_preflight(),
+        center_version: env!("CARGO_PKG_VERSION"),
+    });
+    run_remote_cmd_check_strings(&host, &["sh".into(), "-lc".into(), script])?;
+    if transfer_after_start {
+        if config.bootstrap_rotation_pending {
+            transfer_rotated_remote_bootstrap(&host, config)?;
+        } else {
+            transfer_remote_bootstrap(&host, config)?;
+        }
+    } else if bootstrap_attempt.is_some() {
+        // A crash after the Broker's durable output but before its
+        // acknowledgement can republish the same correlation. Preserve the
+        // exact local identity and only remove a byte-identical duplicate.
+        cleanup_matching_republished_bootstrap(&host, config)?;
+    }
+    save_config(config)?;
+    Ok(())
+}
+
+fn ensure_ordinary_center_start_allowed(config: &PersistedSelfHostedConfig) -> Result<(), String> {
+    if config.bootstrap_rotation_pending {
+        return Err(
+            "Relay v2 Host bootstrap rotation must be completed with the explicit rotate action"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+struct BuildRemoteCenterStartScriptArgs<'a> {
+    fingerprint: &'a str,
+    command: &'a str,
+    bootstrap_output_guard: &'a str,
+    listen_port: u16,
+    tmux: &'a str,
+    state_directory_preflight: &'a str,
+    center_version: &'a str,
+}
+
+fn build_remote_center_start_script(args: BuildRemoteCenterStartScriptArgs<'_>) -> String {
     let launcher = format!("$HOME/{REMOTE_ROOT}/relay-v2-center.sh");
     let launcher_stage = format!(
         "$HOME/{REMOTE_ROOT}/.relay-v2-center-{}.stage",
         uuid::Uuid::new_v4().simple()
     );
-    let tmux = remote_tmux_cmd(&host);
-    let state_directory_preflight = build_remote_state_directory_launcher_preflight();
-    let center_version = env!("CARGO_PKG_VERSION");
-    let script = format!(
+    let process_guards = format!(
+        "{REMOTE_CENTER_REAP_FUNCTIONS}\n{}",
+        build_remote_center_port_guard_function(args.listen_port)
+    );
+    format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
+{process_guards}
 set -eu
 require_relay_layout
 {state_directory_preflight}
@@ -3754,6 +3812,11 @@ mv -Tf "{launcher_stage}" "{launcher}"
 require_private_executable "{launcher}"
 trap - EXIT HUP INT TERM
 if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then exit 0; fi
+# No live session: a dead tmux server can have orphaned the previous Center
+# node, which still holds the listen port. Reap it and prove the port free so
+# the new node fails here with a precise error instead of dying on EADDRINUSE.
+center_reap_execute
+center_require_port_free
 {tmux} new-session -d -s {CENTER_SESSION} "\"{launcher}\""
 sleep 1
 {tmux} has-session -t {CENTER_SESSION}
@@ -3762,43 +3825,110 @@ sleep 1
 # so a failed start never refreshes the record of a previously running process.
 {running_version_publish}
 "#,
-        running_version_publish = build_remote_center_running_version_publish(center_version),
+        running_version_publish = build_remote_center_running_version_publish(args.center_version),
         launcher_security_functions = REMOTE_SECURITY_FUNCTIONS,
-        bootstrap_output_guard = bootstrap_attempt
-            .as_ref()
-            .map(|attempt| {
-                format!(
-                    "test ! -e \"$root/bootstrap/{name}\"\ntest ! -L \"$root/bootstrap/{name}\"",
-                    name = attempt.file_name
-                )
-            })
-            .unwrap_or_else(|| ":".to_string()),
-    );
-    run_remote_cmd_check_strings(&host, &["sh".into(), "-lc".into(), script])?;
-    if transfer_after_start {
-        if config.bootstrap_rotation_pending {
-            transfer_rotated_remote_bootstrap(&host, config)?;
-        } else {
-            transfer_remote_bootstrap(&host, config)?;
-        }
-    } else if bootstrap_attempt.is_some() {
-        // A crash after the Broker's durable output but before its
-        // acknowledgement can republish the same correlation. Preserve the
-        // exact local identity and only remove a byte-identical duplicate.
-        cleanup_matching_republished_bootstrap(&host, config)?;
-    }
-    save_config(config)?;
-    Ok(())
+        fingerprint = args.fingerprint,
+        command = args.command,
+        bootstrap_output_guard = args.bootstrap_output_guard,
+        launcher = launcher,
+        launcher_stage = launcher_stage,
+        tmux = args.tmux,
+        state_directory_preflight = args.state_directory_preflight,
+    )
 }
 
-fn ensure_ordinary_center_start_allowed(config: &PersistedSelfHostedConfig) -> Result<(), String> {
-    if config.bootstrap_rotation_pending {
-        return Err(
-            "Relay v2 Host bootstrap rotation must be completed with the explicit rotate action"
-                .to_string(),
-        );
-    }
-    Ok(())
+/// POSIX fragment reaping Center node processes orphaned by a dead tmux
+/// server. `tmux kill-session` removes only the session: when the tmux server
+/// exits with it (observed in production after a Stop/Deploy), the foreground
+/// node is reparented to init and keeps listening — the next Start's node then
+/// dies on EADDRINUSE, and the broker ignores SIGTERM while draining, so a
+/// bounded SIGTERM→SIGKILL is required.
+///
+/// The process is identified by EXACT argv slots read from `/proc/<pid>/cmdline`
+/// (the resolved `current/cli.cjs` path plus a literal `relay-server` slot),
+/// same uid, excluding the script's own process and its parent. Substring
+/// matching is deliberately avoided: this script's own command line contains
+/// the same paths as embedded text. The fragment assumes `$root` and `$uid`
+/// exist (REMOTE_SECURITY_FUNCTIONS provides `$uid`; callers set `$root`).
+const REMOTE_CENTER_REAP_FUNCTIONS: &str = r#"center_reap_list_pids() {
+  center_reap_expected="$root/current/cli.cjs"
+  center_reap_expected_real=""
+  if center_reap_resolved="$(/usr/bin/realpath -e -- "$center_reap_expected" 2>/dev/null)"; then
+    center_reap_expected_real="$center_reap_resolved"
+  fi
+  for center_reap_proc in /proc/[0-9]*; do
+    center_reap_pid="${center_reap_proc#/proc/}"
+    test "$center_reap_pid" = "$$" && continue
+    test "$center_reap_pid" = "$PPID" && continue
+    test "$(stat -c %u -- "$center_reap_proc" 2>/dev/null)" = "$uid" || continue
+    center_reap_cmdline="$center_reap_proc/cmdline"
+    test -r "$center_reap_cmdline" || continue
+    tr '\0' '\n' < "$center_reap_cmdline" 2>/dev/null | grep -Fxq "relay-server" || continue
+    if tr '\0' '\n' < "$center_reap_cmdline" 2>/dev/null | grep -Fxq "$center_reap_expected"; then
+      printf '%s\n' "$center_reap_pid"
+    elif test -n "$center_reap_expected_real" && tr '\0' '\n' < "$center_reap_cmdline" 2>/dev/null | grep -Fxq "$center_reap_expected_real"; then
+      printf '%s\n' "$center_reap_pid"
+    fi
+  done
+}
+center_reap_execute() {
+  center_reap_pids="$(center_reap_list_pids)"
+  if test -z "$center_reap_pids"; then
+    return 0
+  fi
+  printf '%s\n' "$center_reap_pids" | while IFS= read -r center_reap_pid; do
+    kill -TERM "$center_reap_pid" 2>/dev/null || true
+  done
+  center_reap_grace=20
+  while test "$center_reap_grace" -gt 0; do
+    center_reap_alive=""
+    for center_reap_pid in $center_reap_pids; do
+      if test -d "/proc/$center_reap_pid"; then
+        center_reap_alive="$center_reap_alive $center_reap_pid"
+      fi
+    done
+    if test -z "$center_reap_alive"; then
+      return 0
+    fi
+    center_reap_grace=$((center_reap_grace - 1))
+    sleep 1
+  done
+  for center_reap_pid in $center_reap_alive; do
+    kill -KILL "$center_reap_pid" 2>/dev/null || true
+  done
+  center_reap_grace=5
+  while test "$center_reap_grace" -gt 0; do
+    center_reap_alive=""
+    for center_reap_pid in $center_reap_pids; do
+      if test -d "/proc/$center_reap_pid"; then
+        center_reap_alive="$center_reap_alive $center_reap_pid"
+      fi
+    done
+    if test -z "$center_reap_alive"; then
+      return 0
+    fi
+    center_reap_grace=$((center_reap_grace - 1))
+    sleep 1
+  done
+  printf 'Relay v2 Center: process(es) survived SIGKILL:%s\n' "$center_reap_alive" >&2
+  return 1
+}
+"#;
+
+/// POSIX guard: fail before starting a new node when the listen port is held
+/// by something the orphan reaper could not claim (a foreign process). Field 4
+/// `0A` is LISTEN in `/proc/net/tcp{,6}`; field 2 ends with `:<hex port>`.
+fn build_remote_center_port_guard_function(listen_port: u16) -> String {
+    format!(
+        r#"center_require_port_free() {{
+  center_port_hex="$(printf '%04X' {listen_port})"
+  if grep -Eq "^[[:space:]]*[0-9]+:[[:space:]]+[0-9A-F]+:${{center_port_hex}}[[:space:]]+[0-9A-F]+:[0-9A-F]+[[:space:]]+0A([[:space:]]|$)" /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    printf 'Relay v2 Center: port {listen_port} is already held by another process\n' >&2
+    return 1
+  fi
+}}
+"#,
+    )
 }
 
 fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
@@ -3912,8 +4042,10 @@ fn restart_running_center_after_deploy(
 fn build_remote_center_stop_script(tmux: &str) -> String {
     format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
+{REMOTE_CENTER_REAP_FUNCTIONS}
 set -eu
 require_relay_layout
+root="$HOME/{REMOTE_ROOT}"
 {tmux} kill-session -t {CENTER_SESSION} 2>/dev/null || true
 if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then
   exit 1
@@ -3921,9 +4053,11 @@ else
   center_has_session_status=$?
 fi
 test "$center_has_session_status" -eq 1
-# The session is provably gone, so no process is running this bundle anymore;
-# drop the running-version record so the probe never reports a live version
-# for a stopped Center.
+# A dead tmux server reparents the foregrounded Center node to init: the
+# session is gone while the node keeps the port. Reap exactly that process
+# before declaring the Center stopped; the running-version record below is
+# only dropped once both the session and the node are provably gone.
+center_reap_execute
 rm -f -- "$HOME/{REMOTE_ROOT}/{REMOTE_CENTER_RUNNING_VERSION_FILE}"
 "#,
     )
@@ -4496,7 +4630,8 @@ mod tests {
         base_status, bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
         build_remote_bundle_stage_validation_script, build_remote_center_running_version_publish,
-        build_remote_center_status_probe_snippet, build_remote_center_stop_script,
+        build_remote_center_start_script, build_remote_center_status_probe_snippet,
+        build_remote_center_stop_script, BuildRemoteCenterStartScriptArgs,
         build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
         center_running_version_is_stale, certificate_bodies, commit_bootstrap_ready_state,
         commit_config_replacement_with_barrier, committed_start_readiness_outcome,
@@ -5247,8 +5382,77 @@ mod tests {
 
         assert!(kill < postcondition);
         assert!(script[postcondition..].contains("center_has_session_status=$?"));
-        assert!(script[postcondition..].contains("test \"$center_has_session_status\" -eq 1"));
-        assert!(!script[postcondition..].contains("|| true"));
+        let status_assertion = script[postcondition..]
+            .find("test \"$center_has_session_status\" -eq 1")
+            .unwrap();
+        // The absence check itself must not be masked with `|| true`; only the
+        // orphan reaper later is allowed to tolerate a raced kill.
+        assert!(!script[postcondition..postcondition + status_assertion].contains("|| true"));
+    }
+
+    #[test]
+    fn center_stop_reaps_the_orphaned_node_before_dropping_the_version_record() {
+        let script = build_remote_center_stop_script("/usr/bin/tmux");
+        let postcondition = script
+            .find("test \"$center_has_session_status\" -eq 1")
+            .unwrap();
+        let reap = script[postcondition..]
+            .find("center_reap_execute")
+            .map(|index| postcondition + index)
+            .unwrap();
+        let version_rm = script[postcondition..]
+            .find(&format!(
+                "rm -f -- \"$HOME/.tmux-worktree/relay-v2-self-hosted/{REMOTE_CENTER_RUNNING_VERSION_FILE}\""
+            ))
+            .map(|index| postcondition + index)
+            .unwrap();
+        assert!(reap < version_rm);
+
+        // Exact argv-slot matching, same uid, self/parent exclusion, and a
+        // bounded TERM -> SIGKILL escalation.
+        assert!(script.contains("grep -Fxq \"relay-server\""));
+        assert!(script.contains("center_reap_expected=\"$root/current/cli.cjs\""));
+        assert!(script.contains("stat -c %u"));
+        assert!(script.contains("test \"$center_reap_pid\" = \"$$\""));
+        assert!(script.contains("test \"$center_reap_pid\" = \"$PPID\""));
+        assert!(script.contains("kill -TERM"));
+        assert!(script.contains("kill -KILL"));
+        assert!(script.contains("survived SIGKILL"));
+    }
+
+    #[test]
+    fn center_start_reaps_and_checks_the_port_only_when_no_session_is_live() {
+        let script = build_remote_center_start_script(BuildRemoteCenterStartScriptArgs {
+            fingerprint: "fp",
+            command: "node cli.cjs relay-server",
+            bootstrap_output_guard: ":",
+            listen_port: 8788,
+            tmux: "/usr/bin/tmux",
+            state_directory_preflight: ":",
+            center_version: "1.0.28",
+        });
+        let session_early_exit = script
+            .find("if /usr/bin/tmux has-session -t tw-relay-v2-center 2>/dev/null; then exit 0; fi")
+            .unwrap();
+        let reap = script[session_early_exit..]
+            .find("center_reap_execute")
+            .map(|index| session_early_exit + index)
+            .unwrap();
+        let port_guard = script[reap..]
+            .find("center_require_port_free")
+            .map(|index| reap + index)
+            .unwrap();
+        let new_session = script[port_guard..]
+            .find("/usr/bin/tmux new-session -d -s tw-relay-v2-center")
+            .map(|index| port_guard + index)
+            .unwrap();
+        assert!(session_early_exit < reap);
+        assert!(reap < port_guard);
+        assert!(port_guard < new_session);
+        // 8788 in hexadecimal is 2254.
+        assert!(script.contains("printf '%04X' 8788"));
+        assert!(script.contains(":${center_port_hex}"));
+        assert!(script.contains("0A"));
     }
 
     #[test]
