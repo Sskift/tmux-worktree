@@ -167,4 +167,45 @@
 
 ## 执行记录
 
-（每轮执行在此追加：日期、执行人、版本、失败项与处理）
+### 2026-09-14（1.0.28 + master 53e34a17，执行人：自动化+手测混合）
+- A1 ✅ 八处版本均 1.0.28
+- A2 ✅ cargo lib 283/0、renderer 488/0、Node 1990+1skip、Android JVM 单测通过、assembleDebug 通过
+- A3 ✅ center 1.0.28 session/8788/HTTPS/WSS 全在，管理子进程无 churn
+- A4 ✅ 模拟器冷启动 PairingScreen
+- A5 ✅ check:contracts 通过
+- F1/F2/F3/F5 ✅ 生成脚本在 devbox 真 broker 上验证（孤儿回收 2.4s、stop/start、幂等不动活 node、两次 bounce Mac WSS 0 respawn）
+- L1 ✅（doctor 仅报用户历史失效项目路径 + 46 孤儿 worktree，非回归）
+- L2/L3/L4/L6 ✅ devbox 探针 compatible=true；L5 ⏭ bridge 未运行（留 M 段）
+- G1 ✅ pairing 页文案完整
+- G2 ✅ 非法 deeplink 被拒（"payload is invalid"，不发 redeem）
+- G3 进行中：自动化打通（AX 操作 app 生成 QR→Vision 解码→deeplink→Confirm），review facts 已验证正确；被本机内存压力反复打断（模拟器 system_server 被 OOM 杀、screencapture 挂起、swap 28G 打满）
+- 自动化回归补充：`npm run test:interop` 8/8 PASS（handshake/六基能/terminal resume）
+- G3 ✅ 有效 deeplink 全链路：review facts 正确 → Confirm（正确按钮坐标 540,1357；Cancel 在其下方）→ redeem 成功 → ONLINE；broker enrollment consumedAtMs 落地
+- G6 ✅ Dashboard Overview 出现该手机（Dashboard·c67776）
+- H1/H2/H3/H4/H5 ✅ Inbox/Workspaces/Settings(1.0.28)/Connection Health 全绿/Drawer 在线态均正确
+- I1/I2/I3 ✅ 手机建 tmux 会话（tw-term-8ecfa）、真实命令 I/O、Mac 侧会话 resume 回放正常
+- J 段（真实 codex 会话，模型 gpt-5.3-codex-spark xhigh）：
+  - J6 ✅ 手机 New worktree 三步向导创建 e2e-spark-j：Mac git worktree `~/.tmux-worktree/worktrees/tmux-worktree/tmux-worktree-e2e-sp`（基于 master aeb4e398）+ tmux session `tmux-worktree-e2e-sp` + codex 以指定模型启动
+  - J2 ✅ 手机发 "Reply with exactly E2E_SPARK_OK" → Mac codex TUI 收到 steer → 回复 E2E_SPARK_OK → 手机气泡渲染（经 relay 双向闭环）
+  - J1 ✅ 历史两轮对话加载正常；markdown bullet list（Apple/Banana/Mango）渲染正确
+  - J3 ✅ Session detail timeline：You/Agent/System 事件齐，Turn lifecycle: Completed ×2、Run lifecycle: Waiting for user
+  - J4 ✅ chat 右上 Open terminal 跳进同一任务终端，codex TUI 实时内容一致（footer=gpt-5.3-codex-spark xhigh，Online）
+  - J5 ⏭ 失败/重试气泡 P2，未造场景
+- K 段：
+  - K1 ✅ 飞行模式 15s：chip=Connection status: paused（网络层不可用时暂停而非重连风暴）；关网络后 ≤8s 自动 Online，app 不重建
+  - K2 ✅ devbox center kill-session/rm version-record → 重新拉起：停机时静默断链 chip 不立即翻（WS TCP 半开），主动操作后显示 Recovering；center 重启后 ~10s 自动 Online；broker SQLite 持久化使 chat 历史完整恢复
+  - K3 ✅ force-stop 进程后冷启动（launcher=.V2Activity）：2s Offline → 4s Online，auto-connect 持久化
+  - K4 ✅ Forget this pairing：手机回 pairing 页，本地 datastore 仅剩 install clientInstanceId（无 token）；broker 端对应 grant（clientInstanceId f66b7f9c…）revokedAtMs=1789404933627（before/after sqlite 快照 diff 实证），refresh 对 revoked grant fail-closed
+  - K5 ✅ Forget 后新 deeplink 重新激活：Enrollment saved → 手动 Connect（设计不自动连）→ 4s Online
+  - K6 ✅ session detail → More actions → End session：二次确认后 Mac `tmux-worktree-e2e-sp` 消失（kill_session），手机显示 "This session is no longer available"
+- I4/I5 补充：终端 resume/resize 在 J4/K2/K3 已间接覆盖（broker bounce、进程重启后流恢复）
+- B1 ✅ Mission Control：4 统计 tile（need review/agents running/phones connected=1/remote hosts 2/2）、Agent inbox、RELAY V2 Mobile devices 显示 "1 mobile device online"（f66b7f9…213b，与 broker grant clientInstanceId 一致）、Local ready · 2/2 hosts ready，无错误条
+- C1 ✅ 桌面 New terminal（local，~/Desktop）：tw-term-2b3d8 建成自动 attach，PTY I/O 实证 `echo E2E_DESKTOP_$((6*7))`→E2E_DESKTOP_42
+- C2 ✅ 终端持久化：tw-term-8ecfa（前一晚 21:21 建）历经多次 app 重开仍在、历史可见
+- D 段说明：桌面 New worktree wizard 渲染/交互正常（RESTORE EXISTING 列表、HOST/PROJECT/TARGET BRANCH/AGENT/SESSION NAME 全表单、失效目录 requirement-forward 自动剔除并提示）；后端 create worktree+tmux+agent 拉起链路由手机 J6/J2 端到端实证（同一 RPC）。桌面 wizard 走完创建留手测
+- L 段：L3 ✅ `tw host ls`（mew-dev/devbox）、`tw host probe devbox` reachable 31ms/tmux 3.7b/tw 1.0.24 protocolVersion 2；L4 ✅ `tw worktree prune --dry-run` 正常列出不误删；L5 ⏭ 同 M（bridge 未运行，ENOENT feishu-bridge-v1.sock，预期）；注意：PATH 全局 tw=1.0.24（旧全局包），app 内置 CLI=1.0.28，发版需按 N3 先更新全局包
+- F 段补充：K2 的 Stop/Start 与 F1/F2 同路径（devbox tmux 会话 tw-relay-v2-center + relay-v2-center.sh 重启），端口/版本记录/孤儿回收在 1.0.28 脚本级验证基础上再验一次真实 bounce 恢复
+- 待办：B3–B6/E1–E5 桌面细项标【手测】；M1–M5 需测试群与用户配合；N 段发版（P0 全绿后）
+- B2 ✅ Connections→Relay 卡：Mac connected — Relay v2 enrollment available；Connected mobile devices=新 client f66b7f9c…3213b（forget 后新激活实例），Grant 1b0d2ec6…b06ff · 1 connection，Revoke 可见（G6 同证）；devbox 事实补：bundle current=1.0.28、8788 LISTEN、tmux tw-relay-v2-center alive、Mac 3 条 ESTABLISHED
+- F1/F2/F3 面板级复测 ✅：Stop v2 Relay Center → session GONE + 8788 计数 0 + 孤儿 node 回收 + center.running-version 删除；Start v2 Relay Center → 全恢复且记录=[1.0.28]；存活时再 Start：session_created 时间戳不变、单 node 不重建（幂等）；面板 bounce 后手机 2s 恢复 Online（F5 再次验证）
+- L1 ✅ doctor 结论同 2026-09-14；L6 ✅ app 内置 CLI 1.0.28（PATH 全局 tw=1.0.24 为旧全局包，N3 发版注意）
