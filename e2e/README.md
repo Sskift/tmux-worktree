@@ -156,10 +156,10 @@
 
 | ID | 级别 | 用例 | 预期 | 结果 |
 |---|---|---|---|---|
-| N1 | P0 | 版本决策：P2 修复未发布 → bump 1.0.29（root/app/tauri/cargo 四处 + versionCode +1） | 五处一致（A1） | ⬜ |
-| N2 | P0 | `app/scripts/release.sh --dry-run`（或实构建）：tauri build、codesign 校验、DMG + sha256 staged 且校验通过 | 产物就绪 | ⬜ |
-| N3 | P0 | bnpm publish 新版本（用户手动）；**先更新全局包再** `tw-dashboard-install` 验新装 app 版本 | 避开 stale-global 坑 | ⬜【用户】 |
-| N4 | P0 | GitHub Release v<ver> 上传 arm64 DMG + sha256（用户手动） | release 资产齐 | ⬜【用户】 |
+| N1 | P0 | 版本决策：P2 修复未发布 → bump 1.0.29（root/app/tauri/cargo 四处 + versionCode +1） | 五处一致（A1） | ✅ 1.0.29，versionCode 20026，APK badging 实证，commit 9f995afe |
+| N2 | P0 | `app/scripts/release.sh --dry-run`（或实构建）：tauri build、codesign 校验、DMG + sha256 staged 且校验通过 | 产物就绪 | ✅ DMG 5.9M，签名 sealed resources 校验过，sha256 一致 |
+| N3 | P0 | bnpm publish 新版本（用户手动）；**先更新全局包再** `tw-dashboard-install` 验新装 app 版本 | 避开 stale-global 坑 | ⏳【用户】待执行 |
+| N4 | P0 | GitHub Release v<ver> 上传 arm64 DMG + sha256（用户手动） | release 资产齐 | ⏳ 草稿已建含资产，待用户 Publish |
 | N5 | P1 | devbox center Deploy 新版本 bundle + Stop/Start（或面板 Deploy） | center 版本刷新 | ⬜ |
 | N6 | P2 | 发布后手机/桌面在线状态复测一轮 | 全绿 | ⬜ |
 
