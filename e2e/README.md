@@ -160,7 +160,7 @@
 | N2 | P0 | `app/scripts/release.sh --dry-run`（或实构建）：tauri build、codesign 校验、DMG + sha256 staged 且校验通过 | 产物就绪 | ✅ DMG 5.9M，签名 sealed resources 校验过，sha256 一致 |
 | N3 | P0 | bnpm publish 新版本；**先更新全局包再** `tw-dashboard-install` 验新装 app 版本 | 避开 stale-global 坑 | ⏭ 用户决定本轮不发 bnpm（仅 GitHub 渠道） |
 | N4 | P0 | GitHub Release v<ver> 上传 arm64 DMG + sha256 | release 资产齐 | ✅ v1.0.29 已发布，tag=9820571f，DMG+sha256 可下载 |
-| N5 | P1 | devbox center Deploy 新版本 bundle + Stop/Start（或面板 Deploy） | center 版本刷新 | ⬜ |
+| N5 | P1 | devbox center Deploy 新版本 bundle + Stop/Start（或面板 Deploy） | center 版本刷新 | ✅ 面板 Deploy：t+18s current 切到 1.0.29，center 自动重启（deploy-restarts-center），单 node 8788 LISTEN，Mac WSS 2 ESTABLISHED |
 | N6 | P2 | 发布后手机/桌面在线状态复测一轮 | 全绿 | ⬜ |
 
 ---
