@@ -161,7 +161,7 @@
 | N3 | P0 | bnpm publish 新版本；**先更新全局包再** `tw-dashboard-install` 验新装 app 版本 | 避开 stale-global 坑 | ⏭ 用户决定本轮不发 bnpm（仅 GitHub 渠道） |
 | N4 | P0 | GitHub Release v<ver> 上传 arm64 DMG + sha256 | release 资产齐 | ✅ v1.0.29 已发布，tag=9820571f，DMG+sha256 可下载 |
 | N5 | P1 | devbox center Deploy 新版本 bundle + Stop/Start（或面板 Deploy） | center 版本刷新 | ✅ 面板 Deploy：t+18s current 切到 1.0.29，center 自动重启（deploy-restarts-center），单 node 8788 LISTEN，Mac WSS 2 ESTABLISHED |
-| N6 | P2 | 发布后手机/桌面在线状态复测一轮 | 全绿 | ⬜ |
+| N6 | P2 | 发布后手机/桌面在线状态复测一轮 | 全绿 | ✅ 桌面 app/devbox cli/center 均 1.0.29；模拟器手机 6s 恢复 Online；手机经 1.0.29 broker 建终端 tw-term-9b33b，tmux I/O N6_129_OK 后清理 |
 
 ---
 
